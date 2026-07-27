@@ -1,6 +1,7 @@
 mod capture;
 mod config;
 mod diagnostics;
+mod flac_tracks;
 mod inspect;
 mod journal;
 mod playout;

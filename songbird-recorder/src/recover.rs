@@ -15,6 +15,7 @@ use crate::{
         CHANNELS, DecodedFrame, DiagnosticWriter, SAMPLE_RATE as OUTPUT_SAMPLE_RATE,
         SAMPLES_PER_TICK, TrackSummary,
     },
+    flac_tracks::FlacTrackWriter,
     journal::{self, PacketRecord, ReadRecord as ReadPacketRecord},
     playout::{self, OpusPayloadBounds, PlayoutDecision, ReadRecord as ReadPlayoutRecord},
     session::{EVENT_FORMAT_VERSION, SessionEvent},
@@ -32,6 +33,11 @@ const TRACK_MANIFEST_FORMAT_VERSION: u16 = 1;
 enum OutputKind {
     Recovery,
     Tracks,
+}
+
+enum AudioWriter {
+    Recovery(DiagnosticWriter),
+    Tracks(FlacTrackWriter),
 }
 
 struct PacketIndex {
@@ -82,11 +88,7 @@ fn decode_session(session_directory: &Path, output_kind: OutputKind) -> Result<(
         )
     })?;
 
-    let mut output = match output_kind {
-        OutputKind::Recovery => DiagnosticWriter::new_recovery(session_directory),
-        OutputKind::Tracks => DiagnosticWriter::new_tracks(session_directory),
-    }
-    .with_context(|| {
+    let mut output = AudioWriter::new(session_directory, output_kind).with_context(|| {
         format!(
             "failed to create {} output in {}",
             output_kind.operation(),
@@ -185,9 +187,9 @@ fn decode_session(session_directory: &Path, output_kind: OutputKind) -> Result<(
 
     for track in tracks {
         println!(
-            "{} WAV SSRC {}: {}, first tick {}, {} frames, {} source samples, \
+            "{} SSRC {}: {}, first tick {}, {} frames, {} source samples, \
              {} inserted silence samples, {} nonstandard frames.",
-            output_kind.track_label(),
+            output_kind.track_description(),
             track.ssrc,
             track.path.display(),
             track.first_tick,
@@ -216,10 +218,35 @@ impl OutputKind {
         }
     }
 
-    fn track_label(self) -> &'static str {
+    fn track_description(self) -> &'static str {
         match self {
-            Self::Recovery => "Recovered",
-            Self::Tracks => "Aligned track",
+            Self::Recovery => "Recovered WAV",
+            Self::Tracks => "Aligned FLAC track",
+        }
+    }
+}
+
+impl AudioWriter {
+    fn new(session_directory: &Path, output_kind: OutputKind) -> std::io::Result<Self> {
+        match output_kind {
+            OutputKind::Recovery => {
+                DiagnosticWriter::new_recovery(session_directory).map(Self::Recovery)
+            }
+            OutputKind::Tracks => FlacTrackWriter::new(session_directory).map(Self::Tracks),
+        }
+    }
+
+    fn write_frame(&mut self, frame: DecodedFrame) -> std::io::Result<()> {
+        match self {
+            Self::Recovery(writer) => writer.write_frame(frame),
+            Self::Tracks(writer) => writer.write_frame(frame),
+        }
+    }
+
+    fn finalize(self) -> std::io::Result<Vec<TrackSummary>> {
+        match self {
+            Self::Recovery(writer) => writer.finalize(),
+            Self::Tracks(writer) => writer.finalize(),
         }
     }
 }
@@ -227,7 +254,10 @@ impl OutputKind {
 #[derive(Serialize)]
 struct TrackManifest {
     format: u16,
+    codec: &'static str,
+    verification: &'static str,
     sample_rate: u32,
+    bits_per_sample: u16,
     channels: u16,
     samples_per_tick: u64,
     timeline_origin: &'static str,
@@ -284,7 +314,10 @@ fn write_track_manifest(session_directory: &Path, tracks: &[TrackSummary]) -> Re
         .collect::<Result<Vec<_>>>()?;
     let manifest = TrackManifest {
         format: TRACK_MANIFEST_FORMAT_VERSION,
+        codec: "flac",
+        verification: "flac_pcm_md5",
         sample_rate: OUTPUT_SAMPLE_RATE,
+        bits_per_sample: 16,
         channels: CHANNELS,
         samples_per_tick: SAMPLES_PER_TICK,
         timeline_origin: "voice_tick_zero",
