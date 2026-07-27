@@ -104,7 +104,11 @@ pub(crate) fn run(session_directory: &Path) -> Result<()> {
     validate_manifest(&manifest)?;
 
     let packets = inspect_packets(&session_directory.join("packets.dat"))?;
-    let playout = inspect_playout(&session_directory.join("playout.dat"), &packets.packet_keys)?;
+    let playout = inspect_playout(
+        &session_directory.join("playout.dat"),
+        &packets.packet_keys,
+        manifest.files.playout.format,
+    )?;
     let events = inspect_events(&session_directory.join("events.ndjson"))?;
 
     println!("Session inspection: {}.", session_directory.display());
@@ -209,13 +213,27 @@ fn validate_manifest(manifest: &SessionManifest) -> Result<()> {
         "packets.dat",
         journal::FORMAT_VERSION,
     )?;
-    validate_file_description(
-        "playout",
-        &manifest.files.playout,
-        "playout.dat",
-        playout::FORMAT_VERSION,
-    )?;
+    validate_playout_description(&manifest.files.playout)?;
     validate_file_description("events", &manifest.files.events, "events.ndjson", 1)
+}
+
+fn validate_playout_description(description: &FileDescription) -> Result<()> {
+    if description.path != "playout.dat" {
+        bail!(
+            "session manifest playout path is {:?}; expected {:?}",
+            description.path,
+            "playout.dat"
+        );
+    }
+    if !matches!(description.format, 1 | playout::FORMAT_VERSION) {
+        bail!(
+            "session manifest playout format is {}; expected 1 or {}",
+            description.format,
+            playout::FORMAT_VERSION
+        );
+    }
+
+    Ok(())
 }
 
 fn validate_file_description(
@@ -279,16 +297,23 @@ fn inspect_packets(path: &Path) -> Result<PacketInspection> {
 fn inspect_playout(
     path: &Path,
     packet_keys: &HashSet<(u32, u16, u32)>,
+    expected_format_version: u16,
 ) -> Result<PlayoutInspection> {
     let file = File::open(path)
         .with_context(|| format!("failed to open playout journal {}", path.display()))?;
     let mut reader = BufReader::new(file);
-    playout::read_file_header(&mut reader)
+    let format_version = playout::read_file_header(&mut reader)
         .with_context(|| format!("invalid playout journal header in {}", path.display()))?;
+    if format_version != expected_format_version {
+        bail!(
+            "playout journal format {format_version} does not match manifest format \
+             {expected_format_version}"
+        );
+    }
 
     let mut inspection = PlayoutInspection::default();
     loop {
-        match playout::read_record(&mut reader)
+        match playout::read_record(&mut reader, format_version)
             .with_context(|| format!("invalid playout journal record in {}", path.display()))?
         {
             ReadPlayoutRecord::Record(record) => {
@@ -310,6 +335,7 @@ fn inspect_playout(
                     PlayoutDecision::Packet {
                         sequence,
                         timestamp,
+                        ..
                     } => {
                         inspection.packet_decisions += 1;
                         stream.packet_decisions += 1;
@@ -418,10 +444,10 @@ impl PacketStream {
             self.out_of_order += 1;
         }
 
-        if self.recent_sequence_order.len() == RECENT_SEQUENCES {
-            if let Some(expired) = self.recent_sequence_order.pop_front() {
-                self.recent_sequences.remove(&expired);
-            }
+        if self.recent_sequence_order.len() == RECENT_SEQUENCES
+            && let Some(expired) = self.recent_sequence_order.pop_front()
+        {
+            self.recent_sequences.remove(&expired);
         }
         self.recent_sequence_order.push_back(sequence);
         self.recent_sequences.insert(sequence);

@@ -4,6 +4,7 @@ mod diagnostics;
 mod inspect;
 mod journal;
 mod playout;
+mod recover;
 mod session;
 mod telemetry;
 
@@ -35,6 +36,7 @@ struct Handler {
 enum Command {
     Record { config_path: PathBuf },
     Inspect { session_directory: PathBuf },
+    Recover { session_directory: PathBuf },
 }
 
 #[async_trait]
@@ -97,6 +99,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Record { config_path } => config_path,
         Command::Inspect { session_directory } => {
             return inspect::run(&session_directory);
+        }
+        Command::Recover { session_directory } => {
+            return recover::run(&session_directory);
         }
     };
 
@@ -168,15 +173,20 @@ fn parse_command_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Res
         });
     };
 
-    if first == OsStr::new("inspect") {
+    if first == OsStr::new("inspect") || first == OsStr::new("recover") {
+        let operation = first.to_string_lossy();
         let session_directory = args
             .next()
             .map(PathBuf::from)
-            .ok_or_else(|| anyhow::anyhow!("inspect requires a session directory"))?;
+            .ok_or_else(|| anyhow::anyhow!("{operation} requires a session directory"))?;
         if let Some(extra) = args.next() {
             bail!("unexpected argument {:?}", extra);
         }
-        Ok(Command::Inspect { session_directory })
+        if first == OsStr::new("inspect") {
+            Ok(Command::Inspect { session_directory })
+        } else {
+            Ok(Command::Recover { session_directory })
+        }
     } else {
         if let Some(extra) = args.next() {
             bail!("unexpected argument {:?}", extra);
@@ -246,5 +256,21 @@ mod tests {
         )
         .unwrap_err();
         assert!(extra.to_string().contains("unexpected argument"));
+    }
+
+    #[test]
+    fn recover_argument_selects_session_directory() {
+        let command = parse_command_args(
+            [
+                OsString::from("recover"),
+                OsString::from("recordings/session-123"),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        let Command::Recover { session_directory } = command else {
+            panic!("expected recover command");
+        };
+        assert_eq!(session_directory, Path::new("recordings/session-123"));
     }
 }

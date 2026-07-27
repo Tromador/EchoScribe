@@ -7,9 +7,16 @@ use std::{
 };
 
 use serenity::async_trait;
-use songbird::{Call, CoreEvent, Event, EventContext, EventHandler, packet::Packet as _};
+use songbird::{
+    Call, CoreEvent, Event, EventContext, EventHandler,
+    events::context_data::RtpData,
+    packet::{Packet as _, PacketSize as _, rtp::RtpExtensionPacket},
+};
 
-use crate::capture::{CaptureSender, CapturedPacket};
+use crate::{
+    capture::{CaptureSender, CapturedPacket},
+    playout::OpusPayloadBounds,
+};
 
 const RECENT_SEQUENCES: usize = 4096;
 
@@ -163,10 +170,10 @@ impl StreamContinuity {
             self.out_of_order += 1;
         }
 
-        if self.recent_sequence_order.len() == RECENT_SEQUENCES {
-            if let Some(expired) = self.recent_sequence_order.pop_front() {
-                self.recent_sequences.remove(&expired);
-            }
+        if self.recent_sequence_order.len() == RECENT_SEQUENCES
+            && let Some(expired) = self.recent_sequence_order.pop_front()
+        {
+            self.recent_sequences.remove(&expired);
         }
 
         self.recent_sequence_order.push_back(sequence);
@@ -232,7 +239,20 @@ impl EventHandler for TelemetryHandler {
                 for (ssrc, voice) in &tick.speaking {
                     let packet = voice.packet.as_ref().map(|packet| {
                         let rtp = packet.rtp();
-                        (rtp.get_sequence().into(), rtp.get_timestamp().into())
+                        let opus_payload = voice_tick_opus_payload(packet);
+                        if opus_payload.is_none() {
+                            eprintln!(
+                                "Could not determine exact Opus payload bounds for SSRC {}, \
+                                 sequence {}; recovery will use the format-1 compatibility path.",
+                                ssrc,
+                                u16::from(rtp.get_sequence())
+                            );
+                        }
+                        (
+                            rtp.get_sequence().into(),
+                            rtp.get_timestamp().into(),
+                            opus_payload,
+                        )
                     });
                     let decoded_samples = voice
                         .decoded_voice
@@ -276,9 +296,60 @@ impl EventHandler for TelemetryHandler {
     }
 }
 
+fn voice_tick_opus_payload(packet: &RtpData) -> Option<OpusPayloadBounds> {
+    calculate_opus_payload_bounds(
+        &packet.packet,
+        packet.payload_offset,
+        packet.payload_end_pad,
+    )
+}
+
+fn calculate_opus_payload_bounds(
+    packet: &[u8],
+    payload_offset: usize,
+    payload_end_position: usize,
+) -> Option<OpusPayloadBounds> {
+    let rtp = songbird::packet::rtp::RtpPacket::new(packet)?;
+    let rtp_payload = rtp.payload();
+    let packet_body = rtp_payload.get(payload_offset..payload_end_position)?;
+    let extension_length = if rtp.get_extension() != 0 {
+        RtpExtensionPacket::new(packet_body)?.packet_size()
+    } else {
+        0
+    };
+    let rtp_header_length = packet.len().checked_sub(rtp_payload.len())?;
+    let start = rtp_header_length
+        .checked_add(payload_offset)?
+        .checked_add(extension_length)?;
+    let end = rtp_header_length.checked_add(payload_end_position)?;
+
+    if start > end || end > packet.len() {
+        return None;
+    }
+
+    Some(OpusPayloadBounds {
+        start: u32::try_from(start).ok()?,
+        end: u32::try_from(end).ok()?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_tick_bounds_exclude_rtp_extension_and_transport_suffix() {
+        let mut packet = vec![
+            0x90, 0x78, 0, 1, 0, 0, 3, 0, 0, 0, 0, 123, 0xbe, 0xde, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0,
+            1, 2, 3, 4,
+        ];
+        packet.extend_from_slice(&[0xaa; 20]);
+
+        assert_eq!(
+            calculate_opus_payload_bounds(&packet, 0, 16),
+            Some(OpusPayloadBounds { start: 24, end: 28 })
+        );
+    }
 
     #[test]
     fn contiguous_sequences_cross_rollover() {

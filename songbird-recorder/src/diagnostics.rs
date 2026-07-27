@@ -45,7 +45,14 @@ struct Track {
 
 impl DiagnosticWriter {
     pub(crate) fn new(session_directory: &Path) -> io::Result<Self> {
-        let directory = session_directory.join("diagnostics");
+        Self::create_in(session_directory.join("diagnostics"))
+    }
+
+    pub(crate) fn new_recovery(session_directory: &Path) -> io::Result<Self> {
+        Self::create_in(session_directory.join("recovered"))
+    }
+
+    fn create_in(directory: PathBuf) -> io::Result<Self> {
         fs::create_dir(&directory)?;
 
         Ok(Self {

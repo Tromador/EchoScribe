@@ -19,7 +19,7 @@ use tokio::{
 use crate::{
     diagnostics::{DecodedFrame, DiagnosticWriter, TrackSummary},
     journal::{self, PacketRecord},
-    playout::{self, PlayoutDecision, PlayoutRecord},
+    playout::{self, OpusPayloadBounds, PlayoutDecision, PlayoutRecord},
     session::{self, SessionEvent},
 };
 
@@ -192,13 +192,14 @@ impl CaptureSender {
         &self,
         tick: u64,
         ssrc: u32,
-        packet: Option<(u16, u32)>,
+        packet: Option<(u16, u32, Option<OpusPayloadBounds>)>,
         decoded_samples: u32,
     ) {
         let decision = match packet {
-            Some((sequence, timestamp)) => PlayoutDecision::Packet {
+            Some((sequence, timestamp, opus_payload)) => PlayoutDecision::Packet {
                 sequence,
                 timestamp,
+                opus_payload,
             },
             None => PlayoutDecision::Loss,
         };
@@ -616,7 +617,12 @@ mod tests {
 
         sender.try_send(packet(42));
         sender.try_send_speaker_mapping(123, Some("user-789".into()), 1);
-        sender.try_send_playout(10, 123, Some((42, 42 * 960)), 960);
+        sender.try_send_playout(
+            10,
+            123,
+            Some((42, 42 * 960, Some(OpusPayloadBounds { start: 12, end: 16 }))),
+            960,
+        );
         sender.try_send_audio(
             10,
             123,
@@ -642,8 +648,10 @@ mod tests {
 
         let bytes = fs::read(&playout_path).unwrap();
         let mut reader = bytes.as_slice();
-        read_playout_file_header(&mut reader).unwrap();
-        let ReadPlayoutRecord::Record(record) = read_playout_record(&mut reader).unwrap() else {
+        let format_version = read_playout_file_header(&mut reader).unwrap();
+        let ReadPlayoutRecord::Record(record) =
+            read_playout_record(&mut reader, format_version).unwrap()
+        else {
             panic!("expected one playout record");
         };
         assert_eq!(record.tick, 10);
@@ -653,11 +661,12 @@ mod tests {
             PlayoutDecision::Packet {
                 sequence: 42,
                 timestamp: 42 * 960,
+                opus_payload: Some(OpusPayloadBounds { start: 12, end: 16 }),
             }
         );
         assert_eq!(record.decoded_samples, 960);
         assert_eq!(
-            read_playout_record(&mut reader).unwrap(),
+            read_playout_record(&mut reader, format_version).unwrap(),
             ReadPlayoutRecord::EndOfFile
         );
 
