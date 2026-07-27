@@ -1,5 +1,8 @@
 mod capture;
 mod config;
+mod diagnostics;
+mod journal;
+mod session;
 mod telemetry;
 
 use std::{env, path::PathBuf, sync::Arc};
@@ -15,7 +18,7 @@ use serenity::{
 };
 use songbird::{
     Config as SongbirdConfig, SerenityInit, Songbird,
-    driver::{DecodeConfig, DecodeMode},
+    driver::{Channels, DecodeConfig, DecodeMode, SampleRate},
 };
 use telemetry::VoiceTelemetry;
 
@@ -62,8 +65,9 @@ async fn build_client(
     telemetry: Arc<VoiceTelemetry>,
 ) -> Result<(Client, Arc<Songbird>), serenity::Error> {
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
-    let voice_config =
-        SongbirdConfig::default().decode_mode(DecodeMode::Decode(DecodeConfig::default()));
+    let voice_config = SongbirdConfig::default().decode_mode(DecodeMode::Decode(
+        DecodeConfig::new(Channels::Mono, SampleRate::Hz48000),
+    ));
     let voice_manager = Songbird::serenity_from_config(voice_config);
 
     let client = Client::builder(config.token(), intents)
@@ -96,7 +100,16 @@ async fn main() -> anyhow::Result<()> {
         config.output_directory.display()
     );
 
-    let (capture_sender, capture_drain) = capture::start();
+    let (capture_sender, capture_drain) = capture::start(
+        &config.output_directory,
+        &config.guild_id.to_string(),
+        &config.channel_id.to_string(),
+    )
+    .context("failed to create the capture session")?;
+    println!(
+        "Capture session: {}.",
+        capture_drain.session_directory().display()
+    );
     let telemetry = Arc::new(VoiceTelemetry::new(capture_sender));
     let (mut client, voice_manager) = build_client(&config, Arc::clone(&telemetry))
         .await

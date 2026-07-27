@@ -5,7 +5,9 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+hound = "3.5"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 serenity = { version = "0.12.5", default-features = false, features = ["gateway", "rustls_backend", "voice"] }
 songbird = { version = "0.6.0", default-features = false, features = ["driver", "gateway", "receive", "rustls", "serenity", "tungstenite"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }

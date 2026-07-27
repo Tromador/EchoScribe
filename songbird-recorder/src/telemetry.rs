@@ -7,9 +7,9 @@ use std::{
 };
 
 use serenity::async_trait;
-use songbird::{Call, CoreEvent, Event, EventContext, EventHandler};
+use songbird::{Call, CoreEvent, Event, EventContext, EventHandler, packet::Packet as _};
 
-use crate::capture::{CaptureSender, RtpRecord};
+use crate::capture::{CaptureSender, CapturedPacket};
 
 const RECENT_SEQUENCES: usize = 4096;
 
@@ -186,6 +186,11 @@ impl EventHandler for TelemetryHandler {
                 self.telemetry
                     .speaking_updates
                     .fetch_add(1, Ordering::Relaxed);
+                self.telemetry.capture.try_send_speaker_mapping(
+                    update.ssrc,
+                    update.user_id.map(|user_id| user_id.to_string()),
+                    update.speaking.bits(),
+                );
 
                 match update.user_id {
                     Some(user_id) => println!(
@@ -202,31 +207,40 @@ impl EventHandler for TelemetryHandler {
                 let rtp = packet.rtp();
                 let ssrc = rtp.get_ssrc();
                 let sequence = rtp.get_sequence().into();
+                let packet_length = packet.packet.len();
+                let rtp_header_length = packet_length - rtp.payload().len();
+                let payload_start = rtp_header_length + packet.payload_offset;
+                let payload_end = packet_length - packet.payload_end_pad;
 
-                self.telemetry.capture.try_send(RtpRecord {
+                self.telemetry.capture.try_send(CapturedPacket {
                     ssrc,
                     sequence,
                     timestamp: rtp.get_timestamp().into(),
-                    packet_bytes: packet.packet.len(),
+                    payload_start: payload_start as u32,
+                    payload_end: payload_end as u32,
+                    packet: packet.packet.to_vec(),
                 });
                 self.telemetry.observe_rtp(ssrc, sequence);
             }
             EventContext::VoiceTick(tick) => {
-                self.telemetry.voice_ticks.fetch_add(1, Ordering::Relaxed);
+                let tick_index = self.telemetry.voice_ticks.fetch_add(1, Ordering::Relaxed);
 
                 let mut playout_packets = 0;
                 let mut playout_losses = 0;
                 let mut decoded_frames = 0;
 
-                for voice in tick.speaking.values() {
+                for (ssrc, voice) in &tick.speaking {
                     if voice.packet.is_some() {
                         playout_packets += 1;
                     } else {
                         playout_losses += 1;
                     }
 
-                    if voice.decoded_voice.is_some() {
+                    if let Some(samples) = &voice.decoded_voice {
                         decoded_frames += 1;
+                        self.telemetry
+                            .capture
+                            .try_send_audio(tick_index, *ssrc, samples.clone());
                     }
                 }
 
