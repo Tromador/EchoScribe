@@ -7,12 +7,13 @@ use std::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
+    time::{self, MissedTickBehavior},
 };
 
 use crate::{
@@ -23,6 +24,8 @@ use crate::{
 
 const QUEUE_CAPACITY: usize = 4096;
 const WRITER_BUFFER_CAPACITY: usize = 256 * 1024;
+const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
+const DURABILITY_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 
 pub(crate) struct CapturedPacket {
     pub(crate) ssrc: u32,
@@ -67,6 +70,8 @@ struct ConsumerSummary {
     packet_bytes: u64,
     stream_tails: HashMap<u32, (u16, u32)>,
     diagnostic_tracks: Vec<TrackSummary>,
+    checkpoints: u64,
+    durability_syncs: u64,
 }
 
 enum CaptureRecord {
@@ -250,6 +255,10 @@ impl CaptureDrain {
             summary.audio_samples,
         );
         println!("Session files written to {}.", session_directory.display());
+        println!(
+            "Capture durability: {} structural checkpoints, {} storage syncs.",
+            summary.checkpoints, summary.durability_syncs
+        );
 
         let mut streams = summary.stream_tails.iter().collect::<Vec<_>>();
         streams.sort_unstable_by_key(|(ssrc, _)| **ssrc);
@@ -285,6 +294,16 @@ async fn consume(
     mut diagnostic_writer: DiagnosticWriter,
 ) -> io::Result<ConsumerSummary> {
     let mut summary = ConsumerSummary::default();
+    let mut checkpoint_interval = time::interval_at(
+        time::Instant::now() + CHECKPOINT_INTERVAL,
+        CHECKPOINT_INTERVAL,
+    );
+    checkpoint_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut durability_sync_interval = time::interval_at(
+        time::Instant::now() + DURABILITY_SYNC_INTERVAL,
+        DURABILITY_SYNC_INTERVAL,
+    );
+    durability_sync_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -309,6 +328,22 @@ async fn consume(
                     diagnostic_writer,
                     summary,
                 );
+            }
+            _ = checkpoint_interval.tick() => {
+                checkpoint(
+                    &mut packet_writer,
+                    &mut event_writer,
+                    &mut diagnostic_writer,
+                )?;
+                summary.checkpoints += 1;
+            }
+            _ = durability_sync_interval.tick() => {
+                sync_data(
+                    &packet_writer,
+                    &event_writer,
+                    &diagnostic_writer,
+                )?;
+                summary.durability_syncs += 1;
             }
             record = receiver.recv() => {
                 match record {
@@ -359,6 +394,26 @@ fn write_and_observe(
     }
 
     Ok(())
+}
+
+fn checkpoint(
+    packet_writer: &mut BufWriter<File>,
+    event_writer: &mut BufWriter<File>,
+    diagnostic_writer: &mut DiagnosticWriter,
+) -> io::Result<()> {
+    packet_writer.flush()?;
+    event_writer.flush()?;
+    diagnostic_writer.checkpoint()
+}
+
+fn sync_data(
+    packet_writer: &BufWriter<File>,
+    event_writer: &BufWriter<File>,
+    diagnostic_writer: &DiagnosticWriter,
+) -> io::Result<()> {
+    packet_writer.get_ref().sync_data()?;
+    event_writer.get_ref().sync_data()?;
+    diagnostic_writer.sync_data()
 }
 
 fn finish(

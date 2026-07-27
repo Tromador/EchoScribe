@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{self, BufWriter},
     path::{Path, PathBuf},
 };
@@ -64,6 +64,22 @@ impl DiagnosticWriter {
             .get_mut(&frame.ssrc)
             .expect("track was inserted above")
             .write_frame(frame)
+    }
+
+    pub(crate) fn checkpoint(&mut self) -> io::Result<()> {
+        for track in self.tracks.values_mut() {
+            track.checkpoint()?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn sync_data(&self) -> io::Result<()> {
+        for track in self.tracks.values() {
+            track.sync_data()?;
+        }
+
+        Ok(())
     }
 
     pub(crate) fn finalize(self) -> io::Result<Vec<TrackSummary>> {
@@ -144,8 +160,18 @@ impl Track {
         Ok(())
     }
 
+    fn checkpoint(&mut self) -> io::Result<()> {
+        self.writer.flush().map_err(hound_error)
+    }
+
+    fn sync_data(&self) -> io::Result<()> {
+        sync_path(&self.path)
+    }
+
     fn finalize(self, ssrc: u32) -> io::Result<TrackSummary> {
+        let path = self.path.clone();
         self.writer.finalize().map_err(hound_error)?;
+        sync_path(&path)?;
 
         Ok(TrackSummary {
             ssrc,
@@ -161,6 +187,10 @@ impl Track {
 
 fn hound_error(error: hound::Error) -> io::Error {
     io::Error::other(error)
+}
+
+fn sync_path(path: &Path) -> io::Result<()> {
+    OpenOptions::new().write(true).open(path)?.sync_data()
 }
 
 #[cfg(test)]
@@ -225,6 +255,60 @@ mod tests {
         assert!(samples[..960].iter().all(|sample| *sample == 100));
         assert!(samples[960..1920].iter().all(|sample| *sample == 0));
         assert!(samples[1920..].iter().all(|sample| *sample == 200));
+
+        fs::remove_dir_all(session_directory).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_makes_in_progress_wav_readable() {
+        let session_directory = env::temp_dir().join(format!(
+            "echoscribe-checkpoint-test-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&session_directory).unwrap();
+        let mut diagnostics = DiagnosticWriter::new(&session_directory).unwrap();
+        let wav_path = session_directory.join("diagnostics/ssrc-4326.wav");
+
+        diagnostics
+            .write_frame(DecodedFrame {
+                tick: 10,
+                ssrc: 4326,
+                samples: vec![100; SAMPLES_PER_TICK as usize],
+            })
+            .unwrap();
+        diagnostics.checkpoint().unwrap();
+        diagnostics.sync_data().unwrap();
+
+        {
+            let mut reader = WavReader::open(&wav_path).unwrap();
+            let samples = reader
+                .samples::<i16>()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(samples, vec![100; SAMPLES_PER_TICK as usize]);
+        }
+
+        diagnostics
+            .write_frame(DecodedFrame {
+                tick: 11,
+                ssrc: 4326,
+                samples: vec![200; SAMPLES_PER_TICK as usize],
+            })
+            .unwrap();
+        diagnostics.finalize().unwrap();
+
+        let mut reader = WavReader::open(wav_path).unwrap();
+        let samples = reader
+            .samples::<i16>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(samples.len(), 2 * SAMPLES_PER_TICK as usize);
+        assert!(samples[..960].iter().all(|sample| *sample == 100));
+        assert!(samples[960..].iter().all(|sample| *sample == 200));
 
         fs::remove_dir_all(session_directory).unwrap();
     }
