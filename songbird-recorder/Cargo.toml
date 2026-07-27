@@ -1,0 +1,12 @@
+[package]
+name = "songbird-recorder"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serenity = { version = "0.12.5", default-features = false, features = ["gateway", "rustls_backend", "voice"] }
+songbird = { version = "0.6.0", default-features = false, features = ["driver", "gateway", "receive", "rustls", "serenity", "tungstenite"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+toml = "1.1.3"

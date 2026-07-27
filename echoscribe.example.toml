@@ -1,0 +1,18 @@
+version = 1
+
+[discord]
+token = "replace-with-discord-bot-token"
+guild_id = "replace-with-discord-guild-id"
+channel_id = "replace-with-discord-voice-channel-id"
+
+[recording]
+# Relative paths are resolved from the directory containing this file.
+output_directory = "recordings"
+
+[transcription]
+model = "large-v3"
+language = "en"
+device = "cuda"
+compute_type = "float16"
+beam_size = 5
+vocabulary_file = "vocabulary.txt"
