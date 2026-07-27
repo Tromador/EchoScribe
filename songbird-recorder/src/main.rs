@@ -8,7 +8,7 @@ mod recover;
 mod session;
 mod telemetry;
 
-use std::{env, ffi::OsStr, path::PathBuf, sync::Arc};
+use std::{env, path::PathBuf, sync::Arc};
 
 use anyhow::{Context as AnyhowContext, Result, bail};
 use capture::CaptureDrain;
@@ -37,6 +37,7 @@ enum Command {
     Record { config_path: PathBuf },
     Inspect { session_directory: PathBuf },
     Recover { session_directory: PathBuf },
+    Export { session_directory: PathBuf },
 }
 
 #[async_trait]
@@ -102,6 +103,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Recover { session_directory } => {
             return recover::run(&session_directory);
+        }
+        Command::Export { session_directory } => {
+            return recover::export(&session_directory);
         }
     };
 
@@ -173,7 +177,7 @@ fn parse_command_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Res
         });
     };
 
-    if first == OsStr::new("inspect") || first == OsStr::new("recover") {
+    if matches!(first.to_str(), Some("inspect" | "recover" | "export")) {
         let operation = first.to_string_lossy();
         let session_directory = args
             .next()
@@ -182,10 +186,11 @@ fn parse_command_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Res
         if let Some(extra) = args.next() {
             bail!("unexpected argument {:?}", extra);
         }
-        if first == OsStr::new("inspect") {
-            Ok(Command::Inspect { session_directory })
-        } else {
-            Ok(Command::Recover { session_directory })
+        match first.to_str() {
+            Some("inspect") => Ok(Command::Inspect { session_directory }),
+            Some("recover") => Ok(Command::Recover { session_directory }),
+            Some("export") => Ok(Command::Export { session_directory }),
+            _ => unreachable!("command was matched above"),
         }
     } else {
         if let Some(extra) = args.next() {
@@ -270,6 +275,22 @@ mod tests {
         .unwrap();
         let Command::Recover { session_directory } = command else {
             panic!("expected recover command");
+        };
+        assert_eq!(session_directory, Path::new("recordings/session-123"));
+    }
+
+    #[test]
+    fn export_argument_selects_session_directory() {
+        let command = parse_command_args(
+            [
+                OsString::from("export"),
+                OsString::from("recordings/session-123"),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        let Command::Export { session_directory } = command else {
+            panic!("expected export command");
         };
         assert_eq!(session_directory, Path::new("recordings/session-123"));
     }

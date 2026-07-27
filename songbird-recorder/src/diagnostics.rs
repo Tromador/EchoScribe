@@ -20,6 +20,7 @@ pub(crate) struct DecodedFrame {
 pub(crate) struct DiagnosticWriter {
     directory: PathBuf,
     tracks: HashMap<u32, Track>,
+    align_to_session_start: bool,
 }
 
 pub(crate) struct TrackSummary {
@@ -45,25 +46,35 @@ struct Track {
 
 impl DiagnosticWriter {
     pub(crate) fn new(session_directory: &Path) -> io::Result<Self> {
-        Self::create_in(session_directory.join("diagnostics"))
+        Self::create_in(session_directory.join("diagnostics"), false)
     }
 
     pub(crate) fn new_recovery(session_directory: &Path) -> io::Result<Self> {
-        Self::create_in(session_directory.join("recovered"))
+        Self::create_in(session_directory.join("recovered"), false)
     }
 
-    fn create_in(directory: PathBuf) -> io::Result<Self> {
+    pub(crate) fn new_tracks(session_directory: &Path) -> io::Result<Self> {
+        Self::create_in(session_directory.join("tracks"), true)
+    }
+
+    fn create_in(directory: PathBuf, align_to_session_start: bool) -> io::Result<Self> {
         fs::create_dir(&directory)?;
 
         Ok(Self {
             directory,
             tracks: HashMap::new(),
+            align_to_session_start,
         })
     }
 
     pub(crate) fn write_frame(&mut self, frame: DecodedFrame) -> io::Result<()> {
         if !self.tracks.contains_key(&frame.ssrc) {
-            let track = Track::create(&self.directory, frame.ssrc, frame.tick)?;
+            let track = Track::create(
+                &self.directory,
+                frame.ssrc,
+                frame.tick,
+                self.align_to_session_start,
+            )?;
             self.tracks.insert(frame.ssrc, track);
         }
 
@@ -102,7 +113,12 @@ impl DiagnosticWriter {
 }
 
 impl Track {
-    fn create(directory: &Path, ssrc: u32, first_tick: u64) -> io::Result<Self> {
+    fn create(
+        directory: &Path,
+        ssrc: u32,
+        first_tick: u64,
+        align_to_session_start: bool,
+    ) -> io::Result<Self> {
         let path = directory.join(format!("ssrc-{ssrc}.wav"));
         let writer = WavWriter::create(
             &path,
@@ -119,7 +135,11 @@ impl Track {
             writer,
             path,
             first_tick,
-            next_tick: first_tick,
+            next_tick: if align_to_session_start {
+                0
+            } else {
+                first_tick
+            },
             frames: 0,
             source_samples: 0,
             inserted_silence_samples: 0,
@@ -316,6 +336,43 @@ mod tests {
         assert_eq!(samples.len(), 2 * SAMPLES_PER_TICK as usize);
         assert!(samples[..960].iter().all(|sample| *sample == 100));
         assert!(samples[960..].iter().all(|sample| *sample == 200));
+
+        fs::remove_dir_all(session_directory).unwrap();
+    }
+
+    #[test]
+    fn aligned_track_starts_with_silence_from_tick_zero() {
+        let session_directory = env::temp_dir().join(format!(
+            "echoscribe-aligned-track-test-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&session_directory).unwrap();
+        let mut tracks = DiagnosticWriter::new_tracks(&session_directory).unwrap();
+
+        tracks
+            .write_frame(DecodedFrame {
+                tick: 2,
+                ssrc: 4326,
+                samples: vec![100; SAMPLES_PER_TICK as usize],
+            })
+            .unwrap();
+
+        let summaries = tracks.finalize().unwrap();
+        assert_eq!(summaries[0].first_tick, 2);
+        assert_eq!(summaries[0].inserted_silence_samples, 2 * SAMPLES_PER_TICK);
+
+        let mut reader = WavReader::open(&summaries[0].path).unwrap();
+        let samples = reader
+            .samples::<i16>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(samples.len(), 3 * SAMPLES_PER_TICK as usize);
+        assert!(samples[..1920].iter().all(|sample| *sample == 0));
+        assert!(samples[1920..].iter().all(|sample| *sample == 100));
 
         fs::remove_dir_all(session_directory).unwrap();
     }
