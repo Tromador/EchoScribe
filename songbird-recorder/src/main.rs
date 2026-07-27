@@ -1,14 +1,15 @@
 mod capture;
 mod config;
 mod diagnostics;
+mod inspect;
 mod journal;
 mod playout;
 mod session;
 mod telemetry;
 
-use std::{env, path::PathBuf, sync::Arc};
+use std::{env, ffi::OsStr, path::PathBuf, sync::Arc};
 
-use anyhow::Context as AnyhowContext;
+use anyhow::{Context as AnyhowContext, Result, bail};
 use capture::CaptureDrain;
 use config::Config;
 use serenity::{
@@ -28,6 +29,12 @@ struct Handler {
     telemetry: Arc<VoiceTelemetry>,
     guild_id: GuildId,
     channel_id: ChannelId,
+}
+
+#[derive(Debug)]
+enum Command {
+    Record { config_path: PathBuf },
+    Inspect { session_directory: PathBuf },
 }
 
 #[async_trait]
@@ -86,10 +93,13 @@ async fn build_client(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config_path = env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("echoscribe.toml"));
+    let config_path = match parse_command()? {
+        Command::Record { config_path } => config_path,
+        Command::Inspect { session_directory } => {
+            return inspect::run(&session_directory);
+        }
+    };
+
     let config = Config::load(&config_path)?;
 
     println!(
@@ -147,6 +157,94 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn parse_command() -> Result<Command> {
+    parse_command_args(env::args_os().skip(1))
+}
+
+fn parse_command_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<Command> {
+    let Some(first) = args.next() else {
+        return Ok(Command::Record {
+            config_path: PathBuf::from("echoscribe.toml"),
+        });
+    };
+
+    if first == OsStr::new("inspect") {
+        let session_directory = args
+            .next()
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("inspect requires a session directory"))?;
+        if let Some(extra) = args.next() {
+            bail!("unexpected argument {:?}", extra);
+        }
+        Ok(Command::Inspect { session_directory })
+    } else {
+        if let Some(extra) = args.next() {
+            bail!("unexpected argument {:?}", extra);
+        }
+        Ok(Command::Record {
+            config_path: PathBuf::from(first),
+        })
+    }
+}
+
 async fn stop_capture(capture: CaptureDrain) {
     capture.stop().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{ffi::OsString, path::Path};
+
+    use super::*;
+
+    #[test]
+    fn no_arguments_uses_default_config() {
+        let command = parse_command_args(Vec::<OsString>::new().into_iter()).unwrap();
+        let Command::Record { config_path } = command else {
+            panic!("expected record command");
+        };
+        assert_eq!(config_path, Path::new("echoscribe.toml"));
+    }
+
+    #[test]
+    fn one_path_argument_selects_recording_config() {
+        let command = parse_command_args([OsString::from("other.toml")].into_iter()).unwrap();
+        let Command::Record { config_path } = command else {
+            panic!("expected record command");
+        };
+        assert_eq!(config_path, Path::new("other.toml"));
+    }
+
+    #[test]
+    fn inspect_argument_selects_session_directory() {
+        let command = parse_command_args(
+            [
+                OsString::from("inspect"),
+                OsString::from("recordings/session-123"),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        let Command::Inspect { session_directory } = command else {
+            panic!("expected inspect command");
+        };
+        assert_eq!(session_directory, Path::new("recordings/session-123"));
+    }
+
+    #[test]
+    fn inspect_requires_exactly_one_session_directory() {
+        let missing = parse_command_args([OsString::from("inspect")].into_iter()).unwrap_err();
+        assert!(missing.to_string().contains("requires a session directory"));
+
+        let extra = parse_command_args(
+            [
+                OsString::from("inspect"),
+                OsString::from("session"),
+                OsString::from("extra"),
+            ]
+            .into_iter(),
+        )
+        .unwrap_err();
+        assert!(extra.to_string().contains("unexpected argument"));
+    }
 }

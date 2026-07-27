@@ -687,6 +687,8 @@ mod tests {
             vec![321; crate::diagnostics::SAMPLES_PER_TICK as usize]
         );
 
+        crate::inspect::run(&session_path).unwrap();
+
         fs::remove_dir_all(output_directory).unwrap();
     }
 }

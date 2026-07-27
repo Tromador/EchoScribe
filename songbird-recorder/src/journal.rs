@@ -5,10 +5,7 @@
 //! body itself. An incomplete final length or body is treated as a recoverable
 //! truncated tail.
 
-use std::io::{self, ErrorKind, Write};
-
-#[cfg(test)]
-use std::io::Read;
+use std::io::{self, ErrorKind, Read, Write};
 
 const MAGIC: &[u8; 8] = b"ECHOPKT\0";
 pub(crate) const FORMAT_VERSION: u16 = 1;
@@ -28,7 +25,6 @@ pub(crate) struct PacketRecord {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-#[cfg(test)]
 pub(crate) enum ReadRecord {
     Record(PacketRecord),
     EndOfFile,
@@ -41,7 +37,6 @@ pub(crate) fn write_file_header(writer: &mut impl Write) -> io::Result<()> {
     writer.write_all(&FILE_HEADER_LENGTH.to_le_bytes())
 }
 
-#[cfg(test)]
 pub(crate) fn read_file_header(reader: &mut impl Read) -> io::Result<()> {
     let mut header = [0_u8; FILE_HEADER_LENGTH as usize];
 
@@ -100,7 +95,6 @@ pub(crate) fn write_record(writer: &mut impl Write, record: &PacketRecord) -> io
     writer.write_all(&record.packet)
 }
 
-#[cfg(test)]
 pub(crate) fn read_record(reader: &mut impl Read) -> io::Result<ReadRecord> {
     let mut length_bytes = [0_u8; 4];
 
@@ -165,7 +159,6 @@ fn validate_payload_bounds(record: &PacketRecord) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
 fn read_up_to(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<usize> {
     let mut filled = 0;
 
@@ -181,7 +174,6 @@ fn read_up_to(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<usize> {
     Ok(filled)
 }
 
-#[cfg(test)]
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(ErrorKind::InvalidData, message.into())
 }

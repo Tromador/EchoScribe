@@ -4,7 +4,7 @@ use std::{
     path::Path,
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub(crate) const SESSION_FORMAT_VERSION: u16 = 2;
 pub(crate) const EVENT_FORMAT_VERSION: u16 = 1;
@@ -37,7 +37,7 @@ struct FileDescription {
     format: u16,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub(crate) enum SessionEvent {
     SpeakerMapping {
