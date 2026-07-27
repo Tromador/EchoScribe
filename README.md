@@ -67,7 +67,7 @@ CTranslate2 is available on PyPI (for example, `pip index versions ctranslate2` 
 
 ---
 
-See also [Pipeline Document](https://github.com/Tromador/Discord-Transcription-Stack/blob/main/discord_transcript_pipeline.md)
+See also [Pipeline Document](https://github.com/Tromador/EchoScribe/blob/main/discord_transcript_pipeline.md)
 
 ---
 
