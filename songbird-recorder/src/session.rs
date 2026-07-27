@@ -6,7 +6,7 @@ use std::{
 
 use serde::Serialize;
 
-pub(crate) const SESSION_FORMAT_VERSION: u16 = 1;
+pub(crate) const SESSION_FORMAT_VERSION: u16 = 2;
 pub(crate) const EVENT_FORMAT_VERSION: u16 = 1;
 
 #[derive(Serialize)]
@@ -27,6 +27,7 @@ struct DiscordSession<'a> {
 #[derive(Serialize)]
 struct SessionFiles {
     packets: FileDescription,
+    playout: FileDescription,
     events: FileDescription,
 }
 
@@ -85,7 +86,11 @@ pub(crate) fn write_session_file(
         files: SessionFiles {
             packets: FileDescription {
                 path: "packets.dat",
-                format: 1,
+                format: crate::journal::FORMAT_VERSION,
+            },
+            playout: FileDescription {
+                path: "playout.dat",
+                format: crate::playout::FORMAT_VERSION,
             },
             events: FileDescription {
                 path: "events.ndjson",

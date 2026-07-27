@@ -230,7 +230,22 @@ impl EventHandler for TelemetryHandler {
                 let mut decoded_frames = 0;
 
                 for (ssrc, voice) in &tick.speaking {
-                    if voice.packet.is_some() {
+                    let packet = voice.packet.as_ref().map(|packet| {
+                        let rtp = packet.rtp();
+                        (rtp.get_sequence().into(), rtp.get_timestamp().into())
+                    });
+                    let decoded_samples = voice
+                        .decoded_voice
+                        .as_ref()
+                        .map_or(0, |samples| samples.len() as u32);
+                    self.telemetry.capture.try_send_playout(
+                        tick_index,
+                        *ssrc,
+                        packet,
+                        decoded_samples,
+                    );
+
+                    if packet.is_some() {
                         playout_packets += 1;
                     } else {
                         playout_losses += 1;

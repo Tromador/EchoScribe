@@ -2,6 +2,7 @@ mod capture;
 mod config;
 mod diagnostics;
 mod journal;
+mod playout;
 mod session;
 mod telemetry;
 

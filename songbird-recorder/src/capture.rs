@@ -19,6 +19,7 @@ use tokio::{
 use crate::{
     diagnostics::{DecodedFrame, DiagnosticWriter, TrackSummary},
     journal::{self, PacketRecord},
+    playout::{self, PlayoutDecision, PlayoutRecord},
     session::{self, SessionEvent},
 };
 
@@ -56,6 +57,7 @@ struct ProducerMetrics {
     full_drops: AtomicU64,
     closed_drops: AtomicU64,
     event_drops: AtomicU64,
+    playout_drops: AtomicU64,
     audio_drops: AtomicU64,
     high_water: AtomicUsize,
 }
@@ -65,6 +67,7 @@ struct ConsumerSummary {
     records: u64,
     packet_records: u64,
     event_records: u64,
+    playout_records: u64,
     audio_frames: u64,
     audio_samples: u64,
     packet_bytes: u64,
@@ -77,6 +80,7 @@ struct ConsumerSummary {
 enum CaptureRecord {
     Packet(PacketRecord),
     Event(SessionEvent),
+    Playout(PlayoutRecord),
     Audio(DecodedFrame),
 }
 
@@ -110,6 +114,12 @@ pub(crate) fn start(
         .create_new(true)
         .open(session_directory.join("events.ndjson"))?;
     let event_writer = BufWriter::new(events_file);
+    let playout_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(session_directory.join("playout.dat"))?;
+    let mut playout_writer = BufWriter::with_capacity(WRITER_BUFFER_CAPACITY, playout_file);
+    playout::write_file_header(&mut playout_writer)?;
     let diagnostic_writer = DiagnosticWriter::new(&session_directory)?;
 
     let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
@@ -120,6 +130,7 @@ pub(crate) fn start(
         stop_receiver,
         packet_writer,
         event_writer,
+        playout_writer,
         diagnostic_writer,
     ));
 
@@ -177,8 +188,31 @@ impl CaptureSender {
         }));
     }
 
+    pub(crate) fn try_send_playout(
+        &self,
+        tick: u64,
+        ssrc: u32,
+        packet: Option<(u16, u32)>,
+        decoded_samples: u32,
+    ) {
+        let decision = match packet {
+            Some((sequence, timestamp)) => PlayoutDecision::Packet {
+                sequence,
+                timestamp,
+            },
+            None => PlayoutDecision::Loss,
+        };
+        self.try_send_record(CaptureRecord::Playout(PlayoutRecord {
+            tick,
+            ssrc,
+            decision,
+            decoded_samples,
+        }));
+    }
+
     fn try_send_record(&self, record: CaptureRecord) {
         let is_event = matches!(&record, CaptureRecord::Event(_));
+        let is_playout = matches!(&record, CaptureRecord::Playout(_));
         let is_audio = matches!(&record, CaptureRecord::Audio(_));
         let depth_after_send = self.sender.max_capacity() - self.sender.capacity() + 1;
 
@@ -194,6 +228,9 @@ impl CaptureSender {
                 if is_event {
                     self.metrics.event_drops.fetch_add(1, Ordering::Relaxed);
                 }
+                if is_playout {
+                    self.metrics.playout_drops.fetch_add(1, Ordering::Relaxed);
+                }
                 if is_audio {
                     self.metrics.audio_drops.fetch_add(1, Ordering::Relaxed);
                 }
@@ -205,6 +242,9 @@ impl CaptureSender {
                 self.metrics.closed_drops.fetch_add(1, Ordering::Relaxed);
                 if is_event {
                     self.metrics.event_drops.fetch_add(1, Ordering::Relaxed);
+                }
+                if is_playout {
+                    self.metrics.playout_drops.fetch_add(1, Ordering::Relaxed);
                 }
                 if is_audio {
                     self.metrics.audio_drops.fetch_add(1, Ordering::Relaxed);
@@ -238,16 +278,19 @@ impl CaptureDrain {
     fn report(metrics: &ProducerMetrics, summary: &ConsumerSummary, session_directory: &Path) {
         println!(
             "Capture queue: {} records accepted, {} consumed ({} packets, {} events, \
-             {} audio frames), {} full drops, {} closed drops, {} event drops, \
-             {} audio drops, high-water {}/{}, {} packet bytes and {} audio samples consumed.",
+             {} playout decisions, {} audio frames), {} full drops, {} closed drops, \
+             {} event drops, {} playout drops, {} audio drops, high-water {}/{}, \
+             {} packet bytes and {} audio samples consumed.",
             metrics.accepted.load(Ordering::Relaxed),
             summary.records,
             summary.packet_records,
             summary.event_records,
+            summary.playout_records,
             summary.audio_frames,
             metrics.full_drops.load(Ordering::Relaxed),
             metrics.closed_drops.load(Ordering::Relaxed),
             metrics.event_drops.load(Ordering::Relaxed),
+            metrics.playout_drops.load(Ordering::Relaxed),
             metrics.audio_drops.load(Ordering::Relaxed),
             metrics.high_water.load(Ordering::Relaxed),
             QUEUE_CAPACITY,
@@ -291,6 +334,7 @@ async fn consume(
     mut stop: oneshot::Receiver<()>,
     mut packet_writer: BufWriter<File>,
     mut event_writer: BufWriter<File>,
+    mut playout_writer: BufWriter<File>,
     mut diagnostic_writer: DiagnosticWriter,
 ) -> io::Result<ConsumerSummary> {
     let mut summary = ConsumerSummary::default();
@@ -316,6 +360,7 @@ async fn consume(
                     write_and_observe(
                         &mut packet_writer,
                         &mut event_writer,
+                        &mut playout_writer,
                         &mut diagnostic_writer,
                         &mut summary,
                         record,
@@ -325,6 +370,7 @@ async fn consume(
                 return finish(
                     packet_writer,
                     event_writer,
+                    playout_writer,
                     diagnostic_writer,
                     summary,
                 );
@@ -333,6 +379,7 @@ async fn consume(
                 checkpoint(
                     &mut packet_writer,
                     &mut event_writer,
+                    &mut playout_writer,
                     &mut diagnostic_writer,
                 )?;
                 summary.checkpoints += 1;
@@ -341,6 +388,7 @@ async fn consume(
                 sync_data(
                     &packet_writer,
                     &event_writer,
+                    &playout_writer,
                     &diagnostic_writer,
                 )?;
                 summary.durability_syncs += 1;
@@ -350,6 +398,7 @@ async fn consume(
                     Some(record) => write_and_observe(
                         &mut packet_writer,
                         &mut event_writer,
+                        &mut playout_writer,
                         &mut diagnostic_writer,
                         &mut summary,
                         record,
@@ -358,6 +407,7 @@ async fn consume(
                         return finish(
                             packet_writer,
                             event_writer,
+                            playout_writer,
                             diagnostic_writer,
                             summary,
                         );
@@ -371,6 +421,7 @@ async fn consume(
 fn write_and_observe(
     packet_writer: &mut BufWriter<File>,
     event_writer: &mut BufWriter<File>,
+    playout_writer: &mut BufWriter<File>,
     diagnostic_writer: &mut DiagnosticWriter,
     summary: &mut ConsumerSummary,
     record: CaptureRecord,
@@ -386,6 +437,10 @@ fn write_and_observe(
             session::write_event(event_writer, &event)?;
             summary.event_records += 1;
         }
+        CaptureRecord::Playout(record) => {
+            playout::write_record(playout_writer, &record)?;
+            summary.playout_records += 1;
+        }
         CaptureRecord::Audio(frame) => {
             summary.audio_samples += frame.samples.len() as u64;
             diagnostic_writer.write_frame(frame)?;
@@ -399,31 +454,37 @@ fn write_and_observe(
 fn checkpoint(
     packet_writer: &mut BufWriter<File>,
     event_writer: &mut BufWriter<File>,
+    playout_writer: &mut BufWriter<File>,
     diagnostic_writer: &mut DiagnosticWriter,
 ) -> io::Result<()> {
     packet_writer.flush()?;
     event_writer.flush()?;
+    playout_writer.flush()?;
     diagnostic_writer.checkpoint()
 }
 
 fn sync_data(
     packet_writer: &BufWriter<File>,
     event_writer: &BufWriter<File>,
+    playout_writer: &BufWriter<File>,
     diagnostic_writer: &DiagnosticWriter,
 ) -> io::Result<()> {
     packet_writer.get_ref().sync_data()?;
     event_writer.get_ref().sync_data()?;
+    playout_writer.get_ref().sync_data()?;
     diagnostic_writer.sync_data()
 }
 
 fn finish(
     mut packet_writer: BufWriter<File>,
     mut event_writer: BufWriter<File>,
+    mut playout_writer: BufWriter<File>,
     diagnostic_writer: DiagnosticWriter,
     mut summary: ConsumerSummary,
 ) -> io::Result<ConsumerSummary> {
     flush_and_sync(&mut packet_writer)?;
     flush_and_sync(&mut event_writer)?;
+    flush_and_sync(&mut playout_writer)?;
     summary.diagnostic_tracks = diagnostic_writer.finalize()?;
     Ok(summary)
 }
@@ -480,7 +541,13 @@ fn create_session_directory(output_directory: &Path) -> io::Result<(PathBuf, u64
 mod tests {
     use std::{env, process};
 
-    use crate::journal::{ReadRecord, read_file_header, read_record};
+    use crate::{
+        journal::{ReadRecord, read_file_header, read_record},
+        playout::{
+            PlayoutDecision, ReadRecord as ReadPlayoutRecord,
+            read_file_header as read_playout_file_header, read_record as read_playout_record,
+        },
+    };
 
     use super::*;
 
@@ -545,9 +612,11 @@ mod tests {
         let (sender, drain) = start(&output_directory, "guild-123", "channel-456").unwrap();
         let session_path = drain.session_directory().to_path_buf();
         let packets_path = drain.session_directory().join("packets.dat");
+        let playout_path = drain.session_directory().join("playout.dat");
 
         sender.try_send(packet(42));
         sender.try_send_speaker_mapping(123, Some("user-789".into()), 1);
+        sender.try_send_playout(10, 123, Some((42, 42 * 960)), 960);
         sender.try_send_audio(
             10,
             123,
@@ -571,12 +640,34 @@ mod tests {
         assert_eq!(record.packet, packet(42).packet);
         assert_eq!(read_record(&mut reader).unwrap(), ReadRecord::EndOfFile);
 
+        let bytes = fs::read(&playout_path).unwrap();
+        let mut reader = bytes.as_slice();
+        read_playout_file_header(&mut reader).unwrap();
+        let ReadPlayoutRecord::Record(record) = read_playout_record(&mut reader).unwrap() else {
+            panic!("expected one playout record");
+        };
+        assert_eq!(record.tick, 10);
+        assert_eq!(record.ssrc, 123);
+        assert_eq!(
+            record.decision,
+            PlayoutDecision::Packet {
+                sequence: 42,
+                timestamp: 42 * 960,
+            }
+        );
+        assert_eq!(record.decoded_samples, 960);
+        assert_eq!(
+            read_playout_record(&mut reader).unwrap(),
+            ReadPlayoutRecord::EndOfFile
+        );
+
         let session: serde_json::Value =
             serde_json::from_slice(&fs::read(session_path.join("session.json")).unwrap()).unwrap();
-        assert_eq!(session["format"], 1);
+        assert_eq!(session["format"], 2);
         assert_eq!(session["discord"]["guild_id"], "guild-123");
         assert_eq!(session["discord"]["channel_id"], "channel-456");
         assert_eq!(session["files"]["packets"]["path"], "packets.dat");
+        assert_eq!(session["files"]["playout"]["path"], "playout.dat");
         assert_eq!(session["files"]["events"]["path"], "events.ndjson");
 
         let events = fs::read_to_string(session_path.join("events.ndjson")).unwrap();

@@ -11,7 +11,7 @@ use std::io::{self, ErrorKind, Write};
 use std::io::Read;
 
 const MAGIC: &[u8; 8] = b"ECHOPKT\0";
-const FORMAT_VERSION: u16 = 1;
+pub(crate) const FORMAT_VERSION: u16 = 1;
 const FILE_HEADER_LENGTH: u16 = 12;
 const RECORD_METADATA_LENGTH: usize = 30;
 const MAX_RECORD_BODY_LENGTH: usize = 65_536;
