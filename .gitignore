@@ -1,3 +1,8 @@
 /echoscribe.toml
 /recordings/
 /songbird-recorder/target/
+/AGENTS.md
+/docs/SPECIFICATION.md
+/docs/ARCHITECTURE.md
+/docs/IMPLEMENTATION_PLAN.md
+/docs/SLICE_0_RECONCILIATION.md
