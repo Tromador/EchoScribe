@@ -4,6 +4,7 @@ mod diagnostics;
 mod flac_tracks;
 mod inspect;
 mod journal;
+mod participants;
 mod playout;
 mod recover;
 mod session;
@@ -118,11 +119,11 @@ async fn main() -> anyhow::Result<()> {
     );
     println!(
         "Recordings will be written to {}.",
-        config.output_directory.display()
+        config.recording.output_directory.display()
     );
 
     let (capture_sender, capture_drain) = capture::start(
-        &config.output_directory,
+        &config.recording.output_directory,
         &config.guild_id.to_string(),
         &config.channel_id.to_string(),
     )

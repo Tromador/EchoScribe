@@ -1,0 +1,8 @@
+version = 1
+
+[participants."881203221593464864"]
+character = "Example Character"
+role = "player"
+
+[participants."123456789012345678"]
+role = "gm"

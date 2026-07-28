@@ -8,6 +8,12 @@ channel_id = "replace-with-discord-voice-channel-id"
 [recording]
 # Relative paths are resolved from the directory containing this file.
 output_directory = "recordings"
+# Diagnostic WAV is opt-in; routine recording leaves this false.
+diagnostic_wav = false
+
+[participants]
+# Copy participants.example.toml to participants.toml and edit for the session.
+file = "participants.toml"
 
 [transcription]
 model = "large-v3"
@@ -16,3 +22,9 @@ device = "cuda"
 compute_type = "float16"
 beam_size = 5
 vocabulary_file = "vocabulary.txt"
+resume_rewind_seconds = 120
+
+[segmentation]
+vad_enabled = false
+# Provisional until tuned against representative recordings.
+merge_gap_ms = 750
