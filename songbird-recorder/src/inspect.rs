@@ -13,7 +13,10 @@ use crate::{
     diagnostics::SAMPLES_PER_TICK,
     journal::{self, ReadRecord as ReadPacketRecord},
     playout::{self, PlayoutDecision, ReadRecord as ReadPlayoutRecord},
-    session::{LEGACY_SESSION_FORMAT_VERSION, SESSION_FORMAT_VERSION, SessionEvent, WorkflowState},
+    session::{
+        EVENT_FORMAT_VERSION, LEGACY_EVENT_FORMAT_VERSION, LEGACY_SESSION_FORMAT_VERSION,
+        SESSION_FORMAT_VERSION, SessionEvent, WorkflowState,
+    },
 };
 
 const RECENT_SEQUENCES: usize = 4096;
@@ -92,6 +95,8 @@ struct EventInspection {
     records: u64,
     truncated_tail: bool,
     mappings: Vec<SpeakerMapping>,
+    identity_updates: u64,
+    unresolved_abandonments: u64,
 }
 
 struct SpeakerMapping {
@@ -111,7 +116,10 @@ pub(crate) fn run(session_directory: &Path) -> Result<()> {
         &packets.packet_keys,
         manifest.files.playout.format,
     )?;
-    let events = inspect_events(&session_directory.join(&manifest.files.events.path))?;
+    let events = inspect_events(
+        &session_directory.join(&manifest.files.events.path),
+        manifest.files.events.format,
+    )?;
 
     println!("Session inspection: {}.", session_directory.display());
     println!(
@@ -171,10 +179,13 @@ pub(crate) fn run(session_directory: &Path) -> Result<()> {
     }
 
     println!(
-        "events.ndjson: {} records, {}, {} speaker mappings.",
+        "events.ndjson: {} records, {}, {} speaker mappings, {} identity updates, \
+         {} unresolved-SSRC abandonments.",
         events.records,
         tail_description(events.truncated_tail),
-        events.mappings.len()
+        events.mappings.len(),
+        events.identity_updates,
+        events.unresolved_abandonments,
     );
     for mapping in &events.mappings {
         let user = mapping.user_id.as_deref().unwrap_or("unknown");
@@ -286,7 +297,30 @@ fn validate_manifest(manifest: &SessionManifest) -> Result<()> {
         journal::FORMAT_VERSION,
     )?;
     validate_playout_description(&manifest.files.playout)?;
-    validate_file_description("events", &manifest.files.events, EVENT_JOURNAL_FILE_NAME, 1)
+    validate_event_description(&manifest.files.events)
+}
+
+fn validate_event_description(description: &FileDescription) -> Result<()> {
+    if description.path != EVENT_JOURNAL_FILE_NAME {
+        bail!(
+            "session manifest events path is {:?}; expected {:?}",
+            description.path,
+            EVENT_JOURNAL_FILE_NAME
+        );
+    }
+    if !matches!(
+        description.format,
+        LEGACY_EVENT_FORMAT_VERSION | EVENT_FORMAT_VERSION
+    ) {
+        bail!(
+            "session manifest events format is {}; expected {} or {}",
+            description.format,
+            LEGACY_EVENT_FORMAT_VERSION,
+            EVENT_FORMAT_VERSION
+        );
+    }
+
+    Ok(())
 }
 
 fn validate_playout_description(description: &FileDescription) -> Result<()> {
@@ -428,7 +462,7 @@ fn inspect_playout(
     Ok(inspection)
 }
 
-fn inspect_events(path: &Path) -> Result<EventInspection> {
+fn inspect_events(path: &Path, expected_format: u16) -> Result<EventInspection> {
     let bytes = fs::read(path)
         .with_context(|| format!("failed to read event journal {}", path.display()))?;
     let mut inspection = EventInspection::default();
@@ -442,12 +476,13 @@ fn inspect_events(path: &Path) -> Result<EventInspection> {
 
         match serde_json::from_slice::<SessionEvent>(json) {
             Ok(SessionEvent::SpeakerMapping {
+                format,
                 elapsed_nanos,
                 ssrc,
                 user_id,
                 speaking_bits,
-                ..
             }) => {
+                validate_event_record_format(format, expected_format, line_index, path)?;
                 inspection.records += 1;
                 inspection.mappings.push(SpeakerMapping {
                     elapsed_nanos,
@@ -455,6 +490,18 @@ fn inspect_events(path: &Path) -> Result<EventInspection> {
                     user_id,
                     speaking_bits,
                 });
+            }
+            Ok(SessionEvent::UserIdentity { format, .. }) => {
+                validate_event_record_format(format, expected_format, line_index, path)?;
+                validate_format_two_event(format, line_index, path)?;
+                inspection.records += 1;
+                inspection.identity_updates += 1;
+            }
+            Ok(SessionEvent::UnresolvedSsrcAbandoned { format, .. }) => {
+                validate_event_record_format(format, expected_format, line_index, path)?;
+                validate_format_two_event(format, line_index, path)?;
+                inspection.records += 1;
+                inspection.unresolved_abandonments += 1;
             }
             Err(error) if !complete_line && error.is_eof() => {
                 inspection.truncated_tail = true;
@@ -473,6 +520,34 @@ fn inspect_events(path: &Path) -> Result<EventInspection> {
     }
 
     Ok(inspection)
+}
+
+fn validate_format_two_event(actual: u16, line_index: usize, path: &Path) -> Result<()> {
+    if actual != EVENT_FORMAT_VERSION {
+        bail!(
+            "event type on line {} in {} requires format {}",
+            line_index + 1,
+            path.display(),
+            EVENT_FORMAT_VERSION
+        );
+    }
+    Ok(())
+}
+
+fn validate_event_record_format(
+    actual: u16,
+    expected: u16,
+    line_index: usize,
+    path: &Path,
+) -> Result<()> {
+    if actual != expected {
+        bail!(
+            "event format {actual} on line {} in {} does not match manifest format {expected}",
+            line_index + 1,
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 impl PacketStream {
@@ -609,6 +684,36 @@ mod tests {
                 .contains("unsupported session manifest format 99")
         );
 
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn format_one_events_remain_inspectable() {
+        let directory = env::temp_dir().join(format!(
+            "echoscribe-inspect-events-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join(EVENT_JOURNAL_FILE_NAME);
+        fs::write(
+            &path,
+            concat!(
+                "{\"event\":\"speaker_mapping\",\"format\":1,\"elapsed_nanos\":123,",
+                "\"ssrc\":4326,\"user_id\":\"881203221593464864\",\"speaking_bits\":1}\n"
+            ),
+        )
+        .unwrap();
+
+        let inspection = inspect_events(&path, LEGACY_EVENT_FORMAT_VERSION).unwrap();
+
+        assert_eq!(inspection.records, 1);
+        assert_eq!(inspection.mappings.len(), 1);
+        assert_eq!(inspection.identity_updates, 0);
+        assert_eq!(inspection.unresolved_abandonments, 0);
         fs::remove_dir_all(directory).unwrap();
     }
 }

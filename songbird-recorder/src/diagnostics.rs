@@ -11,7 +11,9 @@ pub(crate) const SAMPLE_RATE: u32 = 48_000;
 pub(crate) const CHANNELS: u16 = 1;
 pub(crate) const SAMPLES_PER_TICK: u64 = 960;
 
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct DecodedFrame {
+    pub(crate) elapsed_nanos: u64,
     pub(crate) tick: u64,
     pub(crate) ssrc: u32,
     pub(crate) samples: Vec<i16>,
@@ -61,7 +63,7 @@ impl DiagnosticWriter {
         })
     }
 
-    pub(crate) fn write_frame(&mut self, frame: DecodedFrame) -> io::Result<()> {
+    pub(crate) fn write_frame(&mut self, frame: &DecodedFrame) -> io::Result<()> {
         if !self.tracks.contains_key(&frame.ssrc) {
             let track = Track::create(&self.directory, frame.ssrc, frame.tick)?;
             self.tracks.insert(frame.ssrc, track);
@@ -127,7 +129,7 @@ impl Track {
         })
     }
 
-    fn write_frame(&mut self, frame: DecodedFrame) -> io::Result<()> {
+    fn write_frame(&mut self, frame: &DecodedFrame) -> io::Result<()> {
         if frame.tick < self.next_tick {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -225,14 +227,16 @@ mod tests {
         let mut diagnostics = DiagnosticWriter::new(&session_directory).unwrap();
 
         diagnostics
-            .write_frame(DecodedFrame {
+            .write_frame(&DecodedFrame {
+                elapsed_nanos: 200_000_000,
                 tick: 10,
                 ssrc: 4326,
                 samples: vec![100; SAMPLES_PER_TICK as usize],
             })
             .unwrap();
         diagnostics
-            .write_frame(DecodedFrame {
+            .write_frame(&DecodedFrame {
+                elapsed_nanos: 240_000_000,
                 tick: 12,
                 ssrc: 4326,
                 samples: vec![200; SAMPLES_PER_TICK as usize],
@@ -281,7 +285,8 @@ mod tests {
         let wav_path = session_directory.join("diagnostics/ssrc-4326.wav");
 
         diagnostics
-            .write_frame(DecodedFrame {
+            .write_frame(&DecodedFrame {
+                elapsed_nanos: 200_000_000,
                 tick: 10,
                 ssrc: 4326,
                 samples: vec![100; SAMPLES_PER_TICK as usize],
@@ -300,7 +305,8 @@ mod tests {
         }
 
         diagnostics
-            .write_frame(DecodedFrame {
+            .write_frame(&DecodedFrame {
+                elapsed_nanos: 220_000_000,
                 tick: 11,
                 ssrc: 4326,
                 samples: vec![200; SAMPLES_PER_TICK as usize],

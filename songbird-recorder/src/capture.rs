@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
@@ -19,6 +19,7 @@ use tokio::{
 use crate::{
     artifacts::{EVENT_JOURNAL_FILE_NAME, PACKET_JOURNAL_FILE_NAME, PLAYOUT_JOURNAL_FILE_NAME},
     diagnostics::{DecodedFrame, DiagnosticWriter, TrackSummary},
+    identity::{IdentityRouter, RoutingAction, UnresolvedSsrcAbandonment, UserIdentity},
     journal::{self, PacketRecord},
     participants::ParticipantContext,
     playout::{self, OpusPayloadBounds, PlayoutDecision, PlayoutRecord},
@@ -69,12 +70,19 @@ struct ConsumerSummary {
     records: u64,
     packet_records: u64,
     event_records: u64,
+    generated_event_records: u64,
     playout_records: u64,
     audio_frames: u64,
     audio_samples: u64,
     packet_bytes: u64,
     stream_tails: HashMap<u32, (u16, u32)>,
     diagnostic_tracks: Vec<TrackSummary>,
+    resolved_frames: u64,
+    resolved_samples: u64,
+    identity_updates: u64,
+    unresolved_abandonments: u64,
+    abandoned_users: HashSet<u64>,
+    missing_participant_warnings: u64,
     checkpoints: u64,
     durability_syncs: u64,
 }
@@ -160,6 +168,7 @@ fn start_in_session_directory(
             participants,
         },
     )?;
+    let identity_router = IdentityRouter::new(participants.discord_user_ids());
 
     let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
     let (stop, stop_receiver) = oneshot::channel();
@@ -171,6 +180,7 @@ fn start_in_session_directory(
         event_writer,
         playout_writer,
         diagnostic_writer,
+        identity_router,
     ));
     let session_directory = session_directory.disarm();
 
@@ -252,8 +262,29 @@ impl CaptureSender {
         )));
     }
 
+    pub(crate) fn try_send_user_identity(
+        &self,
+        discord_user_id: u64,
+        server_display_name: Option<String>,
+        global_display_name: Option<String>,
+        username: String,
+    ) {
+        let elapsed_nanos =
+            u64::try_from(self.session_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.try_send_record(CaptureRecord::Event(SessionEvent::user_identity(
+            elapsed_nanos,
+            discord_user_id.to_string(),
+            server_display_name,
+            global_display_name,
+            username,
+        )));
+    }
+
     pub(crate) fn try_send_audio(&self, tick: u64, ssrc: u32, samples: Vec<i16>) {
+        let elapsed_nanos =
+            u64::try_from(self.session_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.try_send_record(CaptureRecord::Audio(DecodedFrame {
+            elapsed_nanos,
             tick,
             ssrc,
             samples,
@@ -370,10 +401,24 @@ impl CaptureDrain {
             summary.packet_bytes,
             summary.audio_samples,
         );
+        println!(
+            "Capture-generated events: {}.",
+            summary.generated_event_records
+        );
         println!("Session files written to {}.", session_directory.display());
         println!(
             "Capture durability: {} structural checkpoints, {} storage syncs.",
             summary.checkpoints, summary.durability_syncs
+        );
+        println!(
+            "Identity routing: {} identity updates, {} resolved frames ({} samples), \
+             {} unresolved SSRC abandonments, {} abandoned users, {} missing-participant warnings.",
+            summary.identity_updates,
+            summary.resolved_frames,
+            summary.resolved_samples,
+            summary.unresolved_abandonments,
+            summary.abandoned_users.len(),
+            summary.missing_participant_warnings,
         );
 
         let mut streams = summary.stream_tails.iter().collect::<Vec<_>>();
@@ -409,6 +454,7 @@ async fn consume(
     mut event_writer: BufWriter<File>,
     mut playout_writer: BufWriter<File>,
     mut diagnostic_writer: DiagnosticWriter,
+    mut identity_router: IdentityRouter,
 ) -> io::Result<ConsumerSummary> {
     let mut summary = ConsumerSummary::default();
     let mut checkpoint_interval = time::interval_at(
@@ -435,11 +481,17 @@ async fn consume(
                         &mut event_writer,
                         &mut playout_writer,
                         &mut diagnostic_writer,
+                        &mut identity_router,
                         &mut summary,
                         record,
                     )?;
                 }
 
+                finish_identity_routing(
+                    &mut event_writer,
+                    &mut identity_router,
+                    &mut summary,
+                )?;
                 return finish(
                     packet_writer,
                     event_writer,
@@ -473,10 +525,16 @@ async fn consume(
                         &mut event_writer,
                         &mut playout_writer,
                         &mut diagnostic_writer,
+                        &mut identity_router,
                         &mut summary,
                         record,
                     )?,
                     None => {
+                        finish_identity_routing(
+                            &mut event_writer,
+                            &mut identity_router,
+                            &mut summary,
+                        )?;
                         return finish(
                             packet_writer,
                             event_writer,
@@ -496,6 +554,7 @@ fn write_and_observe(
     event_writer: &mut BufWriter<File>,
     playout_writer: &mut BufWriter<File>,
     diagnostic_writer: &mut DiagnosticWriter,
+    identity_router: &mut IdentityRouter,
     summary: &mut ConsumerSummary,
     record: CaptureRecord,
 ) -> io::Result<()> {
@@ -509,6 +568,46 @@ fn write_and_observe(
         CaptureRecord::Event(event) => {
             session::write_event(event_writer, &event)?;
             summary.event_records += 1;
+            let actions = match event {
+                SessionEvent::SpeakerMapping { ssrc, user_id, .. } => {
+                    let user_id = user_id
+                        .map(|user_id| {
+                            user_id.parse::<u64>().map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!(
+                                        "speaker mapping contains invalid Discord user ID \
+                                         {user_id:?}"
+                                    ),
+                                )
+                            })
+                        })
+                        .transpose()?;
+                    identity_router.observe_mapping(ssrc, user_id)
+                }
+                SessionEvent::UserIdentity {
+                    user_id,
+                    server_display_name,
+                    global_display_name,
+                    username,
+                    ..
+                } => {
+                    let discord_user_id = user_id.parse::<u64>().map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("identity event contains invalid Discord user ID {user_id:?}"),
+                        )
+                    })?;
+                    identity_router.observe_identity(UserIdentity {
+                        discord_user_id,
+                        server_display_name,
+                        global_display_name,
+                        username,
+                    })
+                }
+                SessionEvent::UnresolvedSsrcAbandoned { .. } => Vec::new(),
+            };
+            apply_routing_actions(event_writer, summary, actions)?;
         }
         CaptureRecord::Playout(record) => {
             playout::write_record(playout_writer, &record)?;
@@ -516,12 +615,88 @@ fn write_and_observe(
         }
         CaptureRecord::Audio(frame) => {
             summary.audio_samples += frame.samples.len() as u64;
-            diagnostic_writer.write_frame(frame)?;
+            diagnostic_writer.write_frame(&frame)?;
             summary.audio_frames += 1;
+            let actions = identity_router.route_frame(frame);
+            apply_routing_actions(event_writer, summary, actions)?;
         }
     }
 
     Ok(())
+}
+
+fn finish_identity_routing(
+    event_writer: &mut BufWriter<File>,
+    identity_router: &mut IdentityRouter,
+    summary: &mut ConsumerSummary,
+) -> io::Result<()> {
+    apply_routing_actions(event_writer, summary, identity_router.finish())
+}
+
+fn apply_routing_actions(
+    event_writer: &mut BufWriter<File>,
+    summary: &mut ConsumerSummary,
+    actions: Vec<RoutingAction>,
+) -> io::Result<()> {
+    for action in actions {
+        match action {
+            RoutingAction::Frame(frame) => {
+                summary.resolved_frames += 1;
+                summary.resolved_samples += frame.samples.len() as u64;
+            }
+            RoutingAction::IdentityUpdated(_) => {
+                summary.identity_updates += 1;
+            }
+            RoutingAction::UnresolvedSsrcAbandoned(abandonment) => {
+                write_abandonment_event(event_writer, &abandonment)?;
+                summary.generated_event_records += 1;
+                summary.unresolved_abandonments += 1;
+                eprintln!(
+                    "Unresolved SSRC {} abandoned at tick {}: {} frames and {} samples \
+                     discarded ({})",
+                    abandonment.ssrc,
+                    abandonment.last_tick,
+                    abandonment.discarded_frames,
+                    abandonment.discarded_samples,
+                    abandonment.reason.as_str(),
+                );
+            }
+            RoutingAction::UserTrackAbandoned(abandonment) => {
+                summary.abandoned_users.insert(abandonment.discord_user_id);
+                eprintln!(
+                    "Discord user {} has incomplete live continuity because SSRC {} \
+                     was abandoned before mapping.",
+                    abandonment.discord_user_id, abandonment.source.ssrc
+                );
+            }
+            RoutingAction::MissingParticipantContext { discord_user_id } => {
+                summary.missing_participant_warnings += 1;
+                eprintln!(
+                    "Discord user {discord_user_id} is missing from participant context; \
+                     recording continues with role player and no character."
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_abandonment_event(
+    event_writer: &mut BufWriter<File>,
+    abandonment: &UnresolvedSsrcAbandonment,
+) -> io::Result<()> {
+    session::write_event(
+        event_writer,
+        &SessionEvent::unresolved_ssrc_abandoned(
+            abandonment.elapsed_nanos,
+            abandonment.ssrc,
+            abandonment.first_tick,
+            abandonment.last_tick,
+            abandonment.discarded_frames,
+            abandonment.discarded_samples,
+            abandonment.reason.as_str().to_owned(),
+        ),
+    )
 }
 
 fn checkpoint(
@@ -725,7 +900,13 @@ mod tests {
         let playout_path = drain.session_directory().join(PLAYOUT_JOURNAL_FILE_NAME);
 
         sender.try_send(packet(42));
-        sender.try_send_speaker_mapping(123, Some("user-789".into()), 1);
+        sender.try_send_user_identity(
+            789,
+            Some("Server name".into()),
+            Some("Global name".into()),
+            "username".into(),
+        );
+        sender.try_send_speaker_mapping(123, Some("789".into()), 1);
         sender.try_send_playout(
             10,
             123,
@@ -789,6 +970,10 @@ mod tests {
         assert_eq!(session["files"]["playout"]["path"], "playout.dat");
         assert_eq!(session["files"]["events"]["path"], "events.ndjson");
         assert_eq!(
+            session["files"]["events"]["format"],
+            crate::session::EVENT_FORMAT_VERSION
+        );
+        assert_eq!(
             session["files"]["participants"]["path"],
             "participants.toml"
         );
@@ -796,11 +981,20 @@ mod tests {
         assert!(session_path.join("participants.toml").is_file());
 
         let events = fs::read_to_string(session_path.join("events.ndjson")).unwrap();
-        let event: serde_json::Value = serde_json::from_str(events.trim()).unwrap();
-        assert_eq!(event["event"], "speaker_mapping");
-        assert_eq!(event["ssrc"], 123);
-        assert_eq!(event["user_id"], "user-789");
-        assert_eq!(event["speaking_bits"], 1);
+        let events = events
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["event"], "user_identity");
+        assert_eq!(events[0]["user_id"], "789");
+        assert_eq!(events[0]["server_display_name"], "Server name");
+        assert_eq!(events[0]["global_display_name"], "Global name");
+        assert_eq!(events[0]["username"], "username");
+        assert_eq!(events[1]["event"], "speaker_mapping");
+        assert_eq!(events[1]["ssrc"], 123);
+        assert_eq!(events[1]["user_id"], "789");
+        assert_eq!(events[1]["speaking_bits"], 1);
 
         let mut wav =
             hound::WavReader::open(session_path.join("diagnostics/ssrc-123.wav")).unwrap();

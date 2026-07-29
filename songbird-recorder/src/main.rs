@@ -3,6 +3,7 @@ mod capture;
 mod config;
 mod diagnostics;
 mod flac_tracks;
+mod identity;
 mod inspect;
 mod journal;
 mod participants;
@@ -21,6 +22,7 @@ use serenity::{
     client::{Context, EventHandler},
     model::gateway::{GatewayIntents, Ready},
     model::id::{ChannelId, GuildId},
+    model::voice::VoiceState,
 };
 use songbird::{
     Config as SongbirdConfig, SerenityInit, Songbird,
@@ -71,6 +73,30 @@ impl EventHandler for Handler {
                 self.guild_id, self.channel_id
             ),
         }
+    }
+
+    async fn voice_state_update(
+        &self,
+        _context: Context,
+        _old: Option<VoiceState>,
+        new: VoiceState,
+    ) {
+        if new.guild_id != Some(self.guild_id) || new.channel_id != Some(self.channel_id) {
+            return;
+        }
+        let Some(member) = new.member else {
+            return;
+        };
+        if member.user.bot {
+            return;
+        }
+
+        self.telemetry.observe_user_identity(
+            member.user.id.get(),
+            member.nick,
+            member.user.global_name,
+            member.user.name,
+        );
     }
 }
 

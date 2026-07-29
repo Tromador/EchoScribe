@@ -22,7 +22,7 @@ use crate::{
     flac_tracks::FlacTrackWriter,
     journal::{self, PacketRecord, ReadRecord as ReadPacketRecord},
     playout::{self, OpusPayloadBounds, PlayoutDecision, ReadRecord as ReadPlayoutRecord},
-    session::{EVENT_FORMAT_VERSION, SessionEvent},
+    session::{EVENT_FORMAT_VERSION, LEGACY_EVENT_FORMAT_VERSION, SessionEvent},
 };
 
 type PacketKey = (u32, u16, u32);
@@ -156,6 +156,7 @@ fn decode_session(session_directory: &Path, output_kind: OutputKind) -> Result<(
         summary.decoded_frames += 1;
         summary.decoded_samples += samples.len() as u64;
         output.write_frame(DecodedFrame {
+            elapsed_nanos: record.tick.saturating_mul(20_000_000),
             tick: record.tick,
             ssrc: record.ssrc,
             samples,
@@ -241,7 +242,7 @@ impl AudioWriter {
 
     fn write_frame(&mut self, frame: DecodedFrame) -> std::io::Result<()> {
         match self {
-            Self::Recovery(writer) => writer.write_frame(frame),
+            Self::Recovery(writer) => writer.write_frame(&frame),
             Self::Tracks(writer) => writer.write_frame(frame),
         }
     }
@@ -373,7 +374,7 @@ fn read_speaker_mappings(path: &Path) -> Result<(HashMap<u32, String>, bool)> {
                 user_id,
                 ..
             } => {
-                if format != EVENT_FORMAT_VERSION {
+                if !matches!(format, LEGACY_EVENT_FORMAT_VERSION | EVENT_FORMAT_VERSION) {
                     bail!(
                         "unsupported event format {format} on line {} in {}",
                         line_index + 1,
@@ -382,6 +383,16 @@ fn read_speaker_mappings(path: &Path) -> Result<(HashMap<u32, String>, bool)> {
                 }
                 if let Some(user_id) = user_id {
                     mappings.insert(ssrc, user_id);
+                }
+            }
+            SessionEvent::UserIdentity { format, .. }
+            | SessionEvent::UnresolvedSsrcAbandoned { format, .. } => {
+                if format != EVENT_FORMAT_VERSION {
+                    bail!(
+                        "unsupported event format {format} on line {} in {}",
+                        line_index + 1,
+                        path.display()
+                    );
                 }
             }
         }

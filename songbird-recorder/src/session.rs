@@ -17,7 +17,8 @@ use crate::{
 
 pub(crate) const SESSION_FORMAT_VERSION: u16 = 3;
 pub(crate) const LEGACY_SESSION_FORMAT_VERSION: u16 = 2;
-pub(crate) const EVENT_FORMAT_VERSION: u16 = 1;
+pub(crate) const LEGACY_EVENT_FORMAT_VERSION: u16 = 1;
+pub(crate) const EVENT_FORMAT_VERSION: u16 = 2;
 
 const SESSION_FILE_NAME: &str = "session.json";
 const SESSION_TEMP_FILE_NAME: &str = ".session.json.tmp";
@@ -223,12 +224,6 @@ impl SessionRecord {
                 crate::playout::FORMAT_VERSION,
             ),
             (
-                "events",
-                &self.files.events,
-                EVENT_JOURNAL_FILE_NAME,
-                EVENT_FORMAT_VERSION,
-            ),
-            (
                 "participants",
                 &self.files.participants,
                 PARTICIPANT_SNAPSHOT_FILE_NAME,
@@ -247,6 +242,18 @@ impl SessionRecord {
                     "session file {name} must be {expected_path:?} format {expected_format}"
                 )));
             }
+        }
+        validate_relative_artifact_path("events", &self.files.events.path)?;
+        if self.files.events.path != EVENT_JOURNAL_FILE_NAME
+            || !matches!(
+                self.files.events.format,
+                LEGACY_EVENT_FORMAT_VERSION | EVENT_FORMAT_VERSION
+            )
+        {
+            return Err(invalid_data(format!(
+                "session file events must be {EVENT_JOURNAL_FILE_NAME:?} format \
+                 {LEGACY_EVENT_FORMAT_VERSION} or {EVENT_FORMAT_VERSION}"
+            )));
         }
 
         for failure in &self.failures {
@@ -497,6 +504,24 @@ pub(crate) enum SessionEvent {
         user_id: Option<String>,
         speaking_bits: u8,
     },
+    UserIdentity {
+        format: u16,
+        elapsed_nanos: u64,
+        user_id: String,
+        server_display_name: Option<String>,
+        global_display_name: Option<String>,
+        username: String,
+    },
+    UnresolvedSsrcAbandoned {
+        format: u16,
+        elapsed_nanos: u64,
+        ssrc: u32,
+        first_tick: u64,
+        last_tick: u64,
+        discarded_frames: u64,
+        discarded_samples: u64,
+        reason: String,
+    },
 }
 
 impl SessionEvent {
@@ -512,6 +537,44 @@ impl SessionEvent {
             ssrc,
             user_id,
             speaking_bits,
+        }
+    }
+
+    pub(crate) fn user_identity(
+        elapsed_nanos: u64,
+        user_id: String,
+        server_display_name: Option<String>,
+        global_display_name: Option<String>,
+        username: String,
+    ) -> Self {
+        Self::UserIdentity {
+            format: EVENT_FORMAT_VERSION,
+            elapsed_nanos,
+            user_id,
+            server_display_name,
+            global_display_name,
+            username,
+        }
+    }
+
+    pub(crate) fn unresolved_ssrc_abandoned(
+        elapsed_nanos: u64,
+        ssrc: u32,
+        first_tick: u64,
+        last_tick: u64,
+        discarded_frames: u64,
+        discarded_samples: u64,
+        reason: String,
+    ) -> Self {
+        Self::UnresolvedSsrcAbandoned {
+            format: EVENT_FORMAT_VERSION,
+            elapsed_nanos,
+            ssrc,
+            first_tick,
+            last_tick,
+            discarded_frames,
+            discarded_samples,
+            reason,
         }
     }
 }
@@ -543,7 +606,7 @@ mod tests {
         assert_eq!(store.record().discord.channel_id, "456");
         assert_eq!(store.record().files.packets.format, 1);
         assert_eq!(store.record().files.playout.format, 2);
-        assert_eq!(store.record().files.events.format, 1);
+        assert_eq!(store.record().files.events.format, EVENT_FORMAT_VERSION);
         assert_eq!(store.record().files.participants.path, "participants.toml");
         assert_eq!(store.record().files.participants.format, 1);
         assert_eq!(store.record().files.tracks.path, "tracks.json");
@@ -556,6 +619,29 @@ mod tests {
         assert!(value.get("participants").is_none());
         assert!(directory.join("participants.toml").is_file());
 
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn format_three_session_can_reference_a_format_one_event_journal() {
+        let directory = test_directory("format-three-event-one");
+        let participants = ParticipantContext::empty_for_test();
+        let store = create_store(&directory, &participants);
+        let mut record = store.record().clone();
+        record.files.events.format = LEGACY_EVENT_FORMAT_VERSION;
+        fs::write(
+            directory.join(SESSION_FILE_NAME),
+            serde_json::to_vec_pretty(&record).unwrap(),
+        )
+        .unwrap();
+
+        let reloaded = SessionStore::load(&directory).unwrap();
+
+        assert_eq!(reloaded.record().format, SESSION_FORMAT_VERSION);
+        assert_eq!(
+            reloaded.record().files.events.format,
+            LEGACY_EVENT_FORMAT_VERSION
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -692,11 +778,25 @@ mod tests {
         assert_eq!(text.lines().count(), 1);
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["event"], "speaker_mapping");
-        assert_eq!(value["format"], 1);
+        assert_eq!(value["format"], 2);
         assert_eq!(value["elapsed_nanos"], 123_456);
         assert_eq!(value["ssrc"], 4326);
         assert_eq!(value["user_id"], "881203221593464864");
         assert_eq!(value["speaking_bits"], 1);
+    }
+
+    #[test]
+    fn format_one_speaker_mapping_remains_readable() {
+        let event: SessionEvent = serde_json::from_str(concat!(
+            "{\"event\":\"speaker_mapping\",\"format\":1,\"elapsed_nanos\":123,",
+            "\"ssrc\":4326,\"user_id\":\"881203221593464864\",\"speaking_bits\":1}"
+        ))
+        .unwrap();
+
+        assert!(matches!(
+            event,
+            SessionEvent::SpeakerMapping { format: 1, .. }
+        ));
     }
 
     fn create_store<'a>(directory: &Path, participants: &'a ParticipantContext) -> SessionStore {

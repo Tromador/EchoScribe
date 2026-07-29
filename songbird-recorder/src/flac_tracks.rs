@@ -207,6 +207,7 @@ mod tests {
 
         tracks
             .write_frame(DecodedFrame {
+                elapsed_nanos: 40_000_000,
                 tick: 2,
                 ssrc: 4326,
                 samples: vec![100; SAMPLES_PER_TICK as usize],

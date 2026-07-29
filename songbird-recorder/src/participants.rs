@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use crate::artifacts::PARTICIPANT_SNAPSHOT_FORMAT_VERSION;
 
@@ -27,12 +27,28 @@ struct FileParticipant {
     role: ParticipantRole,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ParticipantRole {
     #[default]
     Player,
     Gm,
+}
+
+impl<'de> Deserialize<'de> for ParticipantRole {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        if value.eq_ignore_ascii_case("player") {
+            Ok(Self::Player)
+        } else if value.eq_ignore_ascii_case("gm") {
+            Ok(Self::Gm)
+        } else {
+            Err(D::Error::unknown_variant(&value, &["player", "gm"]))
+        }
+    }
 }
 
 impl ParticipantRole {
@@ -113,6 +129,10 @@ impl ParticipantContext {
     #[allow(dead_code)]
     pub(crate) fn get(&self, discord_user_id: u64) -> Option<&Participant> {
         self.participants.get(&discord_user_id)
+    }
+
+    pub(crate) fn discord_user_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.participants.keys().copied()
     }
 
     pub(crate) fn canonical_toml(&self) -> Result<String> {
@@ -197,6 +217,28 @@ mod tests {
         assert_eq!(context.len(), 2);
         assert_eq!(context.get(111).unwrap().role, ParticipantRole::Gm);
         assert_eq!(context.get(222).unwrap().role, ParticipantRole::Gm);
+    }
+
+    #[test]
+    fn roles_are_ascii_case_insensitive_and_snapshots_are_lowercase() {
+        let context = ParticipantContext::from_toml(
+            concat!(
+                "version = 1\n",
+                "[participants.\"111\"]\n",
+                "role = \"GM\"\n",
+                "[participants.\"222\"]\n",
+                "role = \"PlAyEr\"\n",
+            ),
+            Path::new("participants.toml"),
+        )
+        .unwrap();
+
+        assert_eq!(context.get(111).unwrap().role, ParticipantRole::Gm);
+        assert_eq!(context.get(222).unwrap().role, ParticipantRole::Player);
+        let snapshot = context.canonical_toml().unwrap();
+        assert!(snapshot.contains("role = \"gm\""));
+        assert!(snapshot.contains("role = \"player\""));
+        assert!(!snapshot.contains("role = \"GM\""));
     }
 
     #[test]

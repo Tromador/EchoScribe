@@ -29,6 +29,7 @@ pub(crate) struct VoiceTelemetry {
     playout_packets: AtomicU64,
     playout_losses: AtomicU64,
     decoded_frames: AtomicU64,
+    identity_updates: AtomicU64,
     streams: Mutex<HashMap<u32, StreamContinuity>>,
 }
 
@@ -43,6 +44,7 @@ impl VoiceTelemetry {
             playout_packets: AtomicU64::new(0),
             playout_losses: AtomicU64::new(0),
             decoded_frames: AtomicU64::new(0),
+            identity_updates: AtomicU64::new(0),
             streams: Mutex::new(HashMap::new()),
         }
     }
@@ -68,9 +70,10 @@ impl VoiceTelemetry {
 
     pub(crate) fn report(&self) {
         println!(
-            "Voice telemetry: {} speaking updates, {} RTP packets, {} voice ticks, \
-             {} playout packets, {} playout losses, {} decoded frames.",
+            "Voice telemetry: {} speaking updates, {} identity updates, {} RTP packets, \
+             {} voice ticks, {} playout packets, {} playout losses, {} decoded frames.",
             self.speaking_updates.load(Ordering::Relaxed),
+            self.identity_updates.load(Ordering::Relaxed),
             self.rtp_packets.load(Ordering::Relaxed),
             self.voice_ticks.load(Ordering::Relaxed),
             self.playout_packets.load(Ordering::Relaxed),
@@ -112,6 +115,22 @@ impl VoiceTelemetry {
             .entry(ssrc)
             .and_modify(|stream| stream.observe(sequence))
             .or_insert_with(|| StreamContinuity::new(sequence));
+    }
+
+    pub(crate) fn observe_user_identity(
+        &self,
+        discord_user_id: u64,
+        server_display_name: Option<String>,
+        global_display_name: Option<String>,
+        username: String,
+    ) {
+        self.identity_updates.fetch_add(1, Ordering::Relaxed);
+        self.capture.try_send_user_identity(
+            discord_user_id,
+            server_display_name,
+            global_display_name,
+            username,
+        );
     }
 }
 
