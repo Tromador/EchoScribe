@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const SUPPORTED_PARTICIPANT_VERSION: u32 = 1;
 
@@ -25,23 +25,19 @@ struct FileParticipant {
     role: ParticipantRole,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum ParticipantRole {
     #[default]
     Player,
     Gm,
 }
 
-impl<'de> Deserialize<'de> for ParticipantRole {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        match value.as_str() {
-            "player" => Ok(Self::Player),
-            "gm" => Ok(Self::Gm),
-            _ => Err(serde::de::Error::unknown_variant(&value, &["player", "gm"])),
+impl ParticipantRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Player => "player",
+            Self::Gm => "gm",
         }
     }
 }
@@ -117,6 +113,33 @@ impl ParticipantContext {
         self.participants.get(&discord_user_id)
     }
 
+    pub(crate) fn canonical_toml(&self) -> Result<String> {
+        let mut participants = self.participants.values().collect::<Vec<_>>();
+        participants.sort_unstable_by_key(|participant| participant.discord_user_id);
+
+        let mut text = format!("version = {SUPPORTED_PARTICIPANT_VERSION}\n");
+        for participant in participants {
+            text.push_str(&format!(
+                "\n[participants.\"{}\"]\n",
+                participant.discord_user_id
+            ));
+            if let Some(character) = &participant.character {
+                let character = toml::Value::String(character.clone());
+                text.push_str(&format!("character = {character}\n"));
+            }
+            text.push_str(&format!("role = \"{}\"\n", participant.role.as_str()));
+        }
+        Ok(text)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            source_path: PathBuf::from("participants.toml"),
+            participants: HashMap::new(),
+        }
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.participants.len()
@@ -172,6 +195,36 @@ mod tests {
         assert_eq!(context.len(), 2);
         assert_eq!(context.get(111).unwrap().role, ParticipantRole::Gm);
         assert_eq!(context.get(222).unwrap().role, ParticipantRole::Gm);
+    }
+
+    #[test]
+    fn canonical_snapshot_is_numeric_id_ordered_and_materialises_roles() {
+        let context = ParticipantContext::from_toml(
+            concat!(
+                "version = 1\n",
+                "[participants.\"222\"]\n",
+                "character = \"Second\"\n",
+                "[participants.\"11\"]\n",
+                "role = \"gm\"\n",
+            ),
+            Path::new("participants.toml"),
+        )
+        .unwrap();
+
+        let snapshot = context.canonical_toml().unwrap();
+        assert!(
+            snapshot.find("[participants.\"11\"]").unwrap()
+                < snapshot.find("[participants.\"222\"]").unwrap()
+        );
+        assert!(snapshot.contains("[participants.\"11\"]\nrole = \"gm\""));
+        assert!(
+            snapshot.contains("[participants.\"222\"]\ncharacter = \"Second\"\nrole = \"player\"")
+        );
+
+        let reloaded =
+            ParticipantContext::from_toml(&snapshot, Path::new("session/participants.toml"))
+                .unwrap();
+        assert_eq!(reloaded.get(222).unwrap().role, ParticipantRole::Player);
     }
 
     #[test]

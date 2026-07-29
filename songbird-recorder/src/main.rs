@@ -126,6 +126,8 @@ async fn main() -> anyhow::Result<()> {
         &config.recording.output_directory,
         &config.guild_id.to_string(),
         &config.channel_id.to_string(),
+        config.configuration_version,
+        &config.participants,
     )
     .context("failed to create the capture session")?;
     println!(

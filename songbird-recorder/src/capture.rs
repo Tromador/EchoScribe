@@ -19,8 +19,9 @@ use tokio::{
 use crate::{
     diagnostics::{DecodedFrame, DiagnosticWriter, TrackSummary},
     journal::{self, PacketRecord},
+    participants::ParticipantContext,
     playout::{self, OpusPayloadBounds, PlayoutDecision, PlayoutRecord},
-    session::{self, SessionEvent},
+    session::{self, NewSession, SessionEvent},
 };
 
 const QUEUE_CAPACITY: usize = 4096;
@@ -88,18 +89,24 @@ pub(crate) fn start(
     output_directory: &Path,
     guild_id: &str,
     channel_id: &str,
+    configuration_version: u32,
+    participants: &ParticipantContext,
 ) -> io::Result<(CaptureSender, CaptureDrain)> {
     let (session_directory, started_at_unix_millis) = create_session_directory(output_directory)?;
     let session_id = session_directory
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| io::Error::other("capture session directory has no valid UTF-8 name"))?;
-    session::write_session_file(
-        &session_directory.join("session.json"),
-        session_id,
-        started_at_unix_millis,
-        guild_id,
-        channel_id,
+    session::SessionStore::create(
+        &session_directory,
+        NewSession {
+            session_id,
+            started_at_unix_millis,
+            configuration_version,
+            guild_id,
+            channel_id,
+            participants,
+        },
     )?;
 
     let packets_path = session_directory.join("packets.dat");
@@ -610,7 +617,8 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let (sender, drain) = start(&output_directory, "guild-123", "channel-456").unwrap();
+        let participants = ParticipantContext::empty_for_test();
+        let (sender, drain) = start(&output_directory, "123", "456", 1, &participants).unwrap();
         let session_path = drain.session_directory().to_path_buf();
         let packets_path = drain.session_directory().join("packets.dat");
         let playout_path = drain.session_directory().join("playout.dat");
@@ -672,12 +680,19 @@ mod tests {
 
         let session: serde_json::Value =
             serde_json::from_slice(&fs::read(session_path.join("session.json")).unwrap()).unwrap();
-        assert_eq!(session["format"], 2);
-        assert_eq!(session["discord"]["guild_id"], "guild-123");
-        assert_eq!(session["discord"]["channel_id"], "channel-456");
+        assert_eq!(session["format"], 3);
+        assert_eq!(session["state"], "recording");
+        assert_eq!(session["discord"]["guild_id"], "123");
+        assert_eq!(session["discord"]["channel_id"], "456");
         assert_eq!(session["files"]["packets"]["path"], "packets.dat");
         assert_eq!(session["files"]["playout"]["path"], "playout.dat");
         assert_eq!(session["files"]["events"]["path"], "events.ndjson");
+        assert_eq!(
+            session["files"]["participants"]["path"],
+            "participants.toml"
+        );
+        assert_eq!(session["files"]["tracks"]["path"], "tracks.json");
+        assert!(session_path.join("participants.toml").is_file());
 
         let events = fs::read_to_string(session_path.join("events.ndjson")).unwrap();
         let event: serde_json::Value = serde_json::from_str(events.trim()).unwrap();

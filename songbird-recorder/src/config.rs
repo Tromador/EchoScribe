@@ -88,6 +88,7 @@ pub(crate) struct SegmentationConfig {
 
 #[allow(dead_code)]
 pub(crate) struct Config {
+    pub(crate) configuration_version: u32,
     token: String,
     pub(crate) guild_id: GuildId,
     pub(crate) channel_id: ChannelId,
@@ -154,6 +155,7 @@ impl Config {
         let participants = ParticipantContext::load(&participant_path)?;
 
         Ok(Self {
+            configuration_version: file.version,
             token: file.discord.token,
             guild_id: GuildId::new(guild_id),
             channel_id: ChannelId::new(channel_id),

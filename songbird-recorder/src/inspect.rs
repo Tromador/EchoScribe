@@ -12,7 +12,7 @@ use crate::{
     diagnostics::SAMPLES_PER_TICK,
     journal::{self, ReadRecord as ReadPacketRecord},
     playout::{self, PlayoutDecision, ReadRecord as ReadPlayoutRecord},
-    session::SessionEvent,
+    session::{LEGACY_SESSION_FORMAT_VERSION, SESSION_FORMAT_VERSION, SessionEvent, WorkflowState},
 };
 
 const RECENT_SEQUENCES: usize = 4096;
@@ -21,6 +21,7 @@ const RECENT_SEQUENCES: usize = 4096;
 struct SessionManifest {
     format: u16,
     session_id: String,
+    state: Option<WorkflowState>,
     discord: DiscordSession,
     files: SessionFiles,
 }
@@ -113,11 +114,16 @@ pub(crate) fn run(session_directory: &Path) -> Result<()> {
 
     println!("Session inspection: {}.", session_directory.display());
     println!(
-        "Manifest: format {}, session {}, guild {}, channel {}.",
+        "Manifest: format {}, session {}, guild {}, channel {}, state {}.",
         manifest.format,
         manifest.session_id,
         manifest.discord.guild_id,
-        manifest.discord.channel_id
+        manifest.discord.channel_id,
+        manifest
+            .state
+            .map(WorkflowState::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| "legacy_untracked".to_owned())
     );
     println!(
         "packets.dat: {} records, {}.",
@@ -195,15 +201,80 @@ fn read_manifest(session_directory: &Path) -> Result<SessionManifest> {
     let path = session_directory.join("session.json");
     let bytes = fs::read(&path)
         .with_context(|| format!("failed to read session manifest {}", path.display()))?;
-    serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed to parse session manifest {}", path.display()))
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse session manifest {}", path.display()))?;
+    let format = value
+        .get("format")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("session manifest has no valid format number"))?;
+
+    match u16::try_from(format).ok() {
+        Some(LEGACY_SESSION_FORMAT_VERSION) => {
+            #[derive(Deserialize)]
+            struct LegacySessionManifest {
+                format: u16,
+                session_id: String,
+                discord: DiscordSession,
+                files: SessionFiles,
+            }
+
+            let legacy: LegacySessionManifest =
+                serde_json::from_value(value).with_context(|| {
+                    format!("failed to parse legacy session manifest {}", path.display())
+                })?;
+            Ok(SessionManifest {
+                format: legacy.format,
+                session_id: legacy.session_id,
+                state: None,
+                discord: legacy.discord,
+                files: legacy.files,
+            })
+        }
+        Some(SESSION_FORMAT_VERSION) => {
+            let current = crate::session::read_record(&path)
+                .with_context(|| format!("failed to parse session manifest {}", path.display()))?;
+            Ok(SessionManifest {
+                format: current.format,
+                session_id: current.session_id,
+                state: Some(current.state),
+                discord: DiscordSession {
+                    guild_id: current.discord.guild_id,
+                    channel_id: current.discord.channel_id,
+                },
+                files: SessionFiles {
+                    packets: FileDescription {
+                        path: current.files.packets.path,
+                        format: current.files.packets.format,
+                    },
+                    playout: FileDescription {
+                        path: current.files.playout.path,
+                        format: current.files.playout.format,
+                    },
+                    events: FileDescription {
+                        path: current.files.events.path,
+                        format: current.files.events.format,
+                    },
+                },
+            })
+        }
+        _ => bail!(
+            "unsupported session manifest format {format}; expected {} or {}",
+            LEGACY_SESSION_FORMAT_VERSION,
+            SESSION_FORMAT_VERSION
+        ),
+    }
 }
 
 fn validate_manifest(manifest: &SessionManifest) -> Result<()> {
-    if manifest.format != 2 {
+    if !matches!(
+        manifest.format,
+        LEGACY_SESSION_FORMAT_VERSION | SESSION_FORMAT_VERSION
+    ) {
         bail!(
-            "unsupported session manifest format {}; expected 2",
-            manifest.format
+            "unsupported session manifest format {}; expected {} or {}",
+            manifest.format,
+            LEGACY_SESSION_FORMAT_VERSION,
+            SESSION_FORMAT_VERSION
         );
     }
 
@@ -467,5 +538,76 @@ fn tail_description(truncated: bool) -> &'static str {
         "recoverable truncated tail"
     } else {
         "clean tail"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        env, process,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::*;
+
+    #[test]
+    fn format_two_session_manifest_remains_readable() {
+        let directory = env::temp_dir().join(format!(
+            "echoscribe-inspect-legacy-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        fs::write(
+            directory.join("session.json"),
+            concat!(
+                "{\n",
+                "  \"format\": 2,\n",
+                "  \"session_id\": \"session-1000\",\n",
+                "  \"discord\": {\"guild_id\": \"123\", \"channel_id\": \"456\"},\n",
+                "  \"files\": {\n",
+                "    \"packets\": {\"path\": \"packets.dat\", \"format\": 1},\n",
+                "    \"playout\": {\"path\": \"playout.dat\", \"format\": 2},\n",
+                "    \"events\": {\"path\": \"events.ndjson\", \"format\": 1}\n",
+                "  }\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+
+        let manifest = read_manifest(&directory).unwrap();
+        validate_manifest(&manifest).unwrap();
+        assert_eq!(manifest.format, LEGACY_SESSION_FORMAT_VERSION);
+        assert_eq!(manifest.state, None);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn unsupported_session_format_has_clear_error() {
+        let directory = env::temp_dir().join(format!(
+            "echoscribe-inspect-version-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("session.json"), "{\"format\":99}\n").unwrap();
+
+        let error = read_manifest(&directory)
+            .err()
+            .expect("unsupported session format should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported session manifest format 99")
+        );
+
+        fs::remove_dir_all(directory).unwrap();
     }
 }
