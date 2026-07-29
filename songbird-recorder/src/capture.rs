@@ -1206,16 +1206,32 @@ fn finalize_recording(
 
     let full_drops = metrics.full_drops.load(Ordering::Relaxed);
     let closed_drops = metrics.closed_drops.load(Ordering::Relaxed);
-    let capture_queue_fault = full_drops > 0 || closed_drops > 0;
+    let audio_drops = metrics.audio_drops.load(Ordering::Relaxed);
+    let capture_queue_fault = full_drops > 0 || closed_drops > 0 || audio_drops > 0;
     if capture_queue_fault {
         session_store.record_failure(
             stopped_at,
             "capture_queue_drop",
             format!(
                 "capture queue rejected {full_drops} records while full and \
-                 {closed_drops} records after closure"
+                 {closed_drops} records after closure, including \
+                 {audio_drops} decoded-audio records"
             ),
         )?;
+    }
+
+    if audio_drops > 0 {
+        // Callback-side routing state is intentionally not duplicated merely
+        // to attribute an exceptional ingress overload. Every user who reached
+        // routine routing is conservatively treated as potentially affected.
+        for user_id in track_summaries
+            .keys()
+            .chain(summary.routed_users.iter())
+            .copied()
+            .collect::<Vec<_>>()
+        {
+            abandonment_reasons.insert(user_id, "capture_audio_drop".to_owned());
+        }
     }
 
     let mut user_ids = track_summaries
@@ -1390,6 +1406,9 @@ fn mark_failed_drain(session_directory: &Path, kind: &str, message: &str) -> io:
     match session_store.record().state {
         WorkflowState::Recording => mark_store_awaiting_operator(&mut session_store, stopped_at),
         WorkflowState::RecordedIncomplete => {
+            session_store.transition(WorkflowState::AwaitingOperator, stopped_at)
+        }
+        WorkflowState::RecordedClean => {
             session_store.transition(WorkflowState::AwaitingOperator, stopped_at)
         }
         // A failure after a later state was durably published is still returned
@@ -2090,6 +2109,101 @@ role = "GM"
         let session = session::SessionStore::load(&session_path).unwrap();
         assert_eq!(session.record().state, WorkflowState::AwaitingOperator);
         assert_eq!(session.record().failures[0].kind, "capture_queue_drop");
+        fs::remove_dir_all(output_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn decoded_audio_drop_makes_existing_track_incomplete() {
+        let output_directory = env::temp_dir().join(format!(
+            "echoscribe-audio-drop-track-test-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let participants = ParticipantContext::empty_for_test();
+        let (sender, drain) =
+            start(&output_directory, "123", "456", 1, &participants, false).unwrap();
+        let session_path = drain.session_directory().to_path_buf();
+        sender.try_send_speaker_mapping(123, Some("789".into()), 1);
+        sender.try_send_audio(
+            10,
+            123,
+            vec![1; crate::diagnostics::SAMPLES_PER_TICK as usize],
+        );
+        drain.metrics.full_drops.fetch_add(1, Ordering::Relaxed);
+        drain.metrics.audio_drops.fetch_add(1, Ordering::Relaxed);
+
+        let outcome = drain.stop().await.unwrap();
+
+        assert_eq!(
+            outcome,
+            RecordingOutcome::AwaitingOperator {
+                incomplete_users: vec![789]
+            }
+        );
+        assert!(session_path.join("tracks/user-789.flac.part").is_file());
+        assert!(!session_path.join("tracks/user-789.flac").exists());
+        let manifest: TrackManifest =
+            serde_json::from_slice(&fs::read(session_path.join("tracks.json")).unwrap()).unwrap();
+        assert_eq!(manifest.tracks[0].state, TrackState::Incomplete);
+        assert_eq!(
+            manifest.tracks[0].abandonment_reason.as_deref(),
+            Some("capture_audio_drop")
+        );
+        let session = session::SessionStore::load(&session_path).unwrap();
+        assert_eq!(session.record().state, WorkflowState::AwaitingOperator);
+        let failure = session
+            .record()
+            .failures
+            .iter()
+            .find(|failure| failure.kind == "capture_queue_drop")
+            .expect("aggregate capture queue failure should be durable");
+        assert!(failure.message.contains("1 decoded-audio records"));
+        fs::remove_dir_all(output_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ready_transition_persistence_failure_cannot_strand_recorded_clean() {
+        let output_directory = env::temp_dir().join(format!(
+            "echoscribe-ready-transition-failure-test-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let participants = ParticipantContext::empty_for_test();
+        let (_sender, drain) =
+            start(&output_directory, "123", "456", 1, &participants, false).unwrap();
+        let session_path = drain.session_directory().to_path_buf();
+        // Finalisation writes its checkpoint, then recorded_clean, then the
+        // ready state. Fail only that third metadata publication.
+        session::fail_record_write_after(&session_path, 2);
+
+        let error = drain.stop().await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected one-shot session record persistence failure")
+        );
+        let session = session::SessionStore::load(&session_path).unwrap();
+        assert_eq!(session.record().state, WorkflowState::AwaitingOperator);
+        assert_ne!(session.record().state, WorkflowState::RecordedClean);
+        let failure = session
+            .record()
+            .failures
+            .iter()
+            .find(|failure| failure.kind == "recording_finalization")
+            .expect("finalisation failure should be durable");
+        assert_eq!(failure.state, WorkflowState::RecordedClean);
+        assert!(
+            failure
+                .message
+                .contains("injected one-shot session record persistence failure")
+        );
         fs::remove_dir_all(output_directory).unwrap();
     }
 

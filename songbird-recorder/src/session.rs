@@ -10,6 +10,12 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+#[cfg(test)]
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+};
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -409,6 +415,10 @@ fn valid_transition(current: WorkflowState, next: WorkflowState) -> bool {
                 WorkflowState::ReadyForTranscription
             )
             | (
+                WorkflowState::RecordedClean,
+                WorkflowState::AwaitingOperator
+            )
+            | (
                 WorkflowState::RecordedIncomplete,
                 WorkflowState::AwaitingOperator
             )
@@ -434,6 +444,9 @@ fn valid_transition(current: WorkflowState, next: WorkflowState) -> bool {
 }
 
 fn write_record_atomically(session_directory: &Path, record: &SessionRecord) -> io::Result<()> {
+    #[cfg(test)]
+    inject_record_write_failure_if_due(session_directory)?;
+
     let mut bytes = serde_json::to_vec_pretty(record).map_err(io::Error::other)?;
     bytes.push(b'\n');
     write_replacing_file_atomically(
@@ -442,6 +455,44 @@ fn write_record_atomically(session_directory: &Path, record: &SessionRecord) -> 
         SESSION_FILE_NAME,
         &bytes,
     )
+}
+
+#[cfg(test)]
+static RECORD_WRITE_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn fail_record_write_after(
+    session_directory: &Path,
+    successful_writes_before_failure: usize,
+) {
+    RECORD_WRITE_FAILURES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            session_directory.to_path_buf(),
+            successful_writes_before_failure,
+        );
+}
+
+#[cfg(test)]
+fn inject_record_write_failure_if_due(session_directory: &Path) -> io::Result<()> {
+    let mut failures = RECORD_WRITE_FAILURES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(remaining) = failures.get_mut(session_directory) else {
+        return Ok(());
+    };
+    if *remaining > 0 {
+        *remaining -= 1;
+        return Ok(());
+    }
+
+    failures.remove(session_directory);
+    Err(io::Error::other(
+        "injected one-shot session record persistence failure",
+    ))
 }
 
 fn write_new_file_atomically(
@@ -703,6 +754,25 @@ mod tests {
             assert_eq!(reloaded.record().stopped_at_unix_millis, Some(2000));
             fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[test]
+    fn recorded_clean_failure_can_wait_for_operator() {
+        let directory = test_directory("clean-to-operator");
+        let participants = ParticipantContext::empty_for_test();
+        let mut store = create_store(&directory, &participants);
+        store
+            .transition(WorkflowState::RecordedClean, 2_000)
+            .unwrap();
+
+        store
+            .transition(WorkflowState::AwaitingOperator, 2_100)
+            .unwrap();
+
+        let reloaded = SessionStore::load(&directory).unwrap();
+        assert_eq!(reloaded.record().state, WorkflowState::AwaitingOperator);
+        assert_eq!(reloaded.record().stopped_at_unix_millis, Some(2_000));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
