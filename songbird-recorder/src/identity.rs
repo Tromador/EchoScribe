@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::diagnostics::DecodedFrame;
 
-pub(crate) const MAX_PENDING_TICKS: u64 = 100;
+pub(crate) const MAX_PENDING_TICKS: u64 = 250;
 pub(crate) const MAX_PENDING_SAMPLES_PER_SSRC: usize = 96_000;
 pub(crate) const MAX_CONCURRENT_PENDING_SSRCS: usize = 32;
 
@@ -157,6 +157,43 @@ impl IdentityRouter {
             );
         }
         actions
+    }
+
+    pub(crate) fn observe_disconnect(&mut self, discord_user_id: u64) {
+        self.mappings
+            .retain(|_, mapped_user_id| *mapped_user_id != discord_user_id);
+    }
+
+    pub(crate) fn advance_tick(&mut self, tick: u64, elapsed_nanos: u64) -> Vec<RoutingAction> {
+        let mut expired = self
+            .pending
+            .iter()
+            .filter_map(|(ssrc, pending)| {
+                (tick.saturating_sub(pending.first_tick) >= MAX_PENDING_TICKS).then_some(*ssrc)
+            })
+            .collect::<Vec<_>>();
+        expired.sort_unstable();
+
+        expired
+            .into_iter()
+            .map(|ssrc| {
+                let pending = self
+                    .pending
+                    .remove(&ssrc)
+                    .expect("expired pending SSRC was collected above");
+                let abandonment = UnresolvedSsrcAbandonment {
+                    ssrc,
+                    first_tick: pending.first_tick,
+                    last_tick: tick,
+                    elapsed_nanos,
+                    discarded_frames: pending.frames.len() as u64,
+                    discarded_samples: pending.samples as u64,
+                    reason: AbandonmentReason::AgeLimit,
+                };
+                self.abandoned_ssrcs.insert(ssrc, abandonment.clone());
+                RoutingAction::UnresolvedSsrcAbandoned(abandonment)
+            })
+            .collect()
     }
 
     pub(crate) fn route_frame(&mut self, frame: DecodedFrame) -> Vec<RoutingAction> {
@@ -390,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn tick_one_hundred_and_ten_abandons_before_retaining_trigger() {
+    fn standard_frame_one_hundred_and_one_hits_sample_limit_before_retention() {
         let mut router = IdentityRouter::new([11]);
         for tick in 10..110 {
             assert!(router.route_frame(frame(tick, 100, 960)).is_empty());
@@ -404,7 +441,68 @@ mod tests {
         assert_eq!(abandonment.last_tick, 110);
         assert_eq!(abandonment.discarded_frames, 101);
         assert_eq!(abandonment.discarded_samples, 96_960);
+        assert_eq!(abandonment.reason, AbandonmentReason::SampleLimit);
+    }
+
+    #[test]
+    fn global_tick_expires_a_silent_pending_ssrc_before_late_mapping() {
+        let mut router = IdentityRouter::new([11]);
+        router.route_frame(frame(10, 100, 960));
+
+        assert!(router.advance_tick(259, 5_180_000_000).is_empty());
+        let actions = router.advance_tick(260, 5_200_000_000);
+        let RoutingAction::UnresolvedSsrcAbandoned(abandonment) = &actions[0] else {
+            panic!("expected age-limit abandonment");
+        };
+        assert_eq!(abandonment.first_tick, 10);
+        assert_eq!(abandonment.last_tick, 260);
+        assert_eq!(abandonment.discarded_frames, 1);
+        assert_eq!(abandonment.discarded_samples, 960);
         assert_eq!(abandonment.reason, AbandonmentReason::AgeLimit);
+
+        let actions = router.observe_mapping(100, Some(11));
+        assert!(
+            actions
+                .iter()
+                .all(|action| !matches!(action, RoutingAction::Frame(_)))
+        );
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            RoutingAction::UserTrackAbandoned(abandonment)
+                if abandonment.discord_user_id == 11
+        )));
+    }
+
+    #[test]
+    fn disconnect_revokes_all_user_mappings_without_discarding_identity() {
+        let mut router = IdentityRouter::new([11, 22]);
+        router.observe_identity(UserIdentity {
+            discord_user_id: 11,
+            server_display_name: Some("Eleven".into()),
+            global_display_name: None,
+            username: "eleven".into(),
+        });
+        router.observe_mapping(100, Some(11));
+        router.observe_disconnect(11);
+
+        assert!(router.route_frame(frame(10, 100, 960)).is_empty());
+        let actions = router.observe_mapping(100, Some(22));
+        let frames = actions
+            .iter()
+            .filter_map(|action| match action {
+                RoutingAction::Frame(frame) => Some(frame),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].discord_user_id, 22);
+
+        router.observe_mapping(200, Some(11));
+        let actions = router.route_frame(frame(11, 200, 960));
+        let RoutingAction::Frame(frame) = &actions[0] else {
+            panic!("expected reconnected user frame");
+        };
+        assert_eq!(frame.display_name, "Eleven");
     }
 
     #[test]

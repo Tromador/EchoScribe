@@ -96,6 +96,7 @@ struct EventInspection {
     truncated_tail: bool,
     mappings: Vec<SpeakerMapping>,
     identity_updates: u64,
+    user_disconnections: u64,
     unresolved_abandonments: u64,
 }
 
@@ -180,11 +181,12 @@ pub(crate) fn run(session_directory: &Path) -> Result<()> {
 
     println!(
         "events.ndjson: {} records, {}, {} speaker mappings, {} identity updates, \
-         {} unresolved-SSRC abandonments.",
+         {} user disconnections, {} unresolved-SSRC abandonments.",
         events.records,
         tail_description(events.truncated_tail),
         events.mappings.len(),
         events.identity_updates,
+        events.user_disconnections,
         events.unresolved_abandonments,
     );
     for mapping in &events.mappings {
@@ -497,6 +499,12 @@ fn inspect_events(path: &Path, expected_format: u16) -> Result<EventInspection> 
                 inspection.records += 1;
                 inspection.identity_updates += 1;
             }
+            Ok(SessionEvent::UserDisconnected { format, .. }) => {
+                validate_event_record_format(format, expected_format, line_index, path)?;
+                validate_format_two_event(format, line_index, path)?;
+                inspection.records += 1;
+                inspection.user_disconnections += 1;
+            }
             Ok(SessionEvent::UnresolvedSsrcAbandoned { format, .. }) => {
                 validate_event_record_format(format, expected_format, line_index, path)?;
                 validate_format_two_event(format, line_index, path)?;
@@ -713,6 +721,7 @@ mod tests {
         assert_eq!(inspection.records, 1);
         assert_eq!(inspection.mappings.len(), 1);
         assert_eq!(inspection.identity_updates, 0);
+        assert_eq!(inspection.user_disconnections, 0);
         assert_eq!(inspection.unresolved_abandonments, 0);
         fs::remove_dir_all(directory).unwrap();
     }

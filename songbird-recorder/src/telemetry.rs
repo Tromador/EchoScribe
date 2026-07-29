@@ -132,6 +132,10 @@ impl VoiceTelemetry {
             username,
         );
     }
+
+    pub(crate) fn observe_user_disconnected(&self, discord_user_id: u64) {
+        self.capture.try_send_user_disconnected(discord_user_id);
+    }
 }
 
 struct StreamContinuity {
@@ -297,6 +301,7 @@ impl EventHandler for TelemetryHandler {
                             .try_send_audio(tick_index, *ssrc, samples.clone());
                     }
                 }
+                self.telemetry.capture.try_advance_routing_tick(tick_index);
 
                 self.telemetry
                     .playout_packets

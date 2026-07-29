@@ -512,6 +512,11 @@ pub(crate) enum SessionEvent {
         global_display_name: Option<String>,
         username: String,
     },
+    UserDisconnected {
+        format: u16,
+        elapsed_nanos: u64,
+        user_id: String,
+    },
     UnresolvedSsrcAbandoned {
         format: u16,
         elapsed_nanos: u64,
@@ -575,6 +580,14 @@ impl SessionEvent {
             discarded_frames,
             discarded_samples,
             reason,
+        }
+    }
+
+    pub(crate) fn user_disconnected(elapsed_nanos: u64, user_id: String) -> Self {
+        Self::UserDisconnected {
+            format: EVENT_FORMAT_VERSION,
+            elapsed_nanos,
+            user_id,
         }
     }
 }

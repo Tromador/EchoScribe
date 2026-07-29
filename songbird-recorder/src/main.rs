@@ -12,7 +12,12 @@ mod recover;
 mod session;
 mod telemetry;
 
-use std::{env, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashSet,
+    env,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{Context as AnyhowContext, Result, bail};
 use capture::CaptureDrain;
@@ -21,6 +26,7 @@ use serenity::{
     Client, async_trait,
     client::{Context, EventHandler},
     model::gateway::{GatewayIntents, Ready},
+    model::guild::{Guild, Member},
     model::id::{ChannelId, GuildId},
     model::voice::VoiceState,
 };
@@ -35,6 +41,7 @@ struct Handler {
     telemetry: Arc<VoiceTelemetry>,
     guild_id: GuildId,
     channel_id: ChannelId,
+    voice_users: Mutex<HashSet<u64>>,
 }
 
 #[derive(Debug)]
@@ -78,24 +85,95 @@ impl EventHandler for Handler {
     async fn voice_state_update(
         &self,
         _context: Context,
-        _old: Option<VoiceState>,
+        old: Option<VoiceState>,
         new: VoiceState,
     ) {
-        if new.guild_id != Some(self.guild_id) || new.channel_id != Some(self.channel_id) {
-            return;
-        }
-        let Some(member) = new.member else {
-            return;
-        };
-        if member.user.bot {
+        let member = new
+            .member
+            .as_ref()
+            .or_else(|| old.as_ref().and_then(|state| state.member.as_ref()));
+        if member.is_some_and(|member| member.user.bot) {
             return;
         }
 
+        let belongs_to_configured_guild = new.guild_id == Some(self.guild_id)
+            || old
+                .as_ref()
+                .is_some_and(|state| state.guild_id == Some(self.guild_id));
+        if !belongs_to_configured_guild {
+            return;
+        }
+
+        if new.channel_id != Some(self.channel_id) {
+            let was_present = self
+                .voice_users
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&new.user_id.get());
+            if was_present {
+                self.telemetry.observe_user_disconnected(new.user_id.get());
+            }
+            return;
+        }
+
+        self.voice_users
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(new.user_id.get());
+        let Some(member) = new.member.as_ref() else {
+            return;
+        };
+        self.observe_member_identity(member);
+    }
+
+    async fn guild_create(&self, _context: Context, guild: Guild, _is_new: Option<bool>) {
+        if guild.id != self.guild_id {
+            return;
+        }
+        let mut current_users = HashSet::new();
+        for voice_state in guild
+            .voice_states
+            .values()
+            .filter(|state| state.channel_id == Some(self.channel_id))
+        {
+            let Some(member) = guild.members.get(&voice_state.user_id) else {
+                continue;
+            };
+            if member.user.bot {
+                continue;
+            }
+            current_users.insert(voice_state.user_id.get());
+            self.observe_member_identity(member);
+        }
+
+        let departed_users = {
+            let mut observed_users = self
+                .voice_users
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let departed = observed_users
+                .difference(&current_users)
+                .copied()
+                .collect::<Vec<_>>();
+            *observed_users = current_users;
+            departed
+        };
+        for user_id in departed_users {
+            self.telemetry.observe_user_disconnected(user_id);
+        }
+    }
+}
+
+impl Handler {
+    fn observe_member_identity(&self, member: &Member) {
+        if member.user.bot {
+            return;
+        }
         self.telemetry.observe_user_identity(
             member.user.id.get(),
-            member.nick,
-            member.user.global_name,
-            member.user.name,
+            member.nick.clone(),
+            member.user.global_name.clone(),
+            member.user.name.clone(),
         );
     }
 }
@@ -116,6 +194,7 @@ async fn build_client(
             telemetry,
             guild_id: config.guild_id,
             channel_id: config.channel_id,
+            voice_users: Mutex::new(HashSet::new()),
         })
         .register_songbird_with(Arc::clone(&voice_manager))
         .await?;

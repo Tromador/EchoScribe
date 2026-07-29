@@ -386,6 +386,7 @@ fn read_speaker_mappings(path: &Path) -> Result<(HashMap<u32, String>, bool)> {
                 }
             }
             SessionEvent::UserIdentity { format, .. }
+            | SessionEvent::UserDisconnected { format, .. }
             | SessionEvent::UnresolvedSsrcAbandoned { format, .. } => {
                 if format != EVENT_FORMAT_VERSION {
                     bail!(

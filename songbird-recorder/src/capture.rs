@@ -71,6 +71,7 @@ struct ConsumerSummary {
     packet_records: u64,
     event_records: u64,
     generated_event_records: u64,
+    routing_ticks: u64,
     playout_records: u64,
     audio_frames: u64,
     audio_samples: u64,
@@ -92,6 +93,7 @@ enum CaptureRecord {
     Event(SessionEvent),
     Playout(PlayoutRecord),
     Audio(DecodedFrame),
+    RoutingTick { tick: u64, elapsed_nanos: u64 },
 }
 
 struct SessionDirectoryGuard {
@@ -280,6 +282,24 @@ impl CaptureSender {
         )));
     }
 
+    pub(crate) fn try_send_user_disconnected(&self, discord_user_id: u64) {
+        let elapsed_nanos =
+            u64::try_from(self.session_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.try_send_record(CaptureRecord::Event(SessionEvent::user_disconnected(
+            elapsed_nanos,
+            discord_user_id.to_string(),
+        )));
+    }
+
+    pub(crate) fn try_advance_routing_tick(&self, tick: u64) {
+        let elapsed_nanos =
+            u64::try_from(self.session_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.try_send_record(CaptureRecord::RoutingTick {
+            tick,
+            elapsed_nanos,
+        });
+    }
+
     pub(crate) fn try_send_audio(&self, tick: u64, ssrc: u32, samples: Vec<i16>) {
         let elapsed_nanos =
             u64::try_from(self.session_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -382,7 +402,7 @@ impl CaptureDrain {
     fn report(metrics: &ProducerMetrics, summary: &ConsumerSummary, session_directory: &Path) {
         println!(
             "Capture queue: {} records accepted, {} consumed ({} packets, {} events, \
-             {} playout decisions, {} audio frames), {} full drops, {} closed drops, \
+             {} playout decisions, {} audio frames, {} routing ticks), {} full drops, {} closed drops, \
              {} event drops, {} playout drops, {} audio drops, high-water {}/{}, \
              {} packet bytes and {} audio samples consumed.",
             metrics.accepted.load(Ordering::Relaxed),
@@ -391,6 +411,7 @@ impl CaptureDrain {
             summary.event_records,
             summary.playout_records,
             summary.audio_frames,
+            summary.routing_ticks,
             metrics.full_drops.load(Ordering::Relaxed),
             metrics.closed_drops.load(Ordering::Relaxed),
             metrics.event_drops.load(Ordering::Relaxed),
@@ -605,6 +626,18 @@ fn write_and_observe(
                         username,
                     })
                 }
+                SessionEvent::UserDisconnected { user_id, .. } => {
+                    let discord_user_id = user_id.parse::<u64>().map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "disconnect event contains invalid Discord user ID {user_id:?}"
+                            ),
+                        )
+                    })?;
+                    identity_router.observe_disconnect(discord_user_id);
+                    Vec::new()
+                }
                 SessionEvent::UnresolvedSsrcAbandoned { .. } => Vec::new(),
             };
             apply_routing_actions(event_writer, summary, actions)?;
@@ -618,6 +651,14 @@ fn write_and_observe(
             diagnostic_writer.write_frame(&frame)?;
             summary.audio_frames += 1;
             let actions = identity_router.route_frame(frame);
+            apply_routing_actions(event_writer, summary, actions)?;
+        }
+        CaptureRecord::RoutingTick {
+            tick,
+            elapsed_nanos,
+        } => {
+            summary.routing_ticks += 1;
+            let actions = identity_router.advance_tick(tick, elapsed_nanos);
             apply_routing_actions(event_writer, summary, actions)?;
         }
     }
@@ -918,6 +959,7 @@ mod tests {
             123,
             vec![321; crate::diagnostics::SAMPLES_PER_TICK as usize],
         );
+        sender.try_send_user_disconnected(789);
         drain.stop().await;
 
         let bytes = fs::read(&packets_path).unwrap();
@@ -985,7 +1027,7 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
         assert_eq!(events[0]["event"], "user_identity");
         assert_eq!(events[0]["user_id"], "789");
         assert_eq!(events[0]["server_display_name"], "Server name");
@@ -995,6 +1037,8 @@ mod tests {
         assert_eq!(events[1]["ssrc"], 123);
         assert_eq!(events[1]["user_id"], "789");
         assert_eq!(events[1]["speaking_bits"], 1);
+        assert_eq!(events[2]["event"], "user_disconnected");
+        assert_eq!(events[2]["user_id"], "789");
 
         let mut wav =
             hound::WavReader::open(session_path.join("diagnostics/ssrc-123.wav")).unwrap();
@@ -1007,6 +1051,45 @@ mod tests {
         );
 
         crate::inspect::run(&session_path).unwrap();
+
+        fs::remove_dir_all(output_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn global_routing_tick_abandons_a_silent_unresolved_ssrc() {
+        let output_directory = env::temp_dir().join(format!(
+            "echoscribe-routing-expiry-test-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let participants = ParticipantContext::empty_for_test();
+        let (sender, drain) = start(&output_directory, "123", "456", 1, &participants).unwrap();
+        let session_path = drain.session_directory().to_path_buf();
+
+        sender.try_send_audio(
+            10,
+            999,
+            vec![1; crate::diagnostics::SAMPLES_PER_TICK as usize],
+        );
+        sender.try_advance_routing_tick(260);
+        drain.stop().await;
+
+        let events = fs::read_to_string(session_path.join(EVENT_JOURNAL_FILE_NAME)).unwrap();
+        let events = events
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"], "unresolved_ssrc_abandoned");
+        assert_eq!(events[0]["ssrc"], 999);
+        assert_eq!(events[0]["first_tick"], 10);
+        assert_eq!(events[0]["last_tick"], 260);
+        assert_eq!(events[0]["discarded_frames"], 1);
+        assert_eq!(events[0]["discarded_samples"], 960);
+        assert_eq!(events[0]["reason"], "age_limit");
 
         fs::remove_dir_all(output_directory).unwrap();
     }
