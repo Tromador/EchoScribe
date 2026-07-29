@@ -103,6 +103,49 @@ impl DiagnosticWriter {
     }
 }
 
+pub(crate) struct OptionalDiagnosticWriter(Option<DiagnosticWriter>);
+
+impl OptionalDiagnosticWriter {
+    pub(crate) fn new(session_directory: &Path, enabled: bool) -> io::Result<Self> {
+        if enabled {
+            DiagnosticWriter::new(session_directory).map(Some).map(Self)
+        } else {
+            Ok(Self(None))
+        }
+    }
+
+    pub(crate) fn write_frame(&mut self, frame: &DecodedFrame) -> io::Result<()> {
+        let result = self
+            .0
+            .as_mut()
+            .map_or(Ok(()), |writer| writer.write_frame(frame));
+        if result.is_err() {
+            self.0 = None;
+        }
+        result
+    }
+
+    pub(crate) fn checkpoint(&mut self) -> io::Result<()> {
+        let result = self.0.as_mut().map_or(Ok(()), DiagnosticWriter::checkpoint);
+        if result.is_err() {
+            self.0 = None;
+        }
+        result
+    }
+
+    pub(crate) fn sync_data(&mut self) -> io::Result<()> {
+        let result = self.0.as_ref().map_or(Ok(()), DiagnosticWriter::sync_data);
+        if result.is_err() {
+            self.0 = None;
+        }
+        result
+    }
+
+    pub(crate) fn finalize(self) -> io::Result<Vec<TrackSummary>> {
+        self.0.map_or(Ok(Vec::new()), DiagnosticWriter::finalize)
+    }
+}
+
 impl Track {
     fn create(directory: &Path, ssrc: u32, first_tick: u64) -> io::Result<Self> {
         let path = directory.join(format!("ssrc-{ssrc}.wav"));

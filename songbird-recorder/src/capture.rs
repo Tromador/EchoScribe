@@ -18,9 +18,10 @@ use tokio::{
 
 use crate::{
     artifacts::{EVENT_JOURNAL_FILE_NAME, PACKET_JOURNAL_FILE_NAME, PLAYOUT_JOURNAL_FILE_NAME},
-    diagnostics::{DecodedFrame, DiagnosticWriter, TrackSummary},
+    diagnostics::{DecodedFrame, OptionalDiagnosticWriter, TrackSummary},
     identity::{IdentityRouter, RoutingAction, UnresolvedSsrcAbandonment, UserIdentity},
     journal::{self, PacketRecord},
+    live_flac::{LiveFlacStage, StageReport as LiveFlacReport, TrackAbandonment},
     participants::ParticipantContext,
     playout::{self, OpusPayloadBounds, PlayoutDecision, PlayoutRecord},
     session::{self, NewSession, SessionEvent},
@@ -78,12 +79,15 @@ struct ConsumerSummary {
     packet_bytes: u64,
     stream_tails: HashMap<u32, (u16, u32)>,
     diagnostic_tracks: Vec<TrackSummary>,
+    live_flac: Option<LiveFlacReport>,
     resolved_frames: u64,
     resolved_samples: u64,
     identity_updates: u64,
     unresolved_abandonments: u64,
     abandoned_users: HashSet<u64>,
     missing_participant_warnings: u64,
+    diagnostic_failures: u64,
+    reported_flac_failure_users: HashSet<u64>,
     checkpoints: u64,
     durability_syncs: u64,
 }
@@ -100,12 +104,19 @@ struct SessionDirectoryGuard {
     path: Option<PathBuf>,
 }
 
+struct DurableFailure {
+    elapsed_nanos: u64,
+    kind: &'static str,
+    message: String,
+}
+
 pub(crate) fn start(
     output_directory: &Path,
     guild_id: &str,
     channel_id: &str,
     configuration_version: u32,
     participants: &ParticipantContext,
+    diagnostic_wav: bool,
 ) -> io::Result<(CaptureSender, CaptureDrain)> {
     let (session_directory, started_at_unix_millis) = create_session_directory(output_directory)?;
     start_in_session_directory(
@@ -115,6 +126,7 @@ pub(crate) fn start(
         channel_id,
         configuration_version,
         participants,
+        diagnostic_wav,
     )
 }
 
@@ -125,6 +137,7 @@ fn start_in_session_directory(
     channel_id: &str,
     configuration_version: u32,
     participants: &ParticipantContext,
+    diagnostic_wav: bool,
 ) -> io::Result<(CaptureSender, CaptureDrain)> {
     let session_id = session_directory
         .path()
@@ -151,7 +164,9 @@ fn start_in_session_directory(
         .open(session_directory.path().join(PLAYOUT_JOURNAL_FILE_NAME))?;
     let mut playout_writer = BufWriter::with_capacity(WRITER_BUFFER_CAPACITY, playout_file);
     playout::write_file_header(&mut playout_writer)?;
-    let diagnostic_writer = DiagnosticWriter::new(session_directory.path())?;
+    let diagnostic_writer =
+        OptionalDiagnosticWriter::new(session_directory.path(), diagnostic_wav)?;
+    fs::create_dir(session_directory.path().join("tracks"))?;
 
     packet_writer.flush()?;
     packet_writer.get_ref().sync_data()?;
@@ -159,7 +174,7 @@ fn start_in_session_directory(
     playout_writer.flush()?;
     playout_writer.get_ref().sync_data()?;
 
-    session::SessionStore::create(
+    let session_store = session::SessionStore::create(
         session_directory.path(),
         NewSession {
             session_id: &session_id,
@@ -171,6 +186,7 @@ fn start_in_session_directory(
         },
     )?;
     let identity_router = IdentityRouter::new(participants.discord_user_ids());
+    let live_flac = LiveFlacStage::start(session_directory.path());
 
     let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
     let (stop, stop_receiver) = oneshot::channel();
@@ -183,6 +199,9 @@ fn start_in_session_directory(
         playout_writer,
         diagnostic_writer,
         identity_router,
+        live_flac,
+        session_store,
+        started_at_unix_millis,
     ));
     let session_directory = session_directory.disarm();
 
@@ -441,6 +460,44 @@ impl CaptureDrain {
             summary.abandoned_users.len(),
             summary.missing_participant_warnings,
         );
+        if summary.diagnostic_failures > 0 {
+            eprintln!(
+                "Diagnostic WAV was abandoned after {} isolated failures.",
+                summary.diagnostic_failures
+            );
+        }
+        if let Some(flac) = &summary.live_flac {
+            println!(
+                "Live FLAC queue: {} frames accepted, {} enqueue failures, \
+                 high-water {}/{}, {} warning crossings, {} abandoned users.",
+                flac.accepted,
+                flac.enqueue_failures,
+                flac.high_water,
+                crate::live_flac::QUEUE_CAPACITY,
+                flac.warning_crossings,
+                summary.abandoned_users.len(),
+            );
+            for track in &flac.summary.tracks {
+                println!(
+                    "Live FLAC user {}: {}, first tick {}, {} frames, {} source samples, \
+                     {} inserted silence samples, {} nonstandard frames, source SSRCs {:?}.",
+                    track.discord_user_id,
+                    track.path.display(),
+                    track.first_tick,
+                    track.frames,
+                    track.source_samples,
+                    track.inserted_silence_samples,
+                    track.nonstandard_frames,
+                    track.source_ssrcs,
+                );
+            }
+            for failure in &flac.summary.failures {
+                eprintln!(
+                    "Live FLAC user {} abandoned at tick {} ({}): {}",
+                    failure.discord_user_id, failure.tick, failure.reason, failure.message
+                );
+            }
+        }
 
         let mut streams = summary.stream_tails.iter().collect::<Vec<_>>();
         streams.sort_unstable_by_key(|(ssrc, _)| **ssrc);
@@ -474,10 +531,19 @@ async fn consume(
     mut packet_writer: BufWriter<File>,
     mut event_writer: BufWriter<File>,
     mut playout_writer: BufWriter<File>,
-    mut diagnostic_writer: DiagnosticWriter,
+    mut diagnostic_writer: OptionalDiagnosticWriter,
     mut identity_router: IdentityRouter,
+    mut live_flac: LiveFlacStage,
+    session_store: session::SessionStore,
+    started_at_unix_millis: u64,
 ) -> io::Result<ConsumerSummary> {
     let mut summary = ConsumerSummary::default();
+    let (failure_sender, failure_receiver) = mpsc::unbounded_channel();
+    let failure_task = tokio::spawn(record_session_failures(
+        failure_receiver,
+        session_store,
+        started_at_unix_millis,
+    ));
     let mut checkpoint_interval = time::interval_at(
         time::Instant::now() + CHECKPOINT_INTERVAL,
         CHECKPOINT_INTERVAL,
@@ -503,6 +569,8 @@ async fn consume(
                         &mut playout_writer,
                         &mut diagnostic_writer,
                         &mut identity_router,
+                        &mut live_flac,
+                        &failure_sender,
                         &mut summary,
                         record,
                     )?;
@@ -511,13 +579,20 @@ async fn consume(
                 finish_identity_routing(
                     &mut event_writer,
                     &mut identity_router,
+                    &mut live_flac,
+                    &failure_sender,
                     &mut summary,
                 )?;
+                let live_report = live_flac.stop().await;
+                record_live_flac_failures(&failure_sender, &summary, &live_report);
+                drop(failure_sender);
+                await_failure_recorder(failure_task).await?;
                 return finish(
                     packet_writer,
                     event_writer,
                     playout_writer,
                     diagnostic_writer,
+                    live_report,
                     summary,
                 );
             }
@@ -535,7 +610,7 @@ async fn consume(
                     &packet_writer,
                     &event_writer,
                     &playout_writer,
-                    &diagnostic_writer,
+                    &mut diagnostic_writer,
                 )?;
                 summary.durability_syncs += 1;
             }
@@ -547,6 +622,8 @@ async fn consume(
                         &mut playout_writer,
                         &mut diagnostic_writer,
                         &mut identity_router,
+                        &mut live_flac,
+                        &failure_sender,
                         &mut summary,
                         record,
                     )?,
@@ -554,13 +631,20 @@ async fn consume(
                         finish_identity_routing(
                             &mut event_writer,
                             &mut identity_router,
+                            &mut live_flac,
+                            &failure_sender,
                             &mut summary,
                         )?;
+                        let live_report = live_flac.stop().await;
+                        record_live_flac_failures(&failure_sender, &summary, &live_report);
+                        drop(failure_sender);
+                        await_failure_recorder(failure_task).await?;
                         return finish(
                             packet_writer,
                             event_writer,
                             playout_writer,
                             diagnostic_writer,
+                            live_report,
                             summary,
                         );
                     }
@@ -574,8 +658,10 @@ fn write_and_observe(
     packet_writer: &mut BufWriter<File>,
     event_writer: &mut BufWriter<File>,
     playout_writer: &mut BufWriter<File>,
-    diagnostic_writer: &mut DiagnosticWriter,
+    diagnostic_writer: &mut OptionalDiagnosticWriter,
     identity_router: &mut IdentityRouter,
+    live_flac: &mut LiveFlacStage,
+    failure_sender: &mpsc::UnboundedSender<DurableFailure>,
     summary: &mut ConsumerSummary,
     record: CaptureRecord,
 ) -> io::Result<()> {
@@ -640,7 +726,7 @@ fn write_and_observe(
                 }
                 SessionEvent::UnresolvedSsrcAbandoned { .. } => Vec::new(),
             };
-            apply_routing_actions(event_writer, summary, actions)?;
+            apply_routing_actions(event_writer, live_flac, failure_sender, summary, actions)?;
         }
         CaptureRecord::Playout(record) => {
             playout::write_record(playout_writer, &record)?;
@@ -648,10 +734,13 @@ fn write_and_observe(
         }
         CaptureRecord::Audio(frame) => {
             summary.audio_samples += frame.samples.len() as u64;
-            diagnostic_writer.write_frame(&frame)?;
+            if let Err(error) = diagnostic_writer.write_frame(&frame) {
+                summary.diagnostic_failures += 1;
+                eprintln!("Diagnostic WAV abandoned; authoritative capture continues: {error}");
+            }
             summary.audio_frames += 1;
             let actions = identity_router.route_frame(frame);
-            apply_routing_actions(event_writer, summary, actions)?;
+            apply_routing_actions(event_writer, live_flac, failure_sender, summary, actions)?;
         }
         CaptureRecord::RoutingTick {
             tick,
@@ -659,7 +748,7 @@ fn write_and_observe(
         } => {
             summary.routing_ticks += 1;
             let actions = identity_router.advance_tick(tick, elapsed_nanos);
-            apply_routing_actions(event_writer, summary, actions)?;
+            apply_routing_actions(event_writer, live_flac, failure_sender, summary, actions)?;
         }
     }
 
@@ -669,21 +758,48 @@ fn write_and_observe(
 fn finish_identity_routing(
     event_writer: &mut BufWriter<File>,
     identity_router: &mut IdentityRouter,
+    live_flac: &mut LiveFlacStage,
+    failure_sender: &mpsc::UnboundedSender<DurableFailure>,
     summary: &mut ConsumerSummary,
 ) -> io::Result<()> {
-    apply_routing_actions(event_writer, summary, identity_router.finish())
+    apply_routing_actions(
+        event_writer,
+        live_flac,
+        failure_sender,
+        summary,
+        identity_router.finish(),
+    )
 }
 
 fn apply_routing_actions(
     event_writer: &mut BufWriter<File>,
+    live_flac: &mut LiveFlacStage,
+    failure_sender: &mpsc::UnboundedSender<DurableFailure>,
     summary: &mut ConsumerSummary,
     actions: Vec<RoutingAction>,
 ) -> io::Result<()> {
+    for failure in live_flac.take_encoder_failures() {
+        summary.abandoned_users.insert(failure.discord_user_id);
+        summary
+            .reported_flac_failure_users
+            .insert(failure.discord_user_id);
+        let _ = failure_sender.send(DurableFailure {
+            elapsed_nanos: failure.elapsed_nanos,
+            kind: "live_flac_encoder",
+            message: format!(
+                "live FLAC track for Discord user {} abandoned at tick {}: reason {}: {}",
+                failure.discord_user_id, failure.tick, failure.reason, failure.message
+            ),
+        });
+    }
     for action in actions {
         match action {
             RoutingAction::Frame(frame) => {
                 summary.resolved_frames += 1;
                 summary.resolved_samples += frame.samples.len() as u64;
+                if let Some(abandonment) = live_flac.try_send(frame) {
+                    record_queue_abandonment(failure_sender, summary, &abandonment);
+                }
             }
             RoutingAction::IdentityUpdated(_) => {
                 summary.identity_updates += 1;
@@ -704,6 +820,12 @@ fn apply_routing_actions(
             }
             RoutingAction::UserTrackAbandoned(abandonment) => {
                 summary.abandoned_users.insert(abandonment.discord_user_id);
+                live_flac.abandon_user(
+                    abandonment.discord_user_id,
+                    abandonment.source.last_tick,
+                    abandonment.source.elapsed_nanos,
+                    "unresolved_ssrc",
+                );
                 eprintln!(
                     "Discord user {} has incomplete live continuity because SSRC {} \
                      was abandoned before mapping.",
@@ -740,41 +862,138 @@ fn write_abandonment_event(
     )
 }
 
+fn record_queue_abandonment(
+    failure_sender: &mpsc::UnboundedSender<DurableFailure>,
+    summary: &mut ConsumerSummary,
+    abandonment: &TrackAbandonment,
+) {
+    summary.abandoned_users.insert(abandonment.discord_user_id);
+    let message = format!(
+        "live FLAC track for Discord user {} abandoned at tick {}: reason {}, \
+         queue depth {}/{}, high-water {}",
+        abandonment.discord_user_id,
+        abandonment.tick,
+        abandonment.reason,
+        abandonment.queue_depth,
+        abandonment.queue_capacity,
+        abandonment.queue_high_water,
+    );
+    let _ = failure_sender.send(DurableFailure {
+        elapsed_nanos: abandonment.elapsed_nanos,
+        kind: if abandonment.reason == "queue_full" {
+            "live_flac_queue_full"
+        } else {
+            "live_flac_queue_closed"
+        },
+        message: message.clone(),
+    });
+    eprintln!("{message}");
+}
+
+fn record_live_flac_failures(
+    failure_sender: &mpsc::UnboundedSender<DurableFailure>,
+    summary: &ConsumerSummary,
+    report: &LiveFlacReport,
+) {
+    for failure in report.summary.failures.iter().filter(|failure| {
+        !summary
+            .reported_flac_failure_users
+            .contains(&failure.discord_user_id)
+    }) {
+        let _ = failure_sender.send(DurableFailure {
+            elapsed_nanos: failure.elapsed_nanos,
+            kind: "live_flac_encoder",
+            message: format!(
+                "live FLAC track for Discord user {} abandoned at tick {}: reason {}: {}",
+                failure.discord_user_id, failure.tick, failure.reason, failure.message
+            ),
+        });
+    }
+}
+
+async fn record_session_failures(
+    mut receiver: mpsc::UnboundedReceiver<DurableFailure>,
+    mut session_store: session::SessionStore,
+    started_at_unix_millis: u64,
+) -> io::Result<()> {
+    while let Some(failure) = receiver.recv().await {
+        let elapsed_millis = failure.elapsed_nanos / 1_000_000;
+        let recorded_at = started_at_unix_millis.saturating_add(elapsed_millis);
+        session_store.record_failure(recorded_at, failure.kind, failure.message)?;
+    }
+    Ok(())
+}
+
+async fn await_failure_recorder(task: JoinHandle<io::Result<()>>) -> io::Result<()> {
+    task.await
+        .map_err(|error| io::Error::other(format!("session failure recorder failed: {error}")))?
+}
+
 fn checkpoint(
     packet_writer: &mut BufWriter<File>,
     event_writer: &mut BufWriter<File>,
     playout_writer: &mut BufWriter<File>,
-    diagnostic_writer: &mut DiagnosticWriter,
+    diagnostic_writer: &mut OptionalDiagnosticWriter,
 ) -> io::Result<()> {
     packet_writer.flush()?;
     event_writer.flush()?;
     playout_writer.flush()?;
-    diagnostic_writer.checkpoint()
+    if let Err(error) = diagnostic_writer.checkpoint() {
+        eprintln!("Diagnostic WAV checkpoint failed and diagnostics were abandoned: {error}");
+    }
+    Ok(())
 }
 
 fn sync_data(
     packet_writer: &BufWriter<File>,
     event_writer: &BufWriter<File>,
     playout_writer: &BufWriter<File>,
-    diagnostic_writer: &DiagnosticWriter,
+    diagnostic_writer: &mut OptionalDiagnosticWriter,
 ) -> io::Result<()> {
     packet_writer.get_ref().sync_data()?;
     event_writer.get_ref().sync_data()?;
     playout_writer.get_ref().sync_data()?;
-    diagnostic_writer.sync_data()
+    if let Err(error) = diagnostic_writer.sync_data() {
+        eprintln!("Diagnostic WAV sync failed and diagnostics were abandoned: {error}");
+    }
+    Ok(())
 }
 
 fn finish(
     mut packet_writer: BufWriter<File>,
     mut event_writer: BufWriter<File>,
     mut playout_writer: BufWriter<File>,
-    diagnostic_writer: DiagnosticWriter,
+    diagnostic_writer: OptionalDiagnosticWriter,
+    live_report: LiveFlacReport,
     mut summary: ConsumerSummary,
 ) -> io::Result<ConsumerSummary> {
     flush_and_sync(&mut packet_writer)?;
     flush_and_sync(&mut event_writer)?;
     flush_and_sync(&mut playout_writer)?;
-    summary.diagnostic_tracks = diagnostic_writer.finalize()?;
+    match diagnostic_writer.finalize() {
+        Ok(tracks) => summary.diagnostic_tracks = tracks,
+        Err(error) => {
+            summary.diagnostic_failures += 1;
+            eprintln!(
+                "Diagnostic WAV finalisation failed; authoritative capture remains valid: {error}"
+            );
+        }
+    }
+    summary.abandoned_users.extend(
+        live_report
+            .abandoned_users
+            .iter()
+            .chain(
+                live_report
+                    .summary
+                    .failures
+                    .iter()
+                    .filter(|failure| failure.discord_user_id != 0)
+                    .map(|failure| &failure.discord_user_id),
+            )
+            .copied(),
+    );
+    summary.live_flac = Some(live_report);
     Ok(summary)
 }
 
@@ -914,6 +1133,7 @@ mod tests {
             "456",
             1,
             &participants,
+            false,
         )
         .err()
         .expect("journal initialisation should fail");
@@ -935,7 +1155,8 @@ mod tests {
                 .as_nanos()
         ));
         let participants = ParticipantContext::empty_for_test();
-        let (sender, drain) = start(&output_directory, "123", "456", 1, &participants).unwrap();
+        let (sender, drain) =
+            start(&output_directory, "123", "456", 1, &participants, true).unwrap();
         let session_path = drain.session_directory().to_path_buf();
         let packets_path = drain.session_directory().join(PACKET_JOURNAL_FILE_NAME);
         let playout_path = drain.session_directory().join(PLAYOUT_JOURNAL_FILE_NAME);
@@ -1049,6 +1270,26 @@ mod tests {
             samples,
             vec![321; crate::diagnostics::SAMPLES_PER_TICK as usize]
         );
+        let live_flac_path = session_path.join("tracks/user-789.flac.part");
+        assert!(live_flac_path.is_file());
+        assert!(!session_path.join("tracks/user-789.flac").exists());
+        let mut live_flac = flac_codec::decode::FlacSampleReader::open(live_flac_path).unwrap();
+        let mut live_samples = Vec::new();
+        live_flac.read_to_end(&mut live_samples).unwrap();
+        assert_eq!(
+            live_samples.len(),
+            crate::diagnostics::SAMPLES_PER_TICK as usize * 11
+        );
+        assert!(
+            live_samples[..crate::diagnostics::SAMPLES_PER_TICK as usize * 10]
+                .iter()
+                .all(|sample| *sample == 0)
+        );
+        assert!(
+            live_samples[crate::diagnostics::SAMPLES_PER_TICK as usize * 10..]
+                .iter()
+                .all(|sample| *sample == 321)
+        );
 
         crate::inspect::run(&session_path).unwrap();
 
@@ -1066,7 +1307,8 @@ mod tests {
                 .as_nanos()
         ));
         let participants = ParticipantContext::empty_for_test();
-        let (sender, drain) = start(&output_directory, "123", "456", 1, &participants).unwrap();
+        let (sender, drain) =
+            start(&output_directory, "123", "456", 1, &participants, false).unwrap();
         let session_path = drain.session_directory().to_path_buf();
 
         sender.try_send_audio(
@@ -1090,7 +1332,120 @@ mod tests {
         assert_eq!(events[0]["discarded_frames"], 1);
         assert_eq!(events[0]["discarded_samples"], 960);
         assert_eq!(events[0]["reason"], "age_limit");
+        assert!(!session_path.join("diagnostics").exists());
 
         fs::remove_dir_all(output_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_encoder_error_is_durable_and_does_not_create_a_replacement() {
+        let output_directory = env::temp_dir().join(format!(
+            "echoscribe-live-flac-failure-test-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let participants = ParticipantContext::empty_for_test();
+        let (sender, drain) =
+            start(&output_directory, "123", "456", 1, &participants, false).unwrap();
+        let session_path = drain.session_directory().to_path_buf();
+        let part_path = session_path.join("tracks/user-789.flac.part");
+        fs::create_dir(&part_path).unwrap();
+
+        sender.try_send_speaker_mapping(123, Some("789".into()), 1);
+        sender.try_send_audio(
+            10,
+            123,
+            vec![1; crate::diagnostics::SAMPLES_PER_TICK as usize],
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        sender.try_send_audio(
+            11,
+            123,
+            vec![2; crate::diagnostics::SAMPLES_PER_TICK as usize],
+        );
+        drain.stop().await;
+
+        let session = session::SessionStore::load(&session_path).unwrap();
+        assert_eq!(session.record().failures.len(), 1);
+        assert_eq!(session.record().failures[0].kind, "live_flac_encoder");
+        assert!(
+            session.record().failures[0]
+                .message
+                .contains("Discord user 789")
+        );
+        assert!(part_path.is_dir());
+        assert!(!session_path.join("tracks/user-789.flac").exists());
+
+        fs::remove_dir_all(output_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn queue_full_abandonment_records_required_durable_evidence() {
+        let session_path = env::temp_dir().join(format!(
+            "echoscribe-live-flac-queue-failure-test-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&session_path).unwrap();
+        let participants = ParticipantContext::empty_for_test();
+        let session_store = session::SessionStore::create(
+            &session_path,
+            NewSession {
+                session_id: "session-test",
+                started_at_unix_millis: 1_000,
+                configuration_version: 1,
+                guild_id: "123",
+                channel_id: "456",
+                participants: &participants,
+            },
+        )
+        .unwrap();
+        let (failure_sender, failure_receiver) = mpsc::unbounded_channel();
+        let task = tokio::spawn(record_session_failures(
+            failure_receiver,
+            session_store,
+            1_000,
+        ));
+        let mut summary = ConsumerSummary::default();
+
+        record_queue_abandonment(
+            &failure_sender,
+            &mut summary,
+            &TrackAbandonment {
+                discord_user_id: 789,
+                tick: 42,
+                elapsed_nanos: 200_000_000,
+                reason: "queue_full",
+                queue_depth: 1024,
+                queue_capacity: 1024,
+                queue_high_water: 1024,
+            },
+        );
+        drop(failure_sender);
+        await_failure_recorder(task).await.unwrap();
+
+        let session = session::SessionStore::load(&session_path).unwrap();
+        assert_eq!(session.record().failures.len(), 1);
+        let failure = &session.record().failures[0];
+        assert_eq!(failure.recorded_at_unix_millis, 1_200);
+        assert_eq!(failure.kind, "live_flac_queue_full");
+        for evidence in [
+            "Discord user 789",
+            "tick 42",
+            "reason queue_full",
+            "queue depth 1024/1024",
+            "high-water 1024",
+        ] {
+            assert!(failure.message.contains(evidence), "{evidence:?} missing");
+        }
+        assert!(summary.abandoned_users.contains(&789));
+
+        fs::remove_dir_all(session_path).unwrap();
     }
 }

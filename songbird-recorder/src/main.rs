@@ -6,6 +6,7 @@ mod flac_tracks;
 mod identity;
 mod inspect;
 mod journal;
+mod live_flac;
 mod participants;
 mod playout;
 mod recover;
@@ -234,6 +235,7 @@ async fn main() -> anyhow::Result<()> {
         &config.channel_id.to_string(),
         config.configuration_version,
         &config.participants,
+        config.recording.diagnostic_wav,
     )
     .context("failed to create the capture session")?;
     println!(
