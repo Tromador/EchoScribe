@@ -70,9 +70,11 @@ pub(crate) struct StageSummary {
     pub(crate) failures: Vec<TrackFailure>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 /// Accounting for one live Discord-user track.
 pub(crate) struct LiveTrackSummary {
     pub(crate) discord_user_id: u64,
+    pub(crate) display_name: String,
     pub(crate) path: PathBuf,
     pub(crate) first_tick: u64,
     pub(crate) frames: u64,
@@ -90,6 +92,7 @@ pub(crate) struct TrackFailure {
     pub(crate) elapsed_nanos: u64,
     pub(crate) reason: &'static str,
     pub(crate) message: String,
+    pub(crate) partial_track: Option<LiveTrackSummary>,
 }
 
 impl LiveFlacStage {
@@ -253,6 +256,7 @@ impl LiveFlacStage {
                     elapsed_nanos: 0,
                     reason: "worker_failed",
                     message: error.to_string(),
+                    partial_track: None,
                 }],
                 ..StageSummary::default()
             },
@@ -355,7 +359,12 @@ fn write_frame(
             entry.get_mut().write_frame(&frame)
         }
         std::collections::hash_map::Entry::Vacant(entry) => {
-            match Track::create(directory, frame.discord_user_id, frame.tick) {
+            match Track::create(
+                directory,
+                frame.discord_user_id,
+                frame.tick,
+                frame.display_name.clone(),
+            ) {
                 Ok(mut track) => {
                     let result = track.write_frame(&frame);
                     entry.insert(track);
@@ -370,13 +379,16 @@ fn write_frame(
         // Removing the writer and remembering the user makes failure terminal;
         // queued or future frames cannot create a replacement.
         abandoned.insert(frame.discord_user_id);
-        writers.remove(&frame.discord_user_id);
+        let partial_track = writers
+            .remove(&frame.discord_user_id)
+            .map(|track| track.summary(frame.discord_user_id));
         let failure = TrackFailure {
             discord_user_id: frame.discord_user_id,
             tick: frame.tick,
             elapsed_nanos: frame.elapsed_nanos,
             reason: "encoder_error",
             message: error.to_string(),
+            partial_track,
         };
         let _ = failure_sender.send(failure.clone());
         failures.push(failure);
@@ -385,6 +397,7 @@ fn write_frame(
 
 struct Track {
     writer: FlacSampleWriter<BufWriter<File>>,
+    display_name: String,
     path: PathBuf,
     first_tick: u64,
     next_tick: u64,
@@ -398,7 +411,12 @@ struct Track {
 }
 
 impl Track {
-    fn create(directory: &Path, discord_user_id: u64, first_tick: u64) -> io::Result<Self> {
+    fn create(
+        directory: &Path,
+        discord_user_id: u64,
+        first_tick: u64,
+        display_name: String,
+    ) -> io::Result<Self> {
         let path = directory.join(format!("user-{discord_user_id}.flac.part"));
         let writer = FlacSampleWriter::create(
             &path,
@@ -412,6 +430,7 @@ impl Track {
 
         Ok(Self {
             writer,
+            display_name,
             path,
             first_tick,
             next_tick: 0,
@@ -450,6 +469,7 @@ impl Track {
             .extend(frame.samples.iter().map(|sample| i32::from(*sample)));
         self.writer.write(&self.sample_buffer).map_err(flac_error)?;
 
+        self.display_name.clone_from(&frame.display_name);
         self.next_tick = frame
             .tick
             .checked_add(1)
@@ -480,11 +500,12 @@ impl Track {
     fn finalize(self, discord_user_id: u64) -> Result<LiveTrackSummary, TrackFailure> {
         let tick = self.next_tick.saturating_sub(1);
         let path = self.path.clone();
+        let summary = self.summary(discord_user_id);
         if let Err(error) = self
             .writer
             .finalize()
             .map_err(flac_error)
-            .and_then(|()| OpenOptions::new().write(true).open(&path)?.sync_data())
+            .and_then(|()| OpenOptions::new().write(true).open(&path)?.sync_all())
         {
             return Err(TrackFailure {
                 discord_user_id,
@@ -492,21 +513,27 @@ impl Track {
                 elapsed_nanos: self.last_elapsed_nanos,
                 reason: "encoder_error",
                 message: error.to_string(),
+                partial_track: Some(summary),
             });
         }
 
-        let mut source_ssrcs = self.source_ssrcs.into_iter().collect::<Vec<_>>();
+        Ok(summary)
+    }
+
+    fn summary(&self, discord_user_id: u64) -> LiveTrackSummary {
+        let mut source_ssrcs = self.source_ssrcs.iter().copied().collect::<Vec<_>>();
         source_ssrcs.sort_unstable();
-        Ok(LiveTrackSummary {
+        LiveTrackSummary {
             discord_user_id,
-            path: self.path,
+            display_name: self.display_name.clone(),
+            path: self.path.clone(),
             first_tick: self.first_tick,
             frames: self.frames,
             source_samples: self.source_samples,
             inserted_silence_samples: self.inserted_silence_samples,
             nonstandard_frames: self.nonstandard_frames,
             source_ssrcs,
-        })
+        }
     }
 }
 
@@ -628,6 +655,38 @@ mod tests {
         assert!(tracks.join("user-11.flac.part").is_dir());
         assert!(!tracks.join("user-11.flac").exists());
 
+        fs::remove_dir_all(session).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn final_file_sync_error_keeps_the_part_name() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let session = test_directory("final-sync-error");
+        fs::create_dir(session.join("tracks")).unwrap();
+        let part_path = session.join("tracks/user-11.flac.part");
+        let mut stage = LiveFlacStage::start(&session);
+        assert!(stage.try_send(frame(11, 100, 0, 960, 1)).is_none());
+
+        for _ in 0..100 {
+            if part_path.exists() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(part_path.is_file());
+        fs::set_permissions(&part_path, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let report = stage.stop().await;
+
+        assert_eq!(report.summary.failures.len(), 1);
+        assert_eq!(report.summary.failures[0].reason, "encoder_error");
+        assert!(report.summary.failures[0].partial_track.is_some());
+        assert!(part_path.is_file());
+        assert!(!session.join("tracks/user-11.flac").exists());
+
+        fs::set_permissions(&part_path, fs::Permissions::from_mode(0o600)).unwrap();
         fs::remove_dir_all(session).unwrap();
     }
 

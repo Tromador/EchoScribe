@@ -60,7 +60,7 @@ impl<'de> Deserialize<'de> for ParticipantRole {
 }
 
 impl ParticipantRole {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Player => "player",
             Self::Gm => "gm",

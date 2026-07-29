@@ -23,14 +23,18 @@ use tokio::{
 };
 
 use crate::{
-    artifacts::{EVENT_JOURNAL_FILE_NAME, PACKET_JOURNAL_FILE_NAME, PLAYOUT_JOURNAL_FILE_NAME},
+    artifacts::{
+        EVENT_JOURNAL_FILE_NAME, PACKET_JOURNAL_FILE_NAME, PARTICIPANT_SNAPSHOT_FILE_NAME,
+        PLAYOUT_JOURNAL_FILE_NAME, TRACK_DIRECTORY_NAME,
+    },
     diagnostics::{DecodedFrame, OptionalDiagnosticWriter, TrackSummary},
     identity::{IdentityRouter, RoutingAction, UnresolvedSsrcAbandonment, UserIdentity},
     journal::{self, PacketRecord},
-    live_flac::{LiveFlacStage, StageReport as LiveFlacReport, TrackAbandonment},
-    participants::ParticipantContext,
+    live_flac::{LiveFlacStage, LiveTrackSummary, StageReport as LiveFlacReport, TrackAbandonment},
+    participants::{ParticipantContext, ParticipantRole},
     playout::{self, OpusPayloadBounds, PlayoutDecision, PlayoutRecord},
-    session::{self, NewSession, SessionEvent},
+    session::{self, NewSession, SessionEvent, WorkflowState},
+    track_manifest::{TrackDescription, TrackManifest, TrackState},
 };
 
 const QUEUE_CAPACITY: usize = 4096;
@@ -106,8 +110,18 @@ struct ConsumerSummary {
     missing_participant_warnings: u64,
     diagnostic_failures: u64,
     reported_flac_failure_users: HashSet<u64>,
+    routed_users: HashSet<u64>,
+    display_names: HashMap<u64, String>,
+    track_abandonments: HashMap<u64, String>,
     checkpoints: u64,
     durability_syncs: u64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+/// Durable disposition returned to the top-level recording orchestrator.
+pub(crate) enum RecordingOutcome {
+    ReadyForTranscription,
+    AwaitingOperator { incomplete_users: Vec<u64> },
 }
 
 enum CaptureRecord {
@@ -189,7 +203,7 @@ fn start_in_session_directory(
     playout::write_file_header(&mut playout_writer)?;
     let diagnostic_writer =
         OptionalDiagnosticWriter::new(session_directory.path(), diagnostic_wav)?;
-    fs::create_dir(session_directory.path().join("tracks"))?;
+    fs::create_dir(session_directory.path().join(TRACK_DIRECTORY_NAME))?;
 
     packet_writer.flush()?;
     packet_writer.get_ref().sync_data()?;
@@ -433,9 +447,25 @@ impl CaptureDrain {
         &self.session_directory
     }
 
-    /// Stop capture and report failures rather than disguising them as a clean
-    /// shutdown. Slice 5 will promote this result into workflow finalisation.
-    pub(crate) async fn stop(self) {
+    /// Drain capture, finalise routine tracks, and publish the workflow result.
+    pub(crate) async fn stop(self) -> io::Result<RecordingOutcome> {
+        self.stop_inner(None).await
+    }
+
+    /// Drain after a fault outside capture, preserving that orchestration
+    /// evidence in the same durable workflow result.
+    pub(crate) async fn stop_after_failure(
+        self,
+        kind: &'static str,
+        message: String,
+    ) -> io::Result<RecordingOutcome> {
+        self.stop_inner(Some((kind, message))).await
+    }
+
+    async fn stop_inner(
+        self,
+        external_failure: Option<(&'static str, String)>,
+    ) -> io::Result<RecordingOutcome> {
         let Self {
             stop,
             task,
@@ -445,9 +475,29 @@ impl CaptureDrain {
         let _ = stop.send(());
 
         match task.await {
-            Ok(Ok(summary)) => Self::report(&metrics, &summary, &session_directory),
-            Ok(Err(error)) => eprintln!("capture writer failed: {error}"),
-            Err(error) => eprintln!("capture consumer task failed: {error}"),
+            Ok(Ok(summary)) => {
+                let outcome =
+                    finalize_recording(&session_directory, &metrics, &summary, external_failure);
+                Self::report(&metrics, &summary, &session_directory);
+                match outcome {
+                    Ok(outcome) => Ok(outcome),
+                    Err(error) => {
+                        let message = format!("recording finalisation failed: {error}");
+                        mark_failed_drain(&session_directory, "recording_finalization", &message)?;
+                        Err(io::Error::new(error.kind(), message))
+                    }
+                }
+            }
+            Ok(Err(error)) => {
+                let message = format!("capture writer failed: {error}");
+                mark_failed_drain(&session_directory, "capture_consumer", &message)?;
+                Err(io::Error::new(error.kind(), message))
+            }
+            Err(error) => {
+                let message = format!("capture consumer task failed: {error}");
+                mark_failed_drain(&session_directory, "capture_consumer_task", &message)?;
+                Err(io::Error::other(message))
+            }
         }
     }
 
@@ -511,11 +561,17 @@ impl CaptureDrain {
                 summary.abandoned_users.len(),
             );
             for track in &flac.summary.tracks {
+                let final_path = track.path.with_extension("");
+                let published_path = if final_path.exists() {
+                    &final_path
+                } else {
+                    &track.path
+                };
                 println!(
                     "Live FLAC user {}: {}, first tick {}, {} frames, {} source samples, \
                      {} inserted silence samples, {} nonstandard frames, source SSRCs {:?}.",
                     track.discord_user_id,
-                    track.path.display(),
+                    published_path.display(),
                     track.first_tick,
                     track.frames,
                     track.source_samples,
@@ -822,6 +878,10 @@ fn apply_routing_actions(
     for failure in live_flac.take_encoder_failures() {
         summary.abandoned_users.insert(failure.discord_user_id);
         summary
+            .track_abandonments
+            .entry(failure.discord_user_id)
+            .or_insert_with(|| failure.reason.to_owned());
+        summary
             .reported_flac_failure_users
             .insert(failure.discord_user_id);
         let _ = failure_sender.send(DurableFailure {
@@ -836,19 +896,43 @@ fn apply_routing_actions(
     for action in actions {
         match action {
             RoutingAction::Frame(frame) => {
+                summary.routed_users.insert(frame.discord_user_id);
+                summary
+                    .display_names
+                    .insert(frame.discord_user_id, frame.display_name.clone());
                 summary.resolved_frames += 1;
                 summary.resolved_samples += frame.samples.len() as u64;
                 if let Some(abandonment) = live_flac.try_send(frame) {
                     record_queue_abandonment(failure_sender, summary, &abandonment);
                 }
             }
-            RoutingAction::IdentityUpdated(_) => {
+            RoutingAction::IdentityUpdated(identity) => {
+                let display_name = identity
+                    .display_name()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| identity.discord_user_id.to_string());
+                summary
+                    .display_names
+                    .insert(identity.discord_user_id, display_name);
                 summary.identity_updates += 1;
             }
             RoutingAction::UnresolvedSsrcAbandoned(abandonment) => {
                 write_abandonment_event(event_writer, &abandonment)?;
                 summary.generated_event_records += 1;
                 summary.unresolved_abandonments += 1;
+                let _ = failure_sender.send(DurableFailure {
+                    elapsed_nanos: abandonment.elapsed_nanos,
+                    kind: "unresolved_ssrc",
+                    message: format!(
+                        "SSRC {} continuity was abandoned at tick {} after discarding \
+                         {} frames and {} samples: {}",
+                        abandonment.ssrc,
+                        abandonment.last_tick,
+                        abandonment.discarded_frames,
+                        abandonment.discarded_samples,
+                        abandonment.reason.as_str(),
+                    ),
+                });
                 eprintln!(
                     "Unresolved SSRC {} abandoned at tick {}: {} frames and {} samples \
                      discarded ({})",
@@ -861,12 +945,25 @@ fn apply_routing_actions(
             }
             RoutingAction::UserTrackAbandoned(abandonment) => {
                 summary.abandoned_users.insert(abandonment.discord_user_id);
+                summary
+                    .track_abandonments
+                    .entry(abandonment.discord_user_id)
+                    .or_insert_with(|| "unresolved_ssrc".to_owned());
                 live_flac.abandon_user(
                     abandonment.discord_user_id,
                     abandonment.source.last_tick,
                     abandonment.source.elapsed_nanos,
                     "unresolved_ssrc",
                 );
+                let _ = failure_sender.send(DurableFailure {
+                    elapsed_nanos: abandonment.source.elapsed_nanos,
+                    kind: "live_track_incomplete",
+                    message: format!(
+                        "live FLAC track for Discord user {} abandoned because SSRC {} \
+                         exceeded pending identity limits",
+                        abandonment.discord_user_id, abandonment.source.ssrc
+                    ),
+                });
                 eprintln!(
                     "Discord user {} has incomplete live continuity because SSRC {} \
                      was abandoned before mapping.",
@@ -911,6 +1008,10 @@ fn record_queue_abandonment(
     // Mark locally before queueing durable metadata so no later frame can race
     // into a replacement writer for the same logical user.
     summary.abandoned_users.insert(abandonment.discord_user_id);
+    summary
+        .track_abandonments
+        .entry(abandonment.discord_user_id)
+        .or_insert_with(|| abandonment.reason.to_owned());
     let message = format!(
         "live FLAC track for Discord user {} abandoned at tick {}: reason {}, \
          queue depth {}/{}, high-water {}",
@@ -1047,6 +1148,275 @@ fn finish(
 fn flush_and_sync(writer: &mut BufWriter<File>) -> io::Result<()> {
     writer.flush()?;
     writer.get_ref().sync_data()
+}
+
+fn finalize_recording(
+    session_directory: &Path,
+    metrics: &ProducerMetrics,
+    summary: &ConsumerSummary,
+    external_failure: Option<(&'static str, String)>,
+) -> io::Result<RecordingOutcome> {
+    let mut session_store = session::SessionStore::load(session_directory)?;
+    let participants =
+        ParticipantContext::load(&session_directory.join(PARTICIPANT_SNAPSHOT_FILE_NAME))
+            .map_err(io::Error::other)?;
+    let live_report = summary
+        .live_flac
+        .as_ref()
+        .ok_or_else(|| io::Error::other("live FLAC stage did not return a shutdown report"))?;
+    let stopped_at = unix_millis_now()?;
+    if let Some((kind, message)) = &external_failure {
+        session_store.record_failure(stopped_at, *kind, message)?;
+    }
+
+    let mut abandonment_reasons = summary.track_abandonments.clone();
+    let mut track_summaries = HashMap::<u64, LiveTrackSummary>::new();
+    for track in &live_report.summary.tracks {
+        track_summaries.insert(track.discord_user_id, track.clone());
+    }
+
+    let mut shared_writer_failure = None;
+    for failure in &live_report.summary.failures {
+        if failure.discord_user_id == 0 {
+            shared_writer_failure = Some(failure.reason.to_owned());
+            continue;
+        }
+        abandonment_reasons
+            .entry(failure.discord_user_id)
+            .or_insert_with(|| failure.reason.to_owned());
+        if let Some(track) = &failure.partial_track {
+            track_summaries
+                .entry(failure.discord_user_id)
+                .or_insert_with(|| track.clone());
+        }
+    }
+    if let Some(reason) = &shared_writer_failure {
+        for user_id in track_summaries
+            .keys()
+            .chain(summary.abandoned_users.iter())
+            .chain(summary.routed_users.iter())
+            .copied()
+            .collect::<Vec<_>>()
+        {
+            abandonment_reasons
+                .entry(user_id)
+                .or_insert_with(|| reason.clone());
+        }
+    }
+
+    let full_drops = metrics.full_drops.load(Ordering::Relaxed);
+    let closed_drops = metrics.closed_drops.load(Ordering::Relaxed);
+    let capture_queue_fault = full_drops > 0 || closed_drops > 0;
+    if capture_queue_fault {
+        session_store.record_failure(
+            stopped_at,
+            "capture_queue_drop",
+            format!(
+                "capture queue rejected {full_drops} records while full and \
+                 {closed_drops} records after closure"
+            ),
+        )?;
+    }
+
+    let mut user_ids = track_summaries
+        .keys()
+        .chain(abandonment_reasons.keys())
+        .chain(summary.routed_users.iter())
+        .copied()
+        .collect::<Vec<_>>();
+    user_ids.sort_unstable();
+    user_ids.dedup();
+
+    let mut descriptions = Vec::with_capacity(user_ids.len());
+    for user_id in user_ids {
+        let track = track_summaries.get(&user_id);
+        let mut reason = abandonment_reasons.get(&user_id).cloned();
+        let part_relative = format!("{TRACK_DIRECTORY_NAME}/user-{user_id}.flac.part");
+        let final_relative = format!("{TRACK_DIRECTORY_NAME}/user-{user_id}.flac");
+
+        if reason.is_none() {
+            match track {
+                Some(track) => {
+                    if let Err(error) = publish_track(session_directory, user_id, &track.path) {
+                        reason = Some("finalization_error".to_owned());
+                        session_store.record_failure(
+                            stopped_at,
+                            "live_flac_finalization",
+                            format!(
+                                "live FLAC track for Discord user {user_id} could not be \
+                                 published: {error}"
+                            ),
+                        )?;
+                    }
+                }
+                None => {
+                    reason = Some("missing_track_result".to_owned());
+                    session_store.record_failure(
+                        stopped_at,
+                        "live_flac_finalization",
+                        format!("live FLAC track for Discord user {user_id} had no writer result"),
+                    )?;
+                }
+            }
+        }
+
+        let participant = participants.get(user_id);
+        let role = participant
+            .map(|participant| participant.role)
+            .unwrap_or(ParticipantRole::Player)
+            .as_str()
+            .to_owned();
+        let character = participant.and_then(|participant| participant.character.clone());
+        let display_name = summary
+            .display_names
+            .get(&user_id)
+            .cloned()
+            .or_else(|| track.map(|track| track.display_name.clone()))
+            .unwrap_or_else(|| user_id.to_string());
+        let length_samples = track
+            .map(|track| track.source_samples + track.inserted_silence_samples)
+            .unwrap_or(0);
+        let source_ssrcs = track
+            .map(|track| track.source_ssrcs.clone())
+            .unwrap_or_default();
+        let state = if reason.is_some() {
+            TrackState::Incomplete
+        } else {
+            TrackState::Complete
+        };
+        let path = if state == TrackState::Complete {
+            final_relative
+        } else {
+            part_relative
+        };
+        descriptions.push(TrackDescription::new(
+            user_id,
+            display_name,
+            role,
+            character,
+            path,
+            state,
+            length_samples,
+            source_ssrcs,
+            reason,
+        ));
+    }
+
+    let manifest = TrackManifest::new(session_store.record().session_id.clone(), descriptions);
+    if let Err(error) = manifest.write(session_directory) {
+        let message = format!("failed to publish track manifest: {error}");
+        session_store.record_failure(stopped_at, "track_manifest", &message)?;
+        mark_store_awaiting_operator(&mut session_store, stopped_at)?;
+        return Err(io::Error::new(error.kind(), message));
+    }
+
+    let incomplete_users = manifest
+        .tracks
+        .iter()
+        .filter(|track| track.state == TrackState::Incomplete)
+        .map(|track| {
+            track
+                .discord_user_id
+                .parse::<u64>()
+                .expect("validated manifest contains numeric Discord user IDs")
+        })
+        .collect::<Vec<_>>();
+    let recording_fault = capture_queue_fault
+        || shared_writer_failure.is_some()
+        || external_failure.is_some()
+        || summary.unresolved_abandonments > 0
+        || !incomplete_users.is_empty();
+
+    if recording_fault {
+        session_store.record_checkpoint(stopped_at, "recording_finalized_incomplete")?;
+        mark_store_awaiting_operator(&mut session_store, stopped_at)?;
+        Ok(RecordingOutcome::AwaitingOperator { incomplete_users })
+    } else {
+        session_store.record_checkpoint(stopped_at, "recording_finalized_clean")?;
+        session_store.transition(WorkflowState::RecordedClean, stopped_at)?;
+        session_store.transition(WorkflowState::ReadyForTranscription, stopped_at)?;
+        Ok(RecordingOutcome::ReadyForTranscription)
+    }
+}
+
+fn publish_track(
+    session_directory: &Path,
+    discord_user_id: u64,
+    reported_path: &Path,
+) -> io::Result<()> {
+    let track_directory = session_directory.join(TRACK_DIRECTORY_NAME);
+    let part_path = track_directory.join(format!("user-{discord_user_id}.flac.part"));
+    if reported_path != part_path {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "writer returned unexpected track path {}; expected {}",
+                reported_path.display(),
+                part_path.display()
+            ),
+        ));
+    }
+    let final_path = track_directory.join(format!("user-{discord_user_id}.flac"));
+    if final_path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("final track already exists at {}", final_path.display()),
+        ));
+    }
+
+    fs::rename(&part_path, &final_path)?;
+    if let Err(error) = File::open(&track_directory)?.sync_all() {
+        // A failed directory sync cannot support the `.flac` completeness
+        // promise. Put the file back under its incomplete name where possible.
+        let rollback = fs::rename(&final_path, &part_path)
+            .and_then(|()| File::open(&track_directory)?.sync_all());
+        return Err(match rollback {
+            Ok(()) => error,
+            Err(rollback_error) => io::Error::other(format!(
+                "track directory sync failed: {error}; rollback also failed: {rollback_error}"
+            )),
+        });
+    }
+    Ok(())
+}
+
+fn mark_failed_drain(session_directory: &Path, kind: &str, message: &str) -> io::Result<()> {
+    let mut session_store = session::SessionStore::load(session_directory)?;
+    if session_store.record().state == WorkflowState::AwaitingOperator {
+        return Ok(());
+    }
+    let stopped_at = unix_millis_now()?;
+    session_store.record_failure(stopped_at, kind, message)?;
+    match session_store.record().state {
+        WorkflowState::Recording => mark_store_awaiting_operator(&mut session_store, stopped_at),
+        WorkflowState::RecordedIncomplete => {
+            session_store.transition(WorkflowState::AwaitingOperator, stopped_at)
+        }
+        // A failure after a later state was durably published is still returned
+        // to orchestration and recorded, but cannot invent an unapproved
+        // backwards state transition.
+        _ => Ok(()),
+    }
+}
+
+fn mark_store_awaiting_operator(
+    session_store: &mut session::SessionStore,
+    stopped_at: u64,
+) -> io::Result<()> {
+    session_store.transition(WorkflowState::RecordedIncomplete, stopped_at)?;
+    session_store.transition(WorkflowState::AwaitingOperator, stopped_at)
+}
+
+fn unix_millis_now() -> io::Result<u64> {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| {
+                io::Error::other(format!("system clock precedes Unix epoch: {error}"))
+            })?
+            .as_millis(),
+    )
+    .map_err(|_| io::Error::other("current Unix timestamp does not fit in u64"))
 }
 
 impl ConsumerSummary {
@@ -1203,7 +1573,20 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let participants = ParticipantContext::empty_for_test();
+        fs::create_dir(&output_directory).unwrap();
+        let participant_source = output_directory.join("source-participants.toml");
+        fs::write(
+            &participant_source,
+            r#"
+version = 1
+
+[participants."789"]
+character = "Example Character"
+role = "GM"
+"#,
+        )
+        .unwrap();
+        let participants = ParticipantContext::load(&participant_source).unwrap();
         let (sender, drain) =
             start(&output_directory, "123", "456", 1, &participants, true).unwrap();
         let session_path = drain.session_directory().to_path_buf();
@@ -1230,7 +1613,8 @@ mod tests {
             vec![321; crate::diagnostics::SAMPLES_PER_TICK as usize],
         );
         sender.try_send_user_disconnected(789);
-        drain.stop().await;
+        let outcome = drain.stop().await.unwrap();
+        assert_eq!(outcome, RecordingOutcome::ReadyForTranscription);
 
         let bytes = fs::read(&packets_path).unwrap();
         let mut reader = bytes.as_slice();
@@ -1275,7 +1659,7 @@ mod tests {
         let session: serde_json::Value =
             serde_json::from_slice(&fs::read(session_path.join("session.json")).unwrap()).unwrap();
         assert_eq!(session["format"], 3);
-        assert_eq!(session["state"], "recording");
+        assert_eq!(session["state"], "ready_for_transcription");
         assert_eq!(session["discord"]["guild_id"], "123");
         assert_eq!(session["discord"]["channel_id"], "456");
         assert_eq!(session["files"]["packets"]["path"], "packets.dat");
@@ -1319,9 +1703,9 @@ mod tests {
             samples,
             vec![321; crate::diagnostics::SAMPLES_PER_TICK as usize]
         );
-        let live_flac_path = session_path.join("tracks/user-789.flac.part");
+        let live_flac_path = session_path.join("tracks/user-789.flac");
         assert!(live_flac_path.is_file());
-        assert!(!session_path.join("tracks/user-789.flac").exists());
+        assert!(!session_path.join("tracks/user-789.flac.part").exists());
         let mut live_flac = flac_codec::decode::FlacSampleReader::open(live_flac_path).unwrap();
         let mut live_samples = Vec::new();
         live_flac.read_to_end(&mut live_samples).unwrap();
@@ -1339,8 +1723,31 @@ mod tests {
                 .iter()
                 .all(|sample| *sample == 321)
         );
+        let manifest: TrackManifest = serde_json::from_slice(
+            &fs::read(session_path.join(crate::artifacts::TRACK_MANIFEST_FILE_NAME)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.session_id, session["session_id"]);
+        assert_eq!(manifest.tracks.len(), 1);
+        assert_eq!(manifest.tracks[0].discord_user_id, "789");
+        assert_eq!(manifest.tracks[0].display_name, "Server name");
+        assert_eq!(manifest.tracks[0].role, "gm");
+        assert_eq!(
+            manifest.tracks[0].character.as_deref(),
+            Some("Example Character")
+        );
+        assert_eq!(manifest.tracks[0].state, TrackState::Complete);
+        assert_eq!(manifest.tracks[0].path, "tracks/user-789.flac");
+        assert_eq!(
+            manifest.tracks[0].length_samples,
+            crate::diagnostics::SAMPLES_PER_TICK * 11
+        );
+        assert_eq!(manifest.tracks[0].source_ssrcs, [123]);
+        assert!(!session_path.join("tracks/ssrc-123.flac").exists());
+        assert!(!session_path.join("transcription").exists());
 
         crate::inspect::run(&session_path).unwrap();
+        crate::verify_tracks::run(&session_path).unwrap();
 
         fs::remove_dir_all(output_directory).unwrap();
     }
@@ -1366,7 +1773,13 @@ mod tests {
             vec![1; crate::diagnostics::SAMPLES_PER_TICK as usize],
         );
         sender.try_advance_routing_tick(260);
-        drain.stop().await;
+        let outcome = drain.stop().await.unwrap();
+        assert_eq!(
+            outcome,
+            RecordingOutcome::AwaitingOperator {
+                incomplete_users: Vec::new()
+            }
+        );
 
         let events = fs::read_to_string(session_path.join(EVENT_JOURNAL_FILE_NAME)).unwrap();
         let events = events
@@ -1382,6 +1795,9 @@ mod tests {
         assert_eq!(events[0]["discarded_samples"], 960);
         assert_eq!(events[0]["reason"], "age_limit");
         assert!(!session_path.join("diagnostics").exists());
+        let session = session::SessionStore::load(&session_path).unwrap();
+        assert_eq!(session.record().state, WorkflowState::AwaitingOperator);
+        assert_eq!(session.record().failures[0].kind, "unresolved_ssrc");
 
         fs::remove_dir_all(output_directory).unwrap();
     }
@@ -1415,9 +1831,16 @@ mod tests {
             123,
             vec![2; crate::diagnostics::SAMPLES_PER_TICK as usize],
         );
-        drain.stop().await;
+        let outcome = drain.stop().await.unwrap();
+        assert_eq!(
+            outcome,
+            RecordingOutcome::AwaitingOperator {
+                incomplete_users: vec![789]
+            }
+        );
 
         let session = session::SessionStore::load(&session_path).unwrap();
+        assert_eq!(session.record().state, WorkflowState::AwaitingOperator);
         assert_eq!(session.record().failures.len(), 1);
         assert_eq!(session.record().failures[0].kind, "live_flac_encoder");
         assert!(
@@ -1427,6 +1850,14 @@ mod tests {
         );
         assert!(part_path.is_dir());
         assert!(!session_path.join("tracks/user-789.flac").exists());
+        let manifest: TrackManifest =
+            serde_json::from_slice(&fs::read(session_path.join("tracks.json")).unwrap()).unwrap();
+        assert_eq!(manifest.tracks[0].state, TrackState::Incomplete);
+        assert_eq!(
+            manifest.tracks[0].abandonment_reason.as_deref(),
+            Some("encoder_error")
+        );
+        assert_eq!(manifest.tracks[0].path, "tracks/user-789.flac.part");
 
         fs::remove_dir_all(output_directory).unwrap();
     }
@@ -1495,6 +1926,249 @@ mod tests {
         }
         assert!(summary.abandoned_users.contains(&789));
 
+        fs::remove_dir_all(session_path).unwrap();
+    }
+
+    #[test]
+    fn publication_error_leaves_the_incomplete_name() {
+        let session_path = env::temp_dir().join(format!(
+            "echoscribe-track-publication-failure-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let tracks = session_path.join(TRACK_DIRECTORY_NAME);
+        fs::create_dir_all(&tracks).unwrap();
+        let part_path = tracks.join("user-789.flac.part");
+        fs::write(&part_path, b"finalised encoder bytes").unwrap();
+
+        let error =
+            publish_track(&session_path, 789, &tracks.join("unexpected.flac.part")).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(part_path.is_file());
+        assert!(!tracks.join("user-789.flac").exists());
+        fs::remove_dir_all(session_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn consumer_failure_is_returned_and_cannot_leave_a_clean_session() {
+        let session_path = env::temp_dir().join(format!(
+            "echoscribe-capture-consumer-failure-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&session_path).unwrap();
+        let participants = ParticipantContext::empty_for_test();
+        session::SessionStore::create(
+            &session_path,
+            NewSession {
+                session_id: "session-consumer-failure",
+                started_at_unix_millis: 1_000,
+                configuration_version: 1,
+                guild_id: "123",
+                channel_id: "456",
+                participants: &participants,
+            },
+        )
+        .unwrap();
+        let (stop, _stop_receiver) = oneshot::channel();
+        let task = tokio::spawn(async {
+            Err(io::Error::other(
+                "injected authoritative journal write failure",
+            ))
+        });
+        let drain = CaptureDrain {
+            stop,
+            task,
+            metrics: Arc::new(ProducerMetrics::default()),
+            session_directory: session_path.clone(),
+        };
+
+        let error = drain.stop().await.unwrap_err();
+
+        assert!(error.to_string().contains("authoritative journal"));
+        let session = session::SessionStore::load(&session_path).unwrap();
+        assert_eq!(session.record().state, WorkflowState::AwaitingOperator);
+        assert_ne!(session.record().state, WorkflowState::RecordedClean);
+        assert_eq!(session.record().failures[0].kind, "capture_consumer");
+        fs::remove_dir_all(session_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn finalisation_error_is_returned_and_marks_operator_action() {
+        let output_directory = env::temp_dir().join(format!(
+            "echoscribe-finalisation-error-test-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let participants = ParticipantContext::empty_for_test();
+        let (_sender, drain) =
+            start(&output_directory, "123", "456", 1, &participants, false).unwrap();
+        let session_path = drain.session_directory().to_path_buf();
+        fs::remove_file(session_path.join(PARTICIPANT_SNAPSHOT_FILE_NAME)).unwrap();
+
+        let error = drain.stop().await.unwrap_err();
+
+        assert!(error.to_string().contains("participant"));
+        let session = session::SessionStore::load(&session_path).unwrap();
+        assert_eq!(session.record().state, WorkflowState::AwaitingOperator);
+        assert_eq!(session.record().failures[0].kind, "recording_finalization");
+        fs::remove_dir_all(output_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_gateway_failure_still_drains_and_finalises_capture() {
+        let output_directory = env::temp_dir().join(format!(
+            "echoscribe-gateway-termination-test-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let participants = ParticipantContext::empty_for_test();
+        let (_sender, drain) =
+            start(&output_directory, "123", "456", 1, &participants, false).unwrap();
+        let session_path = drain.session_directory().to_path_buf();
+
+        let outcome = drain
+            .stop_after_failure(
+                "gateway_terminated",
+                "gateway stopped before Ctrl-C".to_owned(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            RecordingOutcome::AwaitingOperator {
+                incomplete_users: Vec::new()
+            }
+        );
+        let session = session::SessionStore::load(&session_path).unwrap();
+        assert_eq!(session.record().state, WorkflowState::AwaitingOperator);
+        assert_eq!(session.record().failures[0].kind, "gateway_terminated");
+        let manifest: TrackManifest =
+            serde_json::from_slice(&fs::read(session_path.join("tracks.json")).unwrap()).unwrap();
+        assert!(manifest.tracks.is_empty());
+        fs::remove_dir_all(output_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn authoritative_queue_drop_prevents_clean_recording_state() {
+        let output_directory = env::temp_dir().join(format!(
+            "echoscribe-capture-drop-finalisation-test-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let participants = ParticipantContext::empty_for_test();
+        let (_sender, drain) =
+            start(&output_directory, "123", "456", 1, &participants, false).unwrap();
+        let session_path = drain.session_directory().to_path_buf();
+        drain.metrics.full_drops.fetch_add(1, Ordering::Relaxed);
+
+        let outcome = drain.stop().await.unwrap();
+
+        assert_eq!(
+            outcome,
+            RecordingOutcome::AwaitingOperator {
+                incomplete_users: Vec::new()
+            }
+        );
+        let session = session::SessionStore::load(&session_path).unwrap();
+        assert_eq!(session.record().state, WorkflowState::AwaitingOperator);
+        assert_eq!(session.record().failures[0].kind, "capture_queue_drop");
+        fs::remove_dir_all(output_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn abandoned_user_keeps_part_and_publishes_incomplete_manifest() {
+        let session_path = env::temp_dir().join(format!(
+            "echoscribe-incomplete-manifest-test-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&session_path).unwrap();
+        let participants = ParticipantContext::empty_for_test();
+        session::SessionStore::create(
+            &session_path,
+            NewSession {
+                session_id: "session-incomplete-track",
+                started_at_unix_millis: 1_000,
+                configuration_version: 1,
+                guild_id: "123",
+                channel_id: "456",
+                participants: &participants,
+            },
+        )
+        .unwrap();
+        fs::create_dir(session_path.join(TRACK_DIRECTORY_NAME)).unwrap();
+        let mut stage = LiveFlacStage::start(&session_path);
+        stage.try_send(crate::identity::ResolvedFrame {
+            discord_user_id: 789,
+            display_name: "Server Name".to_owned(),
+            source_ssrc: 123,
+            elapsed_nanos: 200_000_000,
+            tick: 10,
+            samples: vec![1; crate::diagnostics::SAMPLES_PER_TICK as usize],
+        });
+        let report = stage.stop().await;
+        let mut summary = ConsumerSummary {
+            live_flac: Some(report),
+            ..ConsumerSummary::default()
+        };
+        summary.abandoned_users.insert(789);
+        summary
+            .track_abandonments
+            .insert(789, "queue_full".to_owned());
+        summary.display_names.insert(789, "Server Name".to_owned());
+
+        let outcome =
+            finalize_recording(&session_path, &ProducerMetrics::default(), &summary, None).unwrap();
+
+        assert_eq!(
+            outcome,
+            RecordingOutcome::AwaitingOperator {
+                incomplete_users: vec![789]
+            }
+        );
+        assert!(session_path.join("tracks/user-789.flac.part").is_file());
+        assert!(!session_path.join("tracks/user-789.flac").exists());
+        let manifest: TrackManifest =
+            serde_json::from_slice(&fs::read(session_path.join("tracks.json")).unwrap()).unwrap();
+        assert_eq!(manifest.tracks[0].state, TrackState::Incomplete);
+        assert_eq!(
+            manifest.tracks[0].abandonment_reason.as_deref(),
+            Some("queue_full")
+        );
+        assert_eq!(
+            manifest.tracks[0].last_contiguous_sample,
+            Some(crate::diagnostics::SAMPLES_PER_TICK * 11)
+        );
+        let session_before_verification = fs::read(session_path.join("session.json")).unwrap();
+        let error = crate::verify_tracks::run(&session_path).unwrap_err();
+        assert!(error.to_string().contains("incomplete recording"));
+        assert_eq!(
+            fs::read(session_path.join("session.json")).unwrap(),
+            session_before_verification
+        );
+        assert!(!session_path.join("tracks/ssrc-123.flac").exists());
+        assert!(!session_path.join("transcription").exists());
         fs::remove_dir_all(session_path).unwrap();
     }
 }

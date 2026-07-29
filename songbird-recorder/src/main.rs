@@ -18,6 +18,8 @@ mod playout;
 mod recover;
 mod session;
 mod telemetry;
+mod track_manifest;
+mod verify_tracks;
 
 use std::{
     collections::HashSet,
@@ -27,7 +29,7 @@ use std::{
 };
 
 use anyhow::{Context as AnyhowContext, Result, bail};
-use capture::CaptureDrain;
+use capture::{CaptureDrain, RecordingOutcome};
 use config::Config;
 use serenity::{
     Client, async_trait,
@@ -59,6 +61,7 @@ enum Command {
     Inspect { session_directory: PathBuf },
     Recover { session_directory: PathBuf },
     Export { session_directory: PathBuf },
+    Verify { session_directory: PathBuf },
 }
 
 #[async_trait]
@@ -232,6 +235,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Export { session_directory } => {
             return recover::export(&session_directory);
         }
+        Command::Verify { session_directory } => {
+            return verify_tracks::run(&session_directory);
+        }
     };
 
     let config = Config::load(&config_path)?;
@@ -259,37 +265,86 @@ async fn main() -> anyhow::Result<()> {
         capture_drain.session_directory().display()
     );
     let telemetry = Arc::new(VoiceTelemetry::new(capture_sender));
-    let (mut client, voice_manager) = build_client(&config, Arc::clone(&telemetry))
-        .await
-        .context("failed to build the Discord client")?;
+    let (mut client, voice_manager) = match build_client(&config, Arc::clone(&telemetry)).await {
+        Ok(client) => client,
+        Err(error) => {
+            let message = format!("failed to build the Discord client: {error}");
+            if let Err(stop_error) = capture_drain
+                .stop_after_failure("discord_client", message)
+                .await
+            {
+                eprintln!("recording finalisation also failed: {stop_error}");
+            }
+            telemetry.report();
+            return Err(anyhow::Error::new(error).context("failed to build the Discord client"));
+        }
+    };
     let shard_manager = client.shard_manager.clone();
     let guild_id = config.guild_id;
 
-    // This task owns the drain, enforcing leave -> capture drain -> gateway
-    // shutdown ordering and preventing a second stop attempt.
-    tokio::spawn(async move {
-        match tokio::signal::ctrl_c().await {
-            Ok(()) => {
-                println!("Shutdown requested.");
-
-                if let Err(error) = voice_manager.remove(guild_id).await {
-                    eprintln!("failed to leave the voice channel cleanly: {error}");
-                }
-
-                stop_capture(capture_drain).await;
-                telemetry.report();
-                shard_manager.shutdown_all().await;
-            }
-            Err(error) => eprintln!("failed to listen for Ctrl-C: {error}"),
-        }
-    });
-
     println!("Connecting to Discord; press Ctrl-C to stop.");
 
-    client
-        .start()
-        .await
-        .context("Discord gateway client stopped with an error")?;
+    // Keep the drain in this orchestration scope so gateway termination and
+    // Ctrl-C converge on the same leave -> drain -> gateway-shutdown route.
+    let (gateway_result, recording_failure) = tokio::select! {
+        signal = tokio::signal::ctrl_c() => {
+            match signal {
+                Ok(()) => {
+                    println!("Shutdown requested.");
+                    (Ok(()), None)
+                }
+                Err(error) => {
+                    let message = format!("failed to listen for Ctrl-C: {error}");
+                    (
+                        Err(anyhow::Error::new(error).context(
+                            "failed to listen for Ctrl-C",
+                        )),
+                        Some(("shutdown_signal", message)),
+                    )
+                }
+            }
+        }
+        result = client.start() => {
+            let result = result.context("Discord gateway client stopped with an error");
+            let message = match &result {
+                Ok(()) => "Discord gateway terminated before an explicit stop".to_owned(),
+                Err(error) => error.to_string(),
+            };
+            (result, Some(("gateway_terminated", message)))
+        }
+    };
+
+    if let Err(error) = voice_manager.remove(guild_id).await {
+        eprintln!("failed to leave the voice channel cleanly: {error}");
+    }
+
+    let recording_result = stop_capture(capture_drain, recording_failure).await;
+    telemetry.report();
+    shard_manager.shutdown_all().await;
+
+    let recording_outcome = recording_result.context("recording finalisation failed")?;
+    match recording_outcome {
+        RecordingOutcome::ReadyForTranscription => {
+            println!("Recording finalised cleanly and is ready for transcription.");
+        }
+        RecordingOutcome::AwaitingOperator { incomplete_users } => {
+            if incomplete_users.is_empty() {
+                bail!(
+                    "recording stopped with an integrity fault; session is awaiting operator action"
+                );
+            }
+            bail!(
+                "recording stopped with incomplete tracks for Discord users {}; \
+                 session is awaiting operator action",
+                incomplete_users
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    gateway_result?;
 
     println!("EchoScribe stopped.");
 
@@ -307,7 +362,10 @@ fn parse_command_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Res
         });
     };
 
-    if matches!(first.to_str(), Some("inspect" | "recover" | "export")) {
+    if matches!(
+        first.to_str(),
+        Some("inspect" | "recover" | "export" | "verify")
+    ) {
         let operation = first.to_string_lossy();
         let session_directory = args
             .next()
@@ -320,6 +378,7 @@ fn parse_command_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Res
             Some("inspect") => Ok(Command::Inspect { session_directory }),
             Some("recover") => Ok(Command::Recover { session_directory }),
             Some("export") => Ok(Command::Export { session_directory }),
+            Some("verify") => Ok(Command::Verify { session_directory }),
             _ => unreachable!("command was matched above"),
         }
     } else {
@@ -332,8 +391,14 @@ fn parse_command_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Res
     }
 }
 
-async fn stop_capture(capture: CaptureDrain) {
-    capture.stop().await;
+async fn stop_capture(
+    capture: CaptureDrain,
+    failure: Option<(&'static str, String)>,
+) -> std::io::Result<RecordingOutcome> {
+    match failure {
+        Some((kind, message)) => capture.stop_after_failure(kind, message).await,
+        None => capture.stop().await,
+    }
 }
 
 #[cfg(test)]
@@ -421,6 +486,22 @@ mod tests {
         .unwrap();
         let Command::Export { session_directory } = command else {
             panic!("expected export command");
+        };
+        assert_eq!(session_directory, Path::new("recordings/session-123"));
+    }
+
+    #[test]
+    fn verify_argument_selects_session_directory() {
+        let command = parse_command_args(
+            [
+                OsString::from("verify"),
+                OsString::from("recordings/session-123"),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        let Command::Verify { session_directory } = command else {
+            panic!("expected verify command");
         };
         assert_eq!(session_directory, Path::new("recordings/session-123"));
     }
