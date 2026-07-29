@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::{
+    artifacts::{EVENT_JOURNAL_FILE_NAME, PACKET_JOURNAL_FILE_NAME, PLAYOUT_JOURNAL_FILE_NAME},
     diagnostics::SAMPLES_PER_TICK,
     journal::{self, ReadRecord as ReadPacketRecord},
     playout::{self, PlayoutDecision, ReadRecord as ReadPlayoutRecord},
@@ -104,13 +105,13 @@ pub(crate) fn run(session_directory: &Path) -> Result<()> {
     let manifest = read_manifest(session_directory)?;
     validate_manifest(&manifest)?;
 
-    let packets = inspect_packets(&session_directory.join("packets.dat"))?;
+    let packets = inspect_packets(&session_directory.join(&manifest.files.packets.path))?;
     let playout = inspect_playout(
-        &session_directory.join("playout.dat"),
+        &session_directory.join(&manifest.files.playout.path),
         &packets.packet_keys,
         manifest.files.playout.format,
     )?;
-    let events = inspect_events(&session_directory.join("events.ndjson"))?;
+    let events = inspect_events(&session_directory.join(&manifest.files.events.path))?;
 
     println!("Session inspection: {}.", session_directory.display());
     println!(
@@ -281,19 +282,19 @@ fn validate_manifest(manifest: &SessionManifest) -> Result<()> {
     validate_file_description(
         "packets",
         &manifest.files.packets,
-        "packets.dat",
+        PACKET_JOURNAL_FILE_NAME,
         journal::FORMAT_VERSION,
     )?;
     validate_playout_description(&manifest.files.playout)?;
-    validate_file_description("events", &manifest.files.events, "events.ndjson", 1)
+    validate_file_description("events", &manifest.files.events, EVENT_JOURNAL_FILE_NAME, 1)
 }
 
 fn validate_playout_description(description: &FileDescription) -> Result<()> {
-    if description.path != "playout.dat" {
+    if description.path != PLAYOUT_JOURNAL_FILE_NAME {
         bail!(
             "session manifest playout path is {:?}; expected {:?}",
             description.path,
-            "playout.dat"
+            PLAYOUT_JOURNAL_FILE_NAME
         );
     }
     if !matches!(description.format, 1 | playout::FORMAT_VERSION) {

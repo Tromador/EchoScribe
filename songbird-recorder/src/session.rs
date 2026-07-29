@@ -6,17 +6,21 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::participants::ParticipantContext;
+use crate::{
+    artifacts::{
+        EVENT_JOURNAL_FILE_NAME, PACKET_JOURNAL_FILE_NAME, PARTICIPANT_SNAPSHOT_FILE_NAME,
+        PARTICIPANT_SNAPSHOT_FORMAT_VERSION, PLAYOUT_JOURNAL_FILE_NAME, TRACK_MANIFEST_FILE_NAME,
+        TRACK_MANIFEST_FORMAT_VERSION,
+    },
+    participants::ParticipantContext,
+};
 
 pub(crate) const SESSION_FORMAT_VERSION: u16 = 3;
 pub(crate) const LEGACY_SESSION_FORMAT_VERSION: u16 = 2;
 pub(crate) const EVENT_FORMAT_VERSION: u16 = 1;
-pub(crate) const PARTICIPANT_FORMAT_VERSION: u16 = 1;
-pub(crate) const TRACK_MANIFEST_FORMAT_VERSION: u16 = 1;
 
 const SESSION_FILE_NAME: &str = "session.json";
 const SESSION_TEMP_FILE_NAME: &str = ".session.json.tmp";
-const PARTICIPANT_FILE_NAME: &str = "participants.toml";
 const PARTICIPANT_TEMP_FILE_NAME: &str = ".participants.toml.tmp";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -132,23 +136,23 @@ impl SessionRecord {
             },
             files: SessionFiles {
                 packets: FileDescription {
-                    path: "packets.dat".to_owned(),
+                    path: PACKET_JOURNAL_FILE_NAME.to_owned(),
                     format: crate::journal::FORMAT_VERSION,
                 },
                 playout: FileDescription {
-                    path: "playout.dat".to_owned(),
+                    path: PLAYOUT_JOURNAL_FILE_NAME.to_owned(),
                     format: crate::playout::FORMAT_VERSION,
                 },
                 events: FileDescription {
-                    path: "events.ndjson".to_owned(),
+                    path: EVENT_JOURNAL_FILE_NAME.to_owned(),
                     format: EVENT_FORMAT_VERSION,
                 },
                 participants: FileDescription {
-                    path: PARTICIPANT_FILE_NAME.to_owned(),
-                    format: PARTICIPANT_FORMAT_VERSION,
+                    path: PARTICIPANT_SNAPSHOT_FILE_NAME.to_owned(),
+                    format: PARTICIPANT_SNAPSHOT_FORMAT_VERSION,
                 },
                 tracks: FileDescription {
-                    path: "tracks.json".to_owned(),
+                    path: TRACK_MANIFEST_FILE_NAME.to_owned(),
                     format: TRACK_MANIFEST_FORMAT_VERSION,
                 },
             },
@@ -209,31 +213,31 @@ impl SessionRecord {
             (
                 "packets",
                 &self.files.packets,
-                "packets.dat",
+                PACKET_JOURNAL_FILE_NAME,
                 crate::journal::FORMAT_VERSION,
             ),
             (
                 "playout",
                 &self.files.playout,
-                "playout.dat",
+                PLAYOUT_JOURNAL_FILE_NAME,
                 crate::playout::FORMAT_VERSION,
             ),
             (
                 "events",
                 &self.files.events,
-                "events.ndjson",
+                EVENT_JOURNAL_FILE_NAME,
                 EVENT_FORMAT_VERSION,
             ),
             (
                 "participants",
                 &self.files.participants,
-                PARTICIPANT_FILE_NAME,
-                PARTICIPANT_FORMAT_VERSION,
+                PARTICIPANT_SNAPSHOT_FILE_NAME,
+                PARTICIPANT_SNAPSHOT_FORMAT_VERSION,
             ),
             (
                 "tracks",
                 &self.files.tracks,
-                "tracks.json",
+                TRACK_MANIFEST_FILE_NAME,
                 TRACK_MANIFEST_FORMAT_VERSION,
             ),
         ] {
@@ -268,7 +272,7 @@ impl SessionStore {
         write_new_file_atomically(
             session_directory,
             PARTICIPANT_TEMP_FILE_NAME,
-            PARTICIPANT_FILE_NAME,
+            PARTICIPANT_SNAPSHOT_FILE_NAME,
             participant_snapshot.as_bytes(),
         )?;
 

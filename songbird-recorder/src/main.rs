@@ -1,3 +1,4 @@
+mod artifacts;
 mod capture;
 mod config;
 mod diagnostics;

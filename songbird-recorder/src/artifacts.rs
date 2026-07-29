@@ -1,0 +1,8 @@
+pub(crate) const PACKET_JOURNAL_FILE_NAME: &str = "packets.dat";
+pub(crate) const PLAYOUT_JOURNAL_FILE_NAME: &str = "playout.dat";
+pub(crate) const EVENT_JOURNAL_FILE_NAME: &str = "events.ndjson";
+pub(crate) const PARTICIPANT_SNAPSHOT_FILE_NAME: &str = "participants.toml";
+pub(crate) const TRACK_MANIFEST_FILE_NAME: &str = "tracks.json";
+
+pub(crate) const PARTICIPANT_SNAPSHOT_FORMAT_VERSION: u16 = 1;
+pub(crate) const TRACK_MANIFEST_FORMAT_VERSION: u16 = 1;

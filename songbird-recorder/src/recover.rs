@@ -11,6 +11,10 @@ use serde::Serialize;
 use songbird::packet::rtp::RtpPacket;
 
 use crate::{
+    artifacts::{
+        EVENT_JOURNAL_FILE_NAME, PACKET_JOURNAL_FILE_NAME, PLAYOUT_JOURNAL_FILE_NAME,
+        TRACK_MANIFEST_FILE_NAME, TRACK_MANIFEST_FORMAT_VERSION,
+    },
     diagnostics::{
         CHANNELS, DecodedFrame, DiagnosticWriter, SAMPLE_RATE as OUTPUT_SAMPLE_RATE,
         SAMPLES_PER_TICK, TrackSummary,
@@ -27,7 +31,6 @@ const SAMPLE_RATE: u32 = 48_000;
 const INITIAL_DECODE_CAPACITY: usize = 1_920;
 const MAX_DECODE_CAPACITY: usize = 11_520;
 const FORMAT_ONE_TRANSPORT_SUFFIX_LENGTH: usize = 20;
-const TRACK_MANIFEST_FORMAT_VERSION: u16 = 1;
 
 #[derive(Clone, Copy)]
 enum OutputKind {
@@ -71,8 +74,8 @@ pub(crate) fn export(session_directory: &Path) -> Result<()> {
 }
 
 fn decode_session(session_directory: &Path, output_kind: OutputKind) -> Result<()> {
-    let packets_path = session_directory.join("packets.dat");
-    let playout_path = session_directory.join("playout.dat");
+    let packets_path = session_directory.join(PACKET_JOURNAL_FILE_NAME);
+    let playout_path = session_directory.join(PLAYOUT_JOURNAL_FILE_NAME);
 
     let packet_index = build_packet_index(&packets_path)?;
     let packet_file = File::open(&packets_path)
@@ -279,7 +282,7 @@ struct TrackDescription {
 
 fn write_track_manifest(session_directory: &Path, tracks: &[TrackSummary]) -> Result<()> {
     let (speaker_mappings, event_journal_truncated_tail) =
-        read_speaker_mappings(&session_directory.join("events.ndjson"))?;
+        read_speaker_mappings(&session_directory.join(EVENT_JOURNAL_FILE_NAME))?;
     let descriptions = tracks
         .iter()
         .map(|track| {
@@ -324,7 +327,7 @@ fn write_track_manifest(session_directory: &Path, tracks: &[TrackSummary]) -> Re
         event_journal_truncated_tail,
         tracks: descriptions,
     };
-    let path = session_directory.join("tracks.json");
+    let path = session_directory.join(TRACK_MANIFEST_FILE_NAME);
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)

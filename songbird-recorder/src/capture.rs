@@ -17,6 +17,7 @@ use tokio::{
 };
 
 use crate::{
+    artifacts::{EVENT_JOURNAL_FILE_NAME, PACKET_JOURNAL_FILE_NAME, PLAYOUT_JOURNAL_FILE_NAME},
     diagnostics::{DecodedFrame, DiagnosticWriter, TrackSummary},
     journal::{self, PacketRecord},
     participants::ParticipantContext,
@@ -85,6 +86,10 @@ enum CaptureRecord {
     Audio(DecodedFrame),
 }
 
+struct SessionDirectoryGuard {
+    path: Option<PathBuf>,
+}
+
 pub(crate) fn start(
     output_directory: &Path,
     guild_id: &str,
@@ -93,23 +98,32 @@ pub(crate) fn start(
     participants: &ParticipantContext,
 ) -> io::Result<(CaptureSender, CaptureDrain)> {
     let (session_directory, started_at_unix_millis) = create_session_directory(output_directory)?;
+    start_in_session_directory(
+        SessionDirectoryGuard::new(session_directory),
+        started_at_unix_millis,
+        guild_id,
+        channel_id,
+        configuration_version,
+        participants,
+    )
+}
+
+fn start_in_session_directory(
+    session_directory: SessionDirectoryGuard,
+    started_at_unix_millis: u64,
+    guild_id: &str,
+    channel_id: &str,
+    configuration_version: u32,
+    participants: &ParticipantContext,
+) -> io::Result<(CaptureSender, CaptureDrain)> {
     let session_id = session_directory
+        .path()
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| io::Error::other("capture session directory has no valid UTF-8 name"))?;
-    session::SessionStore::create(
-        &session_directory,
-        NewSession {
-            session_id,
-            started_at_unix_millis,
-            configuration_version,
-            guild_id,
-            channel_id,
-            participants,
-        },
-    )?;
+        .ok_or_else(|| io::Error::other("capture session directory has no valid UTF-8 name"))?
+        .to_owned();
 
-    let packets_path = session_directory.join("packets.dat");
+    let packets_path = session_directory.path().join(PACKET_JOURNAL_FILE_NAME);
     let packets_file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -119,15 +133,33 @@ pub(crate) fn start(
     let events_file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(session_directory.join("events.ndjson"))?;
+        .open(session_directory.path().join(EVENT_JOURNAL_FILE_NAME))?;
     let event_writer = BufWriter::new(events_file);
     let playout_file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(session_directory.join("playout.dat"))?;
+        .open(session_directory.path().join(PLAYOUT_JOURNAL_FILE_NAME))?;
     let mut playout_writer = BufWriter::with_capacity(WRITER_BUFFER_CAPACITY, playout_file);
     playout::write_file_header(&mut playout_writer)?;
-    let diagnostic_writer = DiagnosticWriter::new(&session_directory)?;
+    let diagnostic_writer = DiagnosticWriter::new(session_directory.path())?;
+
+    packet_writer.flush()?;
+    packet_writer.get_ref().sync_data()?;
+    event_writer.get_ref().sync_data()?;
+    playout_writer.flush()?;
+    playout_writer.get_ref().sync_data()?;
+
+    session::SessionStore::create(
+        session_directory.path(),
+        NewSession {
+            session_id: &session_id,
+            started_at_unix_millis,
+            configuration_version,
+            guild_id,
+            channel_id,
+            participants,
+        },
+    )?;
 
     let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
     let (stop, stop_receiver) = oneshot::channel();
@@ -140,6 +172,7 @@ pub(crate) fn start(
         playout_writer,
         diagnostic_writer,
     ));
+    let session_directory = session_directory.disarm();
 
     Ok((
         CaptureSender {
@@ -154,6 +187,38 @@ pub(crate) fn start(
             session_directory,
         },
     ))
+}
+
+impl SessionDirectoryGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn path(&self) -> &Path {
+        self.path
+            .as_deref()
+            .expect("session directory guard is always armed while borrowed")
+    }
+
+    fn disarm(mut self) -> PathBuf {
+        self.path
+            .take()
+            .expect("session directory guard can only be disarmed once")
+    }
+}
+
+impl Drop for SessionDirectoryGuard {
+    fn drop(&mut self) {
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        if let Err(error) = fs::remove_dir_all(&path) {
+            eprintln!(
+                "failed to remove incomplete capture session directory {}: {error}",
+                path.display()
+            );
+        }
+    }
 }
 
 impl CaptureSender {
@@ -608,6 +673,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn journal_initialisation_failure_removes_unpublished_session() {
+        let output_directory = env::temp_dir().join(format!(
+            "echoscribe-capture-start-failure-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let session_directory = output_directory.join("session-1000");
+        fs::create_dir_all(&session_directory).unwrap();
+        fs::write(
+            session_directory.join(PLAYOUT_JOURNAL_FILE_NAME),
+            b"collision",
+        )
+        .unwrap();
+        let participants = ParticipantContext::empty_for_test();
+
+        let error = start_in_session_directory(
+            SessionDirectoryGuard::new(session_directory.clone()),
+            1000,
+            "123",
+            "456",
+            1,
+            &participants,
+        )
+        .err()
+        .expect("journal initialisation should fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(!session_directory.exists());
+        assert!(!output_directory.join("session-1000/session.json").exists());
+        fs::remove_dir_all(output_directory).unwrap();
+    }
+
+    #[tokio::test]
     async fn writer_creates_readable_session_files() {
         let output_directory = env::temp_dir().join(format!(
             "echoscribe-capture-test-{}-{}",
@@ -620,8 +721,8 @@ mod tests {
         let participants = ParticipantContext::empty_for_test();
         let (sender, drain) = start(&output_directory, "123", "456", 1, &participants).unwrap();
         let session_path = drain.session_directory().to_path_buf();
-        let packets_path = drain.session_directory().join("packets.dat");
-        let playout_path = drain.session_directory().join("playout.dat");
+        let packets_path = drain.session_directory().join(PACKET_JOURNAL_FILE_NAME);
+        let playout_path = drain.session_directory().join(PLAYOUT_JOURNAL_FILE_NAME);
 
         sender.try_send(packet(42));
         sender.try_send_speaker_mapping(123, Some("user-789".into()), 1);

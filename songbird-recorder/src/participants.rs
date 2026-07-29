@@ -7,7 +7,9 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-const SUPPORTED_PARTICIPANT_VERSION: u32 = 1;
+use crate::artifacts::PARTICIPANT_SNAPSHOT_FORMAT_VERSION;
+
+const SUPPORTED_PARTICIPANT_VERSION: u32 = PARTICIPANT_SNAPSHOT_FORMAT_VERSION as u32;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
