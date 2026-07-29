@@ -1,3 +1,9 @@
+//! Durable session workflow metadata and event-journal records.
+//!
+//! `session.json` is workflow authority. Updates use write/synchronise/rename
+//! replacement, while participant context remains a separate immutable TOML
+//! artefact referenced by the manifest.
+
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
@@ -26,6 +32,7 @@ const PARTICIPANT_TEMP_FILE_NAME: &str = ".participants.toml.tmp";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+/// Validated top-level workflow states persisted in `session.json`.
 pub(crate) enum WorkflowState {
     Recording,
     RecordedClean,
@@ -54,6 +61,7 @@ impl WorkflowState {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+/// Versioned durable authority for one session's processing state.
 pub(crate) struct SessionRecord {
     pub(crate) format: u16,
     pub(crate) session_id: String,
@@ -76,6 +84,7 @@ pub(crate) struct DiscordSession {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+/// Internal artefact manifest; paths are relative to the session directory.
 pub(crate) struct SessionFiles {
     pub(crate) packets: FileDescription,
     pub(crate) playout: FileDescription,
@@ -86,6 +95,7 @@ pub(crate) struct SessionFiles {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+/// A path and an independently versioned on-disk format.
 pub(crate) struct FileDescription {
     pub(crate) path: String,
     pub(crate) format: u16,
@@ -93,6 +103,7 @@ pub(crate) struct FileDescription {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+/// Durable explanation of a fault while the record was in `state`.
 pub(crate) struct FailureRecord {
     pub(crate) recorded_at_unix_millis: u64,
     pub(crate) state: WorkflowState,
@@ -107,6 +118,7 @@ pub(crate) struct CheckpointRecord {
     pub(crate) stage: String,
 }
 
+/// Inputs required to allocate the immutable foundation of a new session.
 pub(crate) struct NewSession<'a> {
     pub(crate) session_id: &'a str,
     pub(crate) started_at_unix_millis: u64,
@@ -117,6 +129,7 @@ pub(crate) struct NewSession<'a> {
 }
 
 #[allow(dead_code)]
+/// In-memory record paired with crash-safe persistence operations.
 pub(crate) struct SessionStore {
     path: PathBuf,
     record: SessionRecord,
@@ -163,6 +176,8 @@ impl SessionRecord {
     }
 
     pub(crate) fn validate(&self) -> io::Result<()> {
+        // Validation is intentionally repeated on read and before every write;
+        // malformed workflow authority must never be propagated.
         if self.format != SESSION_FORMAT_VERSION {
             return Err(invalid_data(format!(
                 "unsupported session format {}; expected {}",
@@ -271,6 +286,7 @@ impl SessionRecord {
 }
 
 impl SessionStore {
+    /// Publish the participant snapshot and initial recording record.
     pub(crate) fn create(session_directory: &Path, input: NewSession<'_>) -> io::Result<Self> {
         let participant_snapshot = input
             .participants
@@ -308,6 +324,8 @@ impl SessionStore {
         next: WorkflowState,
         at_unix_millis: u64,
     ) -> io::Result<()> {
+        // State changes are an explicit table, not an ordinal progression. This
+        // prevents commands skipping required operator-controlled boundaries.
         if !valid_transition(self.record.state, next) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -333,6 +351,7 @@ impl SessionStore {
         kind: impl Into<String>,
         message: impl Into<String>,
     ) -> io::Result<()> {
+        // Failure evidence is append-only within the replaced session record.
         let mut updated = self.record.clone();
         updated.failures.push(FailureRecord {
             recorded_at_unix_millis,
@@ -358,6 +377,8 @@ impl SessionStore {
     }
 
     fn persist(&mut self, updated: SessionRecord) -> io::Result<()> {
+        // Do not mutate the in-memory authority until the replacement is
+        // validated and durably published.
         updated.validate()?;
         let session_directory = self
             .path
@@ -370,6 +391,8 @@ impl SessionStore {
 }
 
 pub(crate) fn read_record(path: &Path) -> io::Result<SessionRecord> {
+    // A successfully parsed JSON object is still untrusted until every state,
+    // path, format and identifier invariant has been checked.
     let bytes = fs::read(path)?;
     let record: SessionRecord = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
     record.validate()?;
@@ -442,6 +465,8 @@ fn write_replacing_file_atomically(
     final_name: &str,
     bytes: &[u8],
 ) -> io::Result<()> {
+    // Sync contents before rename and the directory afterwards so a reported
+    // update survives the normal storage crash boundary.
     let temporary_path = directory.join(temporary_name);
     let final_path = directory.join(final_name);
     let mut file = OpenOptions::new()
@@ -496,6 +521,7 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
+/// Versioned identity and continuity evidence stored as NDJSON.
 pub(crate) enum SessionEvent {
     SpeakerMapping {
         format: u16,
@@ -593,6 +619,8 @@ impl SessionEvent {
 }
 
 pub(crate) fn write_event(writer: &mut impl Write, event: &SessionEvent) -> io::Result<()> {
+    // One complete JSON object per line permits streaming append and inspection
+    // of every complete prefix after a crash.
     serde_json::to_writer(&mut *writer, event).map_err(io::Error::other)?;
     writer.write_all(b"\n")
 }

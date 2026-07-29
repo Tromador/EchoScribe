@@ -1,3 +1,9 @@
+//! Bounded live FLAC stage downstream of authoritative capture.
+//!
+//! The capture consumer only performs `try_send`; encoding and filesystem work
+//! happen here. Tracks are keyed by Discord user, remain `.flac.part`, and are
+//! never restarted after continuity or encoder failure.
+
 use std::{
     collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
@@ -26,6 +32,7 @@ const SILENCE_BLOCK_SAMPLES: usize = 4096;
 const SILENCE_BLOCK: [i32; SILENCE_BLOCK_SAMPLES] = [0; SILENCE_BLOCK_SAMPLES];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Capture-side terminal decision after a frame cannot enter the FLAC queue.
 pub(crate) struct TrackAbandonment {
     pub(crate) discord_user_id: u64,
     pub(crate) tick: u64,
@@ -37,6 +44,7 @@ pub(crate) struct TrackAbandonment {
 }
 
 #[derive(Default)]
+/// Atomics shared between queue production and shutdown reporting.
 pub(crate) struct QueueMetrics {
     accepted: AtomicU64,
     enqueue_failures: AtomicU64,
@@ -44,6 +52,7 @@ pub(crate) struct QueueMetrics {
     warning_crossings: AtomicU64,
 }
 
+/// Producer/control handle for the separately scheduled encoder loop.
 pub(crate) struct LiveFlacStage {
     sender: mpsc::Sender<ResolvedFrame>,
     stop: oneshot::Sender<()>,
@@ -55,11 +64,13 @@ pub(crate) struct LiveFlacStage {
 }
 
 #[derive(Default)]
+/// Results owned by the encoder worker after draining accepted input.
 pub(crate) struct StageSummary {
     pub(crate) tracks: Vec<LiveTrackSummary>,
     pub(crate) failures: Vec<TrackFailure>,
 }
 
+/// Accounting for one live Discord-user track.
 pub(crate) struct LiveTrackSummary {
     pub(crate) discord_user_id: u64,
     pub(crate) path: PathBuf,
@@ -72,6 +83,7 @@ pub(crate) struct LiveTrackSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Terminal writer failure returned to capture for durable recording.
 pub(crate) struct TrackFailure {
     pub(crate) discord_user_id: u64,
     pub(crate) tick: u64,
@@ -81,6 +93,7 @@ pub(crate) struct TrackFailure {
 }
 
 impl LiveFlacStage {
+    /// Start the worker after capture has prepared the session's track directory.
     pub(crate) fn start(session_directory: &Path) -> Self {
         Self::start_with_capacity(session_directory, QUEUE_CAPACITY)
     }
@@ -105,6 +118,8 @@ impl LiveFlacStage {
     }
 
     pub(crate) fn try_send(&mut self, frame: ResolvedFrame) -> Option<TrackAbandonment> {
+        // This method is on the authoritative consumer's hot path: never await
+        // queue capacity or perform encoder/file work here.
         if self.abandoned_users.contains(&frame.discord_user_id) {
             return None;
         }
@@ -154,10 +169,12 @@ impl LiveFlacStage {
         elapsed_nanos: u64,
         reason: &'static str,
     ) -> Option<TrackAbandonment> {
+        // Identity loss and queue loss use the same terminal user-level gate.
         self.abandon(discord_user_id, tick, elapsed_nanos, reason, self.depth())
     }
 
     pub(crate) fn take_encoder_failures(&mut self) -> Vec<TrackFailure> {
+        // Capture drains feedback before applying each new routing-action batch.
         let mut failures = Vec::new();
         while let Ok(failure) = self.failure_receiver.try_recv() {
             if failure.discord_user_id != 0 {
@@ -197,6 +214,8 @@ impl LiveFlacStage {
         let capacity = self.sender.max_capacity();
         let warning_depth = capacity * 3 / 4;
         let warning_rearm_depth = capacity / 2;
+        // Hysteresis avoids one warning per frame while depth oscillates around
+        // the 75% threshold.
         if depth < warning_rearm_depth {
             self.warning_armed = true;
         } else if self.warning_armed && depth >= warning_depth {
@@ -226,6 +245,8 @@ impl LiveFlacStage {
         let summary = match task.await {
             Ok(summary) => summary,
             Err(error) => StageSummary {
+                // User zero denotes failure of the shared worker rather than a
+                // particular Discord participant.
                 failures: vec![TrackFailure {
                     discord_user_id: 0,
                     tick: 0,
@@ -248,6 +269,7 @@ impl LiveFlacStage {
     }
 }
 
+/// Queue telemetry and writer outcomes returned at deterministic shutdown.
 pub(crate) struct StageReport {
     pub(crate) accepted: u64,
     pub(crate) enqueue_failures: u64,
@@ -263,6 +285,8 @@ async fn run(
     failure_sender: mpsc::UnboundedSender<TrackFailure>,
     directory: PathBuf,
 ) -> StageSummary {
+    // One managed loop provides deterministic writer ownership and shutdown.
+    // Individual writer failures are isolated through the abandoned-user set.
     let mut writers = HashMap::<u64, Track>::new();
     let mut abandoned = HashSet::new();
     let mut failures = Vec::new();
@@ -271,6 +295,8 @@ async fn run(
         tokio::select! {
             biased;
             _ = &mut stop => {
+                // Closing first fixes the accepted work set, which is drained
+                // completely before encoder finalisation.
                 receiver.close();
                 while let Some(frame) = receiver.recv().await {
                     write_frame(
@@ -341,6 +367,8 @@ fn write_frame(
     };
 
     if let Err(error) = result {
+        // Removing the writer and remembering the user makes failure terminal;
+        // queued or future frames cannot create a replacement.
         abandoned.insert(frame.discord_user_id);
         writers.remove(&frame.discord_user_id);
         let failure = TrackFailure {
@@ -410,6 +438,8 @@ impl Track {
             ));
         }
 
+        // Every user track begins at session tick zero. Silence represents both
+        // leading time and gaps between frames or replacement SSRCs.
         let missing_ticks = frame.tick - self.next_tick;
         let silence_samples = missing_ticks
             .checked_mul(SAMPLES_PER_TICK)

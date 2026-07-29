@@ -1,3 +1,8 @@
+//! Canonical names and format versions for session artefacts.
+//!
+//! Keeping these values central prevents producers, manifests, and readers from
+//! silently developing different ideas about the same file.
+
 pub(crate) const PACKET_JOURNAL_FILE_NAME: &str = "packets.dat";
 pub(crate) const PLAYOUT_JOURNAL_FILE_NAME: &str = "playout.dat";
 pub(crate) const EVENT_JOURNAL_FILE_NAME: &str = "events.ndjson";

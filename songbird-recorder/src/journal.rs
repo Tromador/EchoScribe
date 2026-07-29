@@ -14,6 +14,7 @@ const RECORD_METADATA_LENGTH: usize = 30;
 const MAX_RECORD_BODY_LENGTH: usize = 65_536;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+/// One decrypted RTP packet plus arrival and embedded-payload metadata.
 pub(crate) struct PacketRecord {
     pub(crate) arrival_nanos_since_session_start: u64,
     pub(crate) ssrc: u32,
@@ -25,6 +26,7 @@ pub(crate) struct PacketRecord {
 }
 
 #[derive(Debug, Eq, PartialEq)]
+/// A truncated final record is distinguished from corruption in complete data.
 pub(crate) enum ReadRecord {
     Record(PacketRecord),
     EndOfFile,
@@ -69,6 +71,8 @@ pub(crate) fn read_file_header(reader: &mut impl Read) -> io::Result<()> {
 }
 
 pub(crate) fn write_record(writer: &mut impl Write, record: &PacketRecord) -> io::Result<()> {
+    // Bounds refer to the complete retained packet, preserving original
+    // transport evidence rather than journalling only a copied Opus slice.
     validate_payload_bounds(record)?;
 
     let packet_length = u32::try_from(record.packet.len())
@@ -98,6 +102,8 @@ pub(crate) fn write_record(writer: &mut impl Write, record: &PacketRecord) -> io
 pub(crate) fn read_record(reader: &mut impl Read) -> io::Result<ReadRecord> {
     let mut length_bytes = [0_u8; 4];
 
+    // EOF before a new length is clean; EOF after any part of a record is a
+    // recoverable crash tail.
     match read_up_to(reader, &mut length_bytes)? {
         0 => return Ok(ReadRecord::EndOfFile),
         4 => {}

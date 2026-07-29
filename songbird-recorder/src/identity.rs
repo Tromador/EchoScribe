@@ -1,3 +1,9 @@
+//! Stable Discord-user routing for decoded transport audio.
+//!
+//! Songbird supplies PCM by SSRC, but routine tracks are keyed by Discord user
+//! ID. This module owns the bounded wait for late mapping evidence and refuses
+//! to guess when that evidence never arrives.
+
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::diagnostics::DecodedFrame;
@@ -7,6 +13,7 @@ pub(crate) const MAX_PENDING_SAMPLES_PER_SSRC: usize = 96_000;
 pub(crate) const MAX_CONCURRENT_PENDING_SSRCS: usize = 32;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Discord naming evidence observed from the gateway.
 pub(crate) struct UserIdentity {
     pub(crate) discord_user_id: u64,
     pub(crate) server_display_name: Option<String>,
@@ -15,6 +22,7 @@ pub(crate) struct UserIdentity {
 }
 
 impl UserIdentity {
+    /// Apply the approved player-name fallback without campaign character data.
     pub(crate) fn display_name(&self) -> Option<&str> {
         self.server_display_name
             .as_deref()
@@ -29,6 +37,7 @@ impl UserIdentity {
 }
 
 #[derive(Debug, Eq, PartialEq)]
+/// PCM whose transport identity has resolved to a stable Discord user.
 pub(crate) struct ResolvedFrame {
     pub(crate) discord_user_id: u64,
     pub(crate) display_name: String,
@@ -39,6 +48,7 @@ pub(crate) struct ResolvedFrame {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Terminal reasons why unknown PCM could not remain pending.
 pub(crate) enum AbandonmentReason {
     AgeLimit,
     SampleLimit,
@@ -58,6 +68,7 @@ impl AbandonmentReason {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Durable evidence describing discarded PCM for an unresolved transport.
 pub(crate) struct UnresolvedSsrcAbandonment {
     pub(crate) ssrc: u32,
     pub(crate) first_tick: u64,
@@ -75,6 +86,7 @@ pub(crate) struct UserTrackAbandonment {
 }
 
 #[derive(Debug, Eq, PartialEq)]
+/// Router effects; capture retains ownership of I/O and downstream queueing.
 pub(crate) enum RoutingAction {
     Frame(ResolvedFrame),
     IdentityUpdated(UserIdentity),
@@ -84,6 +96,7 @@ pub(crate) enum RoutingAction {
 }
 
 struct PendingContinuity {
+    // Retained in arrival order and released in that order after mapping.
     first_tick: u64,
     last_tick: u64,
     last_elapsed_nanos: u64,
@@ -91,6 +104,7 @@ struct PendingContinuity {
     frames: VecDeque<DecodedFrame>,
 }
 
+/// Stateful SSRC-to-user router for one recording session.
 pub(crate) struct IdentityRouter {
     known_participants: HashSet<u64>,
     observed_users: HashSet<u64>,
@@ -125,6 +139,8 @@ impl IdentityRouter {
         ssrc: u32,
         discord_user_id: Option<u64>,
     ) -> Vec<RoutingAction> {
+        // `None` is not positive attribution evidence. Disconnect events revoke
+        // existing mappings explicitly.
         let Some(discord_user_id) = discord_user_id else {
             return Vec::new();
         };
@@ -133,6 +149,8 @@ impl IdentityRouter {
         self.mappings.insert(ssrc, discord_user_id);
 
         if let Some(abandonment) = self.abandoned_ssrcs.get(&ssrc).cloned() {
+            // A late mapping identifies which logical user track lost audio.
+            // Poison that user across replacement SSRCs.
             if self.abandoned_users.insert(discord_user_id) {
                 actions.push(RoutingAction::UserTrackAbandoned(UserTrackAbandonment {
                     discord_user_id,
@@ -160,11 +178,15 @@ impl IdentityRouter {
     }
 
     pub(crate) fn observe_disconnect(&mut self, discord_user_id: u64) {
+        // Keep naming evidence for reconnection, but require fresh transport
+        // mapping evidence before routing more PCM.
         self.mappings
             .retain(|_, mapped_user_id| *mapped_user_id != discord_user_id);
     }
 
     pub(crate) fn advance_tick(&mut self, tick: u64, elapsed_nanos: u64) -> Vec<RoutingAction> {
+        // Global expiry prevents a silent unresolved SSRC retaining its last
+        // frame indefinitely while other voice activity continues.
         let mut expired = self
             .pending
             .iter()
@@ -212,6 +234,8 @@ impl IdentityRouter {
         }
 
         if let Some(pending) = self.pending.get(&frame.ssrc) {
+            // Check before retention. Abandonment counters still include the
+            // triggering frame so they describe all discarded PCM.
             let age_exceeded = frame.tick.saturating_sub(pending.first_tick) >= MAX_PENDING_TICKS;
             let samples_exceeded = pending
                 .samples
@@ -239,6 +263,7 @@ impl IdentityRouter {
     }
 
     pub(crate) fn finish(&mut self) -> Vec<RoutingAction> {
+        // No pending continuity may disappear merely because capture stopped.
         let mut ssrcs = self.pending.keys().copied().collect::<Vec<_>>();
         ssrcs.sort_unstable();
         ssrcs

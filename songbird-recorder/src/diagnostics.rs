@@ -1,3 +1,9 @@
+//! Optional per-SSRC diagnostic WAV output.
+//!
+//! Diagnostic files preserve transport-level evidence and are deliberately
+//! separate from routine user-keyed FLAC tracks. A diagnostic failure disables
+//! this derived path without invalidating authoritative capture.
+
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
@@ -12,6 +18,7 @@ pub(crate) const CHANNELS: u16 = 1;
 pub(crate) const SAMPLES_PER_TICK: u64 = 960;
 
 #[derive(Debug, Eq, PartialEq)]
+/// One Songbird decoded frame positioned on the session voice-tick timeline.
 pub(crate) struct DecodedFrame {
     pub(crate) elapsed_nanos: u64,
     pub(crate) tick: u64,
@@ -19,11 +26,13 @@ pub(crate) struct DecodedFrame {
     pub(crate) samples: Vec<i16>,
 }
 
+/// Manages opt-in WAV writers keyed by transport SSRC.
 pub(crate) struct DiagnosticWriter {
     directory: PathBuf,
     tracks: HashMap<u32, Track>,
 }
 
+/// Final accounting for a diagnostic or recovered track.
 pub(crate) struct TrackSummary {
     pub(crate) ssrc: u32,
     pub(crate) path: PathBuf,
@@ -46,10 +55,12 @@ struct Track {
 }
 
 impl DiagnosticWriter {
+    /// Create normal live diagnostics beneath `diagnostics/`.
     pub(crate) fn new(session_directory: &Path) -> io::Result<Self> {
         Self::create_in(session_directory.join("diagnostics"))
     }
 
+    /// Create explicit recovery output beneath `recovered/`.
     pub(crate) fn new_recovery(session_directory: &Path) -> io::Result<Self> {
         Self::create_in(session_directory.join("recovered"))
     }
@@ -63,6 +74,7 @@ impl DiagnosticWriter {
         })
     }
 
+    /// Lazily create the SSRC writer on its first decoded frame.
     pub(crate) fn write_frame(&mut self, frame: &DecodedFrame) -> io::Result<()> {
         if !self.tracks.contains_key(&frame.ssrc) {
             let track = Track::create(&self.directory, frame.ssrc, frame.tick)?;
@@ -103,6 +115,8 @@ impl DiagnosticWriter {
     }
 }
 
+/// No-op wrapper when diagnostics are disabled, and an isolation boundary when
+/// an enabled diagnostic writer fails.
 pub(crate) struct OptionalDiagnosticWriter(Option<DiagnosticWriter>);
 
 impl OptionalDiagnosticWriter {
@@ -120,6 +134,7 @@ impl OptionalDiagnosticWriter {
             .as_mut()
             .map_or(Ok(()), |writer| writer.write_frame(frame));
         if result.is_err() {
+            // Do not repeatedly exercise a failed diagnostic writer.
             self.0 = None;
         }
         result
@@ -185,6 +200,8 @@ impl Track {
             ));
         }
 
+        // Missing ticks become silence rather than shortening this SSRC's
+        // diagnostic relative to the shared session timeline.
         let missing_ticks = frame.tick - self.next_tick;
         let silence_samples = missing_ticks
             .checked_mul(SAMPLES_PER_TICK)

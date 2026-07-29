@@ -1,3 +1,9 @@
+//! Authoritative capture boundary and consumer.
+//!
+//! Songbird callbacks enqueue bounded records without waiting. One consumer
+//! owns journal ordering, identity routing, durability checkpoints, and
+//! non-blocking fan-out into lower-priority live FLAC and diagnostic stages.
+
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
@@ -32,6 +38,10 @@ const WRITER_BUFFER_CAPACITY: usize = 256 * 1024;
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 const DURABILITY_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Decrypted RTP evidence copied out of a Songbird callback.
+///
+/// Payload bounds locate the Opus frame within `packet`; the complete packet is
+/// retained because it is part of the recoverable recording authority.
 pub(crate) struct CapturedPacket {
     pub(crate) ssrc: u32,
     pub(crate) sequence: u16,
@@ -42,12 +52,17 @@ pub(crate) struct CapturedPacket {
 }
 
 #[derive(Clone)]
+/// Non-blocking callback-side handle for the authoritative capture queue.
 pub(crate) struct CaptureSender {
     sender: mpsc::Sender<CaptureRecord>,
     metrics: Arc<ProducerMetrics>,
     session_start: Instant,
 }
 
+/// Owns capture shutdown and the consumer task for one recording session.
+///
+/// Dropping a sender is not the normal stop protocol: `stop` closes the queue,
+/// drains accepted records, and finalises the downstream stages deterministically.
 pub(crate) struct CaptureDrain {
     stop: oneshot::Sender<()>,
     task: JoinHandle<io::Result<ConsumerSummary>>,
@@ -56,6 +71,8 @@ pub(crate) struct CaptureDrain {
 }
 
 #[derive(Default)]
+/// Callback-side counters are atomic because several Songbird event handlers
+/// may submit records concurrently.
 struct ProducerMetrics {
     accepted: AtomicU64,
     full_drops: AtomicU64,
@@ -67,6 +84,7 @@ struct ProducerMetrics {
 }
 
 #[derive(Default)]
+/// Consumer-owned accounting used for the shutdown integrity report.
 struct ConsumerSummary {
     records: u64,
     packet_records: u64,
@@ -93,6 +111,8 @@ struct ConsumerSummary {
 }
 
 enum CaptureRecord {
+    // Authoritative and derived inputs deliberately share this ingress queue at
+    // the Songbird boundary. Derived FLAC work is separated after consumption.
     Packet(PacketRecord),
     Event(SessionEvent),
     Playout(PlayoutRecord),
@@ -139,6 +159,9 @@ fn start_in_session_directory(
     participants: &ParticipantContext,
     diagnostic_wav: bool,
 ) -> io::Result<(CaptureSender, CaptureDrain)> {
+    // Session publication is the startup commit point. Everything which can
+    // fail synchronously is initialised first; the armed guard removes the
+    // directory if publication never succeeds.
     let session_id = session_directory
         .path()
         .file_name()
@@ -253,6 +276,7 @@ impl Drop for SessionDirectoryGuard {
 }
 
 impl CaptureSender {
+    /// Submit decrypted packet evidence without waiting for queue capacity.
     pub(crate) fn try_send(&self, packet: CapturedPacket) {
         let arrival_nanos_since_session_start =
             u64::try_from(self.session_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -267,6 +291,7 @@ impl CaptureSender {
         }));
     }
 
+    /// Record Songbird's transport-to-user mapping evidence.
     pub(crate) fn try_send_speaker_mapping(
         &self,
         ssrc: u32,
@@ -283,6 +308,7 @@ impl CaptureSender {
         )));
     }
 
+    /// Record gateway identity evidence independently of SSRC mapping timing.
     pub(crate) fn try_send_user_identity(
         &self,
         discord_user_id: u64,
@@ -301,6 +327,7 @@ impl CaptureSender {
         )));
     }
 
+    /// Revoke every live SSRC mapping for a user who left the voice channel.
     pub(crate) fn try_send_user_disconnected(&self, discord_user_id: u64) {
         let elapsed_nanos =
             u64::try_from(self.session_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -310,6 +337,7 @@ impl CaptureSender {
         )));
     }
 
+    /// Advance pending-mapping expiry even when an unresolved SSRC is silent.
     pub(crate) fn try_advance_routing_tick(&self, tick: u64) {
         let elapsed_nanos =
             u64::try_from(self.session_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -319,6 +347,7 @@ impl CaptureSender {
         });
     }
 
+    /// Submit decoded mono PCM still keyed by its transport SSRC.
     pub(crate) fn try_send_audio(&self, tick: u64, ssrc: u32, samples: Vec<i16>) {
         let elapsed_nanos =
             u64::try_from(self.session_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -354,6 +383,8 @@ impl CaptureSender {
     }
 
     fn try_send_record(&self, record: CaptureRecord) {
+        // Classify before moving the record so pressure telemetry can distinguish
+        // authoritative event/playout loss from derived decoded-audio loss.
         let is_event = matches!(&record, CaptureRecord::Event(_));
         let is_playout = matches!(&record, CaptureRecord::Playout(_));
         let is_audio = matches!(&record, CaptureRecord::Audio(_));
@@ -402,6 +433,8 @@ impl CaptureDrain {
         &self.session_directory
     }
 
+    /// Stop capture and report failures rather than disguising them as a clean
+    /// shutdown. Slice 5 will promote this result into workflow finalisation.
     pub(crate) async fn stop(self) {
         let Self {
             stop,
@@ -537,6 +570,8 @@ async fn consume(
     session_store: session::SessionStore,
     started_at_unix_millis: u64,
 ) -> io::Result<ConsumerSummary> {
+    // The session-state writer has its own task because an atomic JSON
+    // replacement must not delay journal consumption after a FLAC fault.
     let mut summary = ConsumerSummary::default();
     let (failure_sender, failure_receiver) = mpsc::unbounded_channel();
     let failure_task = tokio::spawn(record_session_failures(
@@ -557,6 +592,8 @@ async fn consume(
 
     loop {
         tokio::select! {
+            // Shutdown wins once requested, then closes and drains the accepted
+            // record set before derived stages are stopped.
             biased;
 
             _ = &mut stop => {
@@ -665,6 +702,8 @@ fn write_and_observe(
     summary: &mut ConsumerSummary,
     record: CaptureRecord,
 ) -> io::Result<()> {
+    // This function is the ordering point: each record reaches its durable
+    // journal before any resulting identity or derived-audio action is applied.
     summary.records += 1;
 
     match record {
@@ -778,6 +817,8 @@ fn apply_routing_actions(
     summary: &mut ConsumerSummary,
     actions: Vec<RoutingAction>,
 ) -> io::Result<()> {
+    // Encoder feedback is observed before routing more PCM, preventing a failed
+    // user writer from being recreated or fed indefinitely.
     for failure in live_flac.take_encoder_failures() {
         summary.abandoned_users.insert(failure.discord_user_id);
         summary
@@ -867,6 +908,8 @@ fn record_queue_abandonment(
     summary: &mut ConsumerSummary,
     abandonment: &TrackAbandonment,
 ) {
+    // Mark locally before queueing durable metadata so no later frame can race
+    // into a replacement writer for the same logical user.
     summary.abandoned_users.insert(abandonment.discord_user_id);
     let message = format!(
         "live FLAC track for Discord user {} abandoned at tick {}: reason {}, \
@@ -916,6 +959,8 @@ async fn record_session_failures(
     mut session_store: session::SessionStore,
     started_at_unix_millis: u64,
 ) -> io::Result<()> {
+    // Durable metadata writes are kept off the authoritative consumer's hot
+    // path. Input is semantically bounded to one terminal failure per track.
     while let Some(failure) = receiver.recv().await {
         let elapsed_millis = failure.elapsed_nanos / 1_000_000;
         let recorded_at = started_at_unix_millis.saturating_add(elapsed_millis);
@@ -935,6 +980,8 @@ fn checkpoint(
     playout_writer: &mut BufWriter<File>,
     diagnostic_writer: &mut OptionalDiagnosticWriter,
 ) -> io::Result<()> {
+    // Checkpoints flush language/runtime buffers; the less frequent sync pass
+    // separately asks storage to make those bytes durable.
     packet_writer.flush()?;
     event_writer.flush()?;
     playout_writer.flush()?;
@@ -1012,6 +1059,8 @@ impl ConsumerSummary {
 }
 
 fn create_session_directory(output_directory: &Path) -> io::Result<(PathBuf, u64)> {
+    // Millisecond IDs are readable but not assumed unique. Bounded suffixing
+    // handles simultaneous/repeated allocation without overwriting a session.
     fs::create_dir_all(output_directory)?;
 
     let unix_millis = u64::try_from(

@@ -1,3 +1,9 @@
+//! Songbird event adapter and lightweight voice telemetry.
+//!
+//! Callbacks extract bounded records and use non-blocking capture sends. These
+//! continuity counters are operational diagnostics; authoritative packet and
+//! playout evidence is written by the capture consumer.
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
@@ -20,6 +26,7 @@ use crate::{
 
 const RECENT_SEQUENCES: usize = 4096;
 
+/// Shared callback telemetry and the capture handle receiving extracted records.
 pub(crate) struct VoiceTelemetry {
     capture: CaptureSender,
     handlers_registered: AtomicBool,
@@ -49,6 +56,7 @@ impl VoiceTelemetry {
         }
     }
 
+    /// Register one handler for every Songbird event EchoScribe consumes.
     pub(crate) fn register(self: &Arc<Self>, call: &mut Call) {
         if self.handlers_registered.swap(true, Ordering::AcqRel) {
             return;
@@ -68,6 +76,7 @@ impl VoiceTelemetry {
         }
     }
 
+    /// Emit an operator-facing reconciliation of callback observations.
     pub(crate) fn report(&self) {
         println!(
             "Voice telemetry: {} speaking updates, {} identity updates, {} RTP packets, \
@@ -138,6 +147,7 @@ impl VoiceTelemetry {
     }
 }
 
+/// Bounded recent-sequence tracker for one RTP transport stream.
 struct StreamContinuity {
     packets: u64,
     first_sequence: u16,
@@ -178,6 +188,8 @@ impl StreamContinuity {
             return;
         }
 
+        // RTP sequence arithmetic wraps at u16::MAX. Distances in the lower
+        // half-space are forward; larger values indicate late/old packets.
         let distance = sequence.wrapping_sub(self.latest_sequence);
 
         if distance == 0 {
@@ -205,6 +217,7 @@ impl StreamContinuity {
 }
 
 struct TelemetryHandler {
+    // All registrations share counters and one capture sender through this Arc.
     telemetry: Arc<VoiceTelemetry>,
 }
 
@@ -253,6 +266,8 @@ impl EventHandler for TelemetryHandler {
                 self.telemetry.observe_rtp(ssrc, sequence);
             }
             EventContext::VoiceTick(tick) => {
+                // VoiceTick is the global alignment clock and advances pending
+                // identity expiry even when a particular SSRC is silent.
                 let tick_index = self.telemetry.voice_ticks.fetch_add(1, Ordering::Relaxed);
 
                 let mut playout_packets = 0;

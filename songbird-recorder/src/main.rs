@@ -1,3 +1,9 @@
+//! EchoScribe command-line entry point and Discord lifecycle orchestration.
+//!
+//! Serenity owns gateway identity events, Songbird owns voice reception, and
+//! both feed the capture boundary. Recovery and inspection avoid the live
+//! Discord path entirely.
+
 mod artifacts;
 mod capture;
 mod config;
@@ -37,6 +43,7 @@ use songbird::{
 };
 use telemetry::VoiceTelemetry;
 
+/// Serenity gateway handler for identity and voice-channel membership evidence.
 struct Handler {
     voice_manager: Arc<Songbird>,
     telemetry: Arc<VoiceTelemetry>,
@@ -46,6 +53,7 @@ struct Handler {
 }
 
 #[derive(Debug)]
+/// Parsed top-level operation. Only `Record` constructs a Discord client.
 enum Command {
     Record { config_path: PathBuf },
     Inspect { session_directory: PathBuf },
@@ -61,6 +69,8 @@ impl EventHandler for Handler {
             ready.user.name, ready.user.id
         );
 
+        // Register receive telemetry before joining so initial voice evidence is
+        // not lost during connection establishment.
         let call = self.voice_manager.get_or_insert(self.guild_id);
         {
             let mut call = call.lock().await;
@@ -106,6 +116,8 @@ impl EventHandler for Handler {
         }
 
         if new.channel_id != Some(self.channel_id) {
+            // Serenity does not reliably provide `old` voice state, so the
+            // locally observed membership set supplies departure evidence.
             let was_present = self
                 .voice_users
                 .lock()
@@ -131,6 +143,8 @@ impl EventHandler for Handler {
         if guild.id != self.guild_id {
             return;
         }
+        // Seed identities for users already seated before the bot connected;
+        // gateway state is sufficient and avoids an HTTP member lookup.
         let mut current_users = HashSet::new();
         for voice_state in guild
             .voice_states
@@ -183,6 +197,8 @@ async fn build_client(
     config: &Config,
     telemetry: Arc<VoiceTelemetry>,
 ) -> Result<(Client, Arc<Songbird>), serenity::Error> {
+    // Voice-state intent supplies the required member identity evidence without
+    // privileged message or content intents.
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
     let voice_config = SongbirdConfig::default().decode_mode(DecodeMode::Decode(
         DecodeConfig::new(Channels::Mono, SampleRate::Hz48000),
@@ -249,6 +265,8 @@ async fn main() -> anyhow::Result<()> {
     let shard_manager = client.shard_manager.clone();
     let guild_id = config.guild_id;
 
+    // This task owns the drain, enforcing leave -> capture drain -> gateway
+    // shutdown ordering and preventing a second stop attempt.
     tokio::spawn(async move {
         match tokio::signal::ctrl_c().await {
             Ok(()) => {

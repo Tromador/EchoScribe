@@ -1,3 +1,8 @@
+//! Human-edited configuration loading and validation.
+//!
+//! Paths in the main TOML are resolved relative to that file, so invoking the
+//! recorder from another working directory does not change their meaning.
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -11,6 +16,8 @@ use crate::participants::ParticipantContext;
 
 const SUPPORTED_CONFIG_VERSION: u32 = 1;
 
+// These private `File*` types describe the on-disk schema. The public crate
+// types below contain validated and resolved values used by the application.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
@@ -64,12 +71,14 @@ struct FileSegmentationConfig {
 }
 
 #[allow(dead_code)]
+/// Validated settings used by the live recording path.
 pub(crate) struct RecordingConfig {
     pub(crate) output_directory: PathBuf,
     pub(crate) diagnostic_wav: bool,
 }
 
 #[allow(dead_code)]
+/// Validated transcription settings retained for later implementation slices.
 pub(crate) struct TranscriptionConfig {
     pub(crate) model: String,
     pub(crate) language: String,
@@ -81,12 +90,15 @@ pub(crate) struct TranscriptionConfig {
 }
 
 #[allow(dead_code)]
+/// Segmentation settings are loaded now so the one configuration schema remains
+/// stable as post-recording range generation is introduced.
 pub(crate) struct SegmentationConfig {
     pub(crate) vad_enabled: bool,
     pub(crate) merge_gap_ms: u64,
 }
 
 #[allow(dead_code)]
+/// Fully validated runtime configuration with all local paths resolved.
 pub(crate) struct Config {
     pub(crate) configuration_version: u32,
     token: String,
@@ -99,6 +111,7 @@ pub(crate) struct Config {
 }
 
 impl Config {
+    /// Load and validate a main TOML configuration plus its participant file.
     pub(crate) fn load(path: &Path) -> Result<Self> {
         let text = fs::read_to_string(path)
             .with_context(|| format!("failed to read configuration file {}", path.display()))?;
@@ -107,6 +120,8 @@ impl Config {
     }
 
     fn from_toml(text: &str, path: &Path) -> Result<Self> {
+        // Rejecting unknown fields catches misspellings rather than silently
+        // running with a default the operator did not intend.
         let file: FileConfig = toml::from_str(text)
             .with_context(|| format!("failed to parse configuration file {}", path.display()))?;
 

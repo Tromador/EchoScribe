@@ -1,3 +1,8 @@
+//! Read-only inspection of session manifests and authoritative journals.
+//!
+//! Inspection consumes the paths and format versions declared by `session.json`
+//! and reports clean or recoverably truncated tails without modifying a session.
+
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     fs::{self, File},
@@ -22,6 +27,7 @@ use crate::{
 const RECENT_SEQUENCES: usize = 4096;
 
 #[derive(Deserialize)]
+/// Minimal manifest projection shared by current and supported legacy sessions.
 struct SessionManifest {
     format: u16,
     session_id: String,
@@ -50,6 +56,7 @@ struct FileDescription {
 }
 
 #[derive(Default)]
+/// Aggregate packet-journal health plus per-transport continuity.
 struct PacketInspection {
     records: u64,
     truncated_tail: bool,
@@ -70,6 +77,7 @@ struct PacketStream {
 }
 
 #[derive(Default)]
+/// Aggregate playout evidence, including links back to packet decisions.
 struct PlayoutInspection {
     records: u64,
     packet_decisions: u64,
@@ -91,6 +99,7 @@ struct PlayoutStream {
 }
 
 #[derive(Default)]
+/// Identity/event counts and the mapping timeline useful to an operator.
 struct EventInspection {
     records: u64,
     truncated_tail: bool,
@@ -108,6 +117,8 @@ struct SpeakerMapping {
 }
 
 pub(crate) fn run(session_directory: &Path) -> Result<()> {
+    // Validate the manifest before joining recorded paths to the session
+    // directory. Absolute and escaping artefact paths are never accepted.
     let manifest = read_manifest(session_directory)?;
     validate_manifest(&manifest)?;
 
@@ -350,6 +361,8 @@ fn validate_file_description(
     expected_path: &str,
     expected_format: u16,
 ) -> Result<()> {
+    // Current filenames are fixed contracts even though readers obtain them
+    // through the manifest rather than repeating literals at open sites.
     if description.path != expected_path {
         bail!(
             "session manifest {name} path is {:?}; expected {:?}",
@@ -376,6 +389,8 @@ fn inspect_packets(path: &Path) -> Result<PacketInspection> {
         .with_context(|| format!("invalid packet journal header in {}", path.display()))?;
 
     let mut inspection = PacketInspection::default();
+    // A truncated final record is a reportable crash tail; corruption in the
+    // complete prefix remains a hard error.
     loop {
         match journal::read_record(&mut reader)
             .with_context(|| format!("invalid packet journal record in {}", path.display()))?
@@ -586,6 +601,8 @@ impl PacketStream {
             return;
         }
 
+        // Half-range RTP arithmetic distinguishes forward wraparound from
+        // late/out-of-order arrival.
         let distance = sequence.wrapping_sub(self.latest_sequence);
         if distance == 0 {
             self.duplicates += 1;

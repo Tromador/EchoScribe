@@ -1,3 +1,8 @@
+//! Participant-context TOML parsing and canonical session snapshots.
+//!
+//! Discord identity remains gateway evidence. This file adds optional campaign
+//! context and materialises defaults into an immutable session-local snapshot.
+
 use std::{
     collections::HashMap,
     fs,
@@ -29,6 +34,7 @@ struct FileParticipant {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
+/// Session role used by later transcript processing, not speaker identity.
 pub(crate) enum ParticipantRole {
     #[default]
     Player,
@@ -41,6 +47,8 @@ impl<'de> Deserialize<'de> for ParticipantRole {
         D: Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
+        // Accept natural human casing, while `Serialize` emits the canonical
+        // lowercase spelling used by session snapshots.
         if value.eq_ignore_ascii_case("player") {
             Ok(Self::Player)
         } else if value.eq_ignore_ascii_case("gm") {
@@ -61,6 +69,7 @@ impl ParticipantRole {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Validated campaign context keyed by a numeric Discord user ID.
 pub(crate) struct Participant {
     pub(crate) discord_user_id: u64,
     pub(crate) character: Option<String>,
@@ -68,12 +77,14 @@ pub(crate) struct Participant {
 }
 
 #[allow(dead_code)]
+/// Source participant mapping plus canonical snapshot serialisation.
 pub(crate) struct ParticipantContext {
     pub(crate) source_path: PathBuf,
     participants: HashMap<u64, Participant>,
 }
 
 impl ParticipantContext {
+    /// Read and validate the operator-maintained participant TOML.
     pub(crate) fn load(path: &Path) -> Result<Self> {
         let text = fs::read_to_string(path).with_context(|| {
             format!("failed to read participant context file {}", path.display())
@@ -136,6 +147,8 @@ impl ParticipantContext {
     }
 
     pub(crate) fn canonical_toml(&self) -> Result<String> {
+        // Numeric ordering makes snapshots deterministic even though runtime
+        // lookup uses a HashMap.
         let mut participants = self.participants.values().collect::<Vec<_>>();
         participants.sort_unstable_by_key(|participant| participant.discord_user_id);
 

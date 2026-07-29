@@ -16,6 +16,7 @@ const DECISION_LOSS: u8 = 0;
 const DECISION_PACKET: u8 = 1;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+/// Songbird's decision for one SSRC at one global voice tick.
 pub(crate) struct PlayoutRecord {
     pub(crate) tick: u64,
     pub(crate) ssrc: u32,
@@ -24,6 +25,7 @@ pub(crate) struct PlayoutRecord {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+/// Either decoded packet selection or explicit packet-loss concealment.
 pub(crate) enum PlayoutDecision {
     Loss,
     Packet {
@@ -34,6 +36,7 @@ pub(crate) enum PlayoutDecision {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// Location of the Opus payload inside its authoritative packet record.
 pub(crate) struct OpusPayloadBounds {
     pub(crate) start: u32,
     pub(crate) end: u32,
@@ -107,6 +110,8 @@ pub(crate) fn read_file_header(reader: &mut impl Read) -> io::Result<u16> {
         return Err(invalid_data("playout journal has an invalid magic value"));
     }
 
+    // Format 2 adds decoded-sample count and Opus bounds. Format 1 remains
+    // readable for sessions captured before that evidence existed.
     let version = u16::from_le_bytes([header[8], header[9]]);
     if !matches!(version, LEGACY_FORMAT_VERSION | FORMAT_VERSION) {
         return Err(invalid_data(format!(
@@ -127,6 +132,8 @@ pub(crate) fn read_file_header(reader: &mut impl Read) -> io::Result<u16> {
 pub(crate) fn read_record(reader: &mut impl Read, format_version: u16) -> io::Result<ReadRecord> {
     let mut length_bytes = [0_u8; 4];
 
+    // Incomplete final data is a recoverable crash tail; malformed complete
+    // records remain hard errors.
     match read_up_to(reader, &mut length_bytes)? {
         0 => return Ok(ReadRecord::EndOfFile),
         4 => {}

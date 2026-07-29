@@ -1,3 +1,9 @@
+//! Offline SSRC-keyed FLAC export used by recovery and diagnostic tooling.
+//!
+//! This is intentionally distinct from `live_flac`: offline export retains its
+//! full-decode verification and existing filenames, while routine live tracks
+//! are user-keyed `.flac.part` files.
+
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
@@ -17,6 +23,8 @@ const SILENCE_BLOCK_SAMPLES: usize = 4096;
 const SILENCE_BLOCK: [i32; SILENCE_BLOCK_SAMPLES] = [0; SILENCE_BLOCK_SAMPLES];
 
 pub(crate) struct FlacTrackWriter {
+    // Recovery remains SSRC-keyed because journal replay reconstructs transport
+    // streams first; user attribution is added to its manifest afterwards.
     directory: PathBuf,
     tracks: HashMap<u32, Track>,
 }
@@ -34,6 +42,7 @@ struct Track {
 }
 
 impl FlacTrackWriter {
+    /// Create the legacy/offline export directory for a session.
     pub(crate) fn new(session_directory: &Path) -> io::Result<Self> {
         let directory = session_directory.join("tracks");
         fs::create_dir(&directory)?;
@@ -44,6 +53,7 @@ impl FlacTrackWriter {
         })
     }
 
+    /// Align and encode one replayed transport frame.
     pub(crate) fn write_frame(&mut self, frame: DecodedFrame) -> io::Result<()> {
         if !self.tracks.contains_key(&frame.ssrc) {
             let track = Track::create(&self.directory, frame.ssrc, frame.tick)?;
@@ -56,6 +66,7 @@ impl FlacTrackWriter {
             .write_frame(frame)
     }
 
+    /// Finish, synchronise, and fully decode-verify every offline track.
     pub(crate) fn finalize(self) -> io::Result<Vec<TrackSummary>> {
         let mut summaries = Vec::with_capacity(self.tracks.len());
 
@@ -107,6 +118,7 @@ impl Track {
             ));
         }
 
+        // Start at tick zero so every exported track shares the session origin.
         let missing_ticks = frame.tick - self.next_tick;
         let silence_samples = missing_ticks
             .checked_mul(SAMPLES_PER_TICK)
@@ -133,6 +145,8 @@ impl Track {
     }
 
     fn write_silence(&mut self, mut samples: u64) -> io::Result<()> {
+        // Fixed zero blocks avoid allocating a potentially session-sized buffer
+        // when the first recovered frame occurs well after tick zero.
         while samples > 0 {
             let block_length = usize::try_from(samples.min(SILENCE_BLOCK_SAMPLES as u64))
                 .expect("silence block length always fits usize");
@@ -149,6 +163,8 @@ impl Track {
         let path = self.path.clone();
         self.writer.finalize().map_err(flac_error)?;
         OpenOptions::new().write(true).open(&path)?.sync_data()?;
+        // Full-file verification is intentional for explicit offline recovery;
+        // routine live shutdown does not pay this complete decoding cost.
         match verify(&path).map_err(flac_error)? {
             Verified::MD5Match => {}
             Verified::MD5Mismatch => {

@@ -1,3 +1,9 @@
+//! Explicit offline reconstruction from authoritative session journals.
+//!
+//! Recovery correlates playout decisions with indexed packet records, decodes
+//! selected Opus payloads, and writes diagnostic WAV or verified FLAC. It is
+//! never invoked automatically by the normal recording path.
+
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
@@ -33,22 +39,26 @@ const MAX_DECODE_CAPACITY: usize = 11_520;
 const FORMAT_ONE_TRANSPORT_SUFFIX_LENGTH: usize = 20;
 
 #[derive(Clone, Copy)]
+/// Selects explicit diagnostic WAV recovery or aligned FLAC export.
 enum OutputKind {
     Recovery,
     Tracks,
 }
 
+/// Common façade keeps journal replay independent of the derived output format.
 enum AudioWriter {
     Recovery(DiagnosticWriter),
     Tracks(FlacTrackWriter),
 }
 
+/// Journal offsets keyed by the tuple referenced from playout evidence.
 struct PacketIndex {
     offsets: HashMap<PacketKey, u64>,
     records: u64,
     truncated_tail: bool,
 }
 
+/// Per-SSRC Opus decoder retained across the complete replay.
 struct RecoveryDecoder {
     decoder: Decoder,
     decode_capacity: usize,
@@ -101,6 +111,8 @@ fn decode_session(session_directory: &Path, output_kind: OutputKind) -> Result<(
     let mut decoders = HashMap::<u32, RecoveryDecoder>::new();
     let mut summary = RecoverySummary::default();
 
+    // Playout order, not packet arrival order, defines recovered PCM timing and
+    // loss positions.
     loop {
         let record =
             match playout::read_record(&mut playout_reader, playout_format).with_context(|| {
@@ -128,6 +140,8 @@ fn decode_session(session_directory: &Path, output_kind: OutputKind) -> Result<(
             .or_insert(RecoveryDecoder::new()?);
         let samples = match record.decision {
             PlayoutDecision::Loss => {
+                // Decode loss through the same stateful Opus decoder so packet
+                // loss concealment matches the original live playout.
                 summary.loss_decisions += 1;
                 decoder.decode_loss(record.decoded_samples)?
             }
@@ -136,6 +150,8 @@ fn decode_session(session_directory: &Path, output_kind: OutputKind) -> Result<(
                 timestamp,
                 opus_payload: opus_bounds,
             } => {
+                // The selected tuple and payload bounds must agree with packet
+                // evidence before any audio is regenerated.
                 summary.packet_decisions += 1;
                 let key = (record.ssrc, sequence, timestamp);
                 let offset = packet_index.offsets.get(&key).ok_or_else(|| {
@@ -347,6 +363,8 @@ fn write_track_manifest(session_directory: &Path, tracks: &[TrackSummary]) -> Re
 }
 
 fn read_speaker_mappings(path: &Path) -> Result<(HashMap<u32, String>, bool)> {
+    // Later mappings replace earlier ones for manifest attribution; the event
+    // journal itself retains the complete timestamped history.
     let bytes = fs::read(path)
         .with_context(|| format!("failed to read event journal {}", path.display()))?;
     let mut mappings = HashMap::new();
@@ -403,6 +421,8 @@ fn read_speaker_mappings(path: &Path) -> Result<(HashMap<u32, String>, bool)> {
 }
 
 fn build_packet_index(path: &Path) -> Result<PacketIndex> {
+    // Store offsets rather than packet bodies so long sessions do not require a
+    // second in-memory copy of the authoritative packet journal.
     let file = File::open(path)
         .with_context(|| format!("failed to open packet journal {}", path.display()))?;
     let mut reader = BufReader::new(file);
@@ -514,6 +534,8 @@ impl RecoveryDecoder {
     }
 
     fn decode_packet(&mut self, payload: &[u8], expected_samples: u32) -> Result<Vec<i16>> {
+        // Opus frames can exceed the common 20 ms size. Grow conservatively up
+        // to the codec maximum instead of assuming 960 decoded samples.
         loop {
             let mut samples = vec![0_i16; self.decode_capacity];
             match self.decoder.decode(payload, &mut samples, false) {
