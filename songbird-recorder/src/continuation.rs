@@ -76,9 +76,21 @@ pub(crate) fn run(session_directory: &Path) -> Result<()> {
         );
     }
 
+    let mut replay_users = HashSet::new();
+    let mut unattributed_ssrcs = HashSet::new();
     let replay =
-        recover::replay_session_files(session_directory, &session.record().files, |_| Ok(()))
-            .context("authoritative packet/playout journal validation failed")?;
+        recover::replay_session_files(session_directory, &session.record().files, |frame| {
+            match timeline.user_at(frame.ssrc, frame.elapsed_nanos) {
+                Some(user_id) => {
+                    replay_users.insert(user_id);
+                }
+                None => {
+                    unattributed_ssrcs.insert(frame.ssrc);
+                }
+            }
+            Ok(())
+        })
+        .context("authoritative packet/playout journal validation failed")?;
     if replay.truncated_packet_tail || replay.truncated_playout_tail {
         bail!("cannot continue with a truncated authoritative journal tail");
     }
@@ -86,6 +98,47 @@ pub(crate) fn run(session_directory: &Path) -> Result<()> {
         bail!(
             "cannot continue: {} playout decisions lack decoded-sample evidence",
             replay.skipped_undecoded
+        );
+    }
+    if !unattributed_ssrcs.is_empty() {
+        let mut ssrcs = unattributed_ssrcs.into_iter().collect::<Vec<_>>();
+        ssrcs.sort_unstable();
+        bail!(
+            "cannot continue: decoded PCM cannot be attributed safely for SSRCs {}",
+            ssrcs
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    // The derived manifest is not evidence that it lists every speaker.
+    // Authoritative replay supplies the required user set.
+    let complete_manifest_users = manifest
+        .tracks
+        .iter()
+        .filter(|track| track.state == crate::track_manifest::TrackState::Complete)
+        .map(|track| {
+            track
+                .discord_user_id
+                .parse::<u64>()
+                .expect("validated manifest contains numeric Discord IDs")
+        })
+        .collect::<HashSet<_>>();
+    let mut missing_users = replay_users
+        .difference(&complete_manifest_users)
+        .copied()
+        .collect::<Vec<_>>();
+    missing_users.sort_unstable();
+    if !missing_users.is_empty() {
+        bail!(
+            "cannot continue: attributable PCM has no complete routine track for Discord users {}",
+            missing_users
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
 
@@ -283,7 +336,11 @@ mod tests {
 
         let error = run(&directory).unwrap_err();
 
-        assert!(error.to_string().contains("incomplete recording"));
+        assert!(
+            error
+                .to_string()
+                .contains("no complete routine track for Discord users 11")
+        );
         assert_eq!(
             SessionStore::load(&directory).unwrap().record().state,
             WorkflowState::AwaitingOperator
@@ -378,6 +435,85 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[test]
+    fn continuation_requires_manifest_coverage_for_every_replayed_user() {
+        let directory = fixture("manifest-user-coverage");
+        routine_recovery::run(&directory, &[]).unwrap();
+
+        let mut playout_bytes = Vec::new();
+        playout::write_file_header(&mut playout_bytes).unwrap();
+        let mut event_bytes = Vec::new();
+        for (index, (user_id, ssrc)) in [(11, 100), (22, 200)].into_iter().enumerate() {
+            playout::write_record(
+                &mut playout_bytes,
+                &PlayoutRecord {
+                    tick: 10 + index as u64,
+                    ssrc,
+                    decision: PlayoutDecision::Loss,
+                    decoded_samples: SAMPLES_PER_TICK as u32,
+                },
+            )
+            .unwrap();
+            write_event(
+                &mut event_bytes,
+                &SessionEvent::speaker_mapping(
+                    1_000_000 + index as u64,
+                    ssrc,
+                    Some(user_id.to_string()),
+                    1,
+                ),
+            )
+            .unwrap();
+        }
+        fs::write(directory.join(PLAYOUT_JOURNAL_FILE_NAME), playout_bytes).unwrap();
+        fs::write(directory.join(EVENT_JOURNAL_FILE_NAME), event_bytes).unwrap();
+
+        let error = run(&directory).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("no complete routine track for Discord users 22")
+        );
+        assert_eq!(
+            SessionStore::load(&directory).unwrap().record().state,
+            WorkflowState::AwaitingOperator
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn continuation_refuses_unattributed_replayed_pcm() {
+        let directory = fixture("unattributed-pcm");
+        routine_recovery::run(&directory, &[]).unwrap();
+        let mut playout_bytes = Vec::new();
+        playout::write_file_header(&mut playout_bytes).unwrap();
+        playout::write_record(
+            &mut playout_bytes,
+            &PlayoutRecord {
+                tick: 10,
+                ssrc: 999,
+                decision: PlayoutDecision::Loss,
+                decoded_samples: SAMPLES_PER_TICK as u32,
+            },
+        )
+        .unwrap();
+        fs::write(directory.join(PLAYOUT_JOURNAL_FILE_NAME), playout_bytes).unwrap();
+
+        let error = run(&directory).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("attributed safely for SSRCs 999")
+        );
+        assert_eq!(
+            SessionStore::load(&directory).unwrap().record().state,
+            WorkflowState::AwaitingOperator
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     fn fixture(label: &str) -> std::path::PathBuf {
         let directory = env::temp_dir().join(format!(
             "echoscribe-continuation-{label}-{}-{}",
@@ -422,7 +558,7 @@ mod tests {
                 tick: 10,
                 ssrc: 100,
                 decision: PlayoutDecision::Loss,
-                decoded_samples: 1_920,
+                decoded_samples: SAMPLES_PER_TICK as u32,
             },
         )
         .unwrap();

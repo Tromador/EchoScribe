@@ -36,6 +36,7 @@ type PacketKey = (u32, u16, u32);
 const SAMPLE_RATE: u32 = 48_000;
 const INITIAL_DECODE_CAPACITY: usize = 1_920;
 const MAX_DECODE_CAPACITY: usize = 11_520;
+const MAX_PLC_SAMPLES: usize = 5_760;
 const FORMAT_ONE_TRANSPORT_SUFFIX_LENGTH: usize = 20;
 
 #[derive(Clone, Copy)]
@@ -634,12 +635,20 @@ impl RecoveryDecoder {
     }
 
     fn decode_loss(&mut self, expected_samples: u32) -> Result<Vec<i16>> {
-        let mut samples = vec![0_i16; self.decode_capacity];
+        let expected_samples = usize::try_from(expected_samples)
+            .map_err(|_| anyhow!("playout loss sample count does not fit usize"))?;
+        if expected_samples == 0 || expected_samples > MAX_PLC_SAMPLES {
+            bail!(
+                "playout loss sample count {expected_samples} is outside the supported range 1..={MAX_PLC_SAMPLES}"
+            );
+        }
+
+        // For PLC, Opus interprets the output slice length as the duration to
+        // conceal. Packet decode capacity is deliberately irrelevant here.
+        let mut samples = vec![0_i16; expected_samples];
         let decoded = self.decoder.decode(&[], &mut samples, false)?;
-        // The approved decode path is mono; opus2 already returns the decoded
-        // sample count for that one channel.
         samples.truncate(decoded);
-        verify_sample_count(samples, expected_samples)
+        verify_sample_count(samples, expected_samples as u32)
     }
 }
 
@@ -690,6 +699,76 @@ mod tests {
         assert_eq!(next_decode_capacity(3_840), 5_760);
         assert_eq!(next_decode_capacity(5_760), 11_520);
         assert_eq!(next_decode_capacity(11_520), 11_520);
+    }
+
+    #[test]
+    fn plc_uses_loss_duration_smaller_than_packet_capacity() {
+        let mut decoder = RecoveryDecoder::new().unwrap();
+        assert_eq!(decoder.decode_capacity, 1_920);
+
+        let samples = decoder.decode_loss(960).unwrap();
+
+        assert_eq!(samples.len(), 960);
+    }
+
+    #[test]
+    fn plc_duration_is_independent_after_packet_capacity_grows() {
+        let mut decoder = RecoveryDecoder::new().unwrap();
+        decoder.decode_capacity = 5_760;
+
+        let samples = decoder.decode_loss(480).unwrap();
+
+        assert_eq!(samples.len(), 480);
+        assert_eq!(decoder.decode_capacity, 5_760);
+    }
+
+    #[test]
+    fn plc_sample_count_agrees_with_authoritative_playout_journal() {
+        let directory = env::temp_dir().join(format!(
+            "echoscribe-plc-journal-test-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let mut packet_bytes = Vec::new();
+        journal::write_file_header(&mut packet_bytes).unwrap();
+        fs::write(directory.join(PACKET_JOURNAL_FILE_NAME), packet_bytes).unwrap();
+        let mut playout_bytes = Vec::new();
+        playout::write_file_header(&mut playout_bytes).unwrap();
+        playout::write_record(
+            &mut playout_bytes,
+            &crate::playout::PlayoutRecord {
+                tick: 10,
+                ssrc: 100,
+                decision: PlayoutDecision::Loss,
+                decoded_samples: 960,
+            },
+        )
+        .unwrap();
+        fs::write(directory.join(PLAYOUT_JOURNAL_FILE_NAME), playout_bytes).unwrap();
+        let mut recovered_samples = Vec::new();
+
+        let summary = replay_session(&directory, |frame| {
+            recovered_samples.push(frame.samples.len());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(summary.loss_decisions, 1);
+        assert_eq!(recovered_samples, [960]);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn plc_rejects_duration_above_opus_maximum() {
+        let mut decoder = RecoveryDecoder::new().unwrap();
+
+        let error = decoder.decode_loss(5_761).unwrap_err();
+
+        assert!(error.to_string().contains("supported range 1..=5760"));
     }
 
     #[test]

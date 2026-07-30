@@ -12,6 +12,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
+
 use anyhow::{Context, Result, anyhow, bail};
 use flac_codec::{
     decode::{Verified, verify},
@@ -204,14 +207,31 @@ fn publish_recovered_tracks(
                 part_path.display()
             )
         })?;
-        File::open(&track_directory)?.sync_all()?;
+        sync_track_directory(&track_directory)?;
         fs::rename(&part_path, &final_path).with_context(|| {
             format!(
                 "failed to finalise recovered track {}",
                 final_path.display()
             )
         })?;
-        File::open(&track_directory)?.sync_all()?;
+        if let Err(sync_error) = sync_track_directory(&track_directory) {
+            let rollback = fs::rename(&final_path, &part_path)
+                .and_then(|()| sync_track_directory(&track_directory));
+            return Err(match rollback {
+                Ok(()) => anyhow!(
+                    "recovered track directory sync failed after publishing {}: {sync_error}; \
+                     publication was rolled back to {}",
+                    final_path.display(),
+                    part_path.display()
+                ),
+                Err(rollback_error) => anyhow!(
+                    "recovered track directory sync failed after publishing {}: {sync_error}; \
+                     rollback to {} also failed: {rollback_error}",
+                    final_path.display(),
+                    part_path.display()
+                ),
+            });
+        }
     }
 
     for track in recovered {
@@ -229,6 +249,43 @@ fn publish_recovered_tracks(
     }
     manifest.write(session_directory)?;
     Ok(())
+}
+
+fn sync_track_directory(directory: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    inject_directory_sync_failure_if_due(directory)?;
+    File::open(directory)?.sync_all()
+}
+
+#[cfg(test)]
+static DIRECTORY_SYNC_FAILURES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+#[cfg(test)]
+fn fail_directory_sync_after(directory: &Path, successful_syncs_before_failure: usize) {
+    DIRECTORY_SYNC_FAILURES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(directory.to_path_buf(), successful_syncs_before_failure);
+}
+
+#[cfg(test)]
+fn inject_directory_sync_failure_if_due(directory: &Path) -> io::Result<()> {
+    let mut failures = DIRECTORY_SYNC_FAILURES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(remaining) = failures.get_mut(directory) else {
+        return Ok(());
+    };
+    if *remaining > 0 {
+        *remaining -= 1;
+        return Ok(());
+    }
+    failures.remove(directory);
+    Err(io::Error::other(
+        "injected recovered track directory sync failure",
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -272,7 +329,7 @@ impl MappingTimeline {
         Ok(builder.finish())
     }
 
-    fn user_at(&self, ssrc: u32, elapsed_nanos: u64) -> Option<u64> {
+    pub(crate) fn user_at(&self, ssrc: u32, elapsed_nanos: u64) -> Option<u64> {
         self.intervals.get(&ssrc).and_then(|intervals| {
             intervals
                 .iter()
@@ -708,7 +765,7 @@ mod tests {
                     tick: 10 + index as u64 * 2,
                     ssrc,
                     decision: PlayoutDecision::Loss,
-                    decoded_samples: 1_920,
+                    decoded_samples: SAMPLES_PER_TICK as u32,
                 },
             )
             .unwrap();
@@ -802,6 +859,27 @@ mod tests {
     }
 
     #[test]
+    fn failed_final_publication_sync_rolls_flac_back_to_part() {
+        let directory = fixture("publication-sync-rollback", &[(11, 100)]);
+        let track_directory = directory.join(TRACK_DIRECTORY_NAME);
+        fail_directory_sync_after(&track_directory, 1);
+
+        let error = run(&directory, &[]).unwrap_err();
+
+        assert!(format!("{error:#}").contains("publication was rolled back"));
+        assert!(!track_directory.join("user-11.flac").exists());
+        assert!(track_directory.join("user-11.flac.part").is_file());
+        let durable_manifest =
+            TrackManifest::read(&directory.join(TRACK_MANIFEST_FILE_NAME)).unwrap();
+        assert_eq!(durable_manifest.tracks[0].state, TrackState::Incomplete);
+        assert_eq!(
+            SessionStore::load(&directory).unwrap().record().state,
+            WorkflowState::AwaitingOperator
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn mapping_timeline_revokes_departed_users_and_resolves_late_evidence() {
         let directory = test_directory("mapping-timeline");
         let path = directory.join(EVENT_JOURNAL_FILE_NAME);
@@ -885,10 +963,7 @@ mod tests {
                     tick: 10 + index as u64,
                     ssrc: *ssrc,
                     decision: PlayoutDecision::Loss,
-                    // A fresh Opus PLC decoder returns its initial 40 ms
-                    // concealment frame; the journal remains authoritative
-                    // about that nonstandard sample count.
-                    decoded_samples: 1_920,
+                    decoded_samples: SAMPLES_PER_TICK as u32,
                 },
             )
             .unwrap();
