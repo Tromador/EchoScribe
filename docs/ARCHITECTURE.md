@@ -309,9 +309,10 @@ Diagnostic failure must not affect authoritative capture or routine FLAC.
 
 ## 11. Session metadata and state
 
-`session.json` is a versioned durable workflow record. The current session
-record format is 4. Format 3 remains readable for sessions created before the
-work-item artefact reference was introduced.
+`session.json` is a versioned durable workflow record. New recording sessions
+begin in format 4. Format 3 remains readable for sessions created before the
+work-item artefact reference was introduced. Format 5 is introduced when the
+authoritative transcription-results artefact is published.
 
 It contains:
 
@@ -323,6 +324,7 @@ It contains:
 - participant snapshot path and format;
 - track manifest path and format;
 - optional transcription work-manifest path and format;
+- optional transcription results path and format according to session version;
 - current workflow state;
 - failure records;
 - completed stage checkpoints.
@@ -335,6 +337,11 @@ New sessions use format 4 with no work-manifest reference until the artefact has
 been published. Format-3 sessions imply no work-manifest reference and must not
 contain the field. Successful work-item generation upgrades a format-3 session
 to format 4.
+
+Format 4 must not contain a results description. Format 5 requires both the
+work-items description and a results description. The results description uses
+the fixed relative path `transcription/results.jsonl` and independently
+versioned result-record format 1.
 
 Minimum states:
 
@@ -494,6 +501,32 @@ For post-session transcription, Rust starts one Python worker process and passes
 - output paths;
 - resume position where applicable.
 
+Before the first worker launch, Rust:
+
+1. validates the published work manifest, complete routine tracks, and required
+   session-local artefacts;
+2. creates and synchronises an empty `transcription/results.jsonl`;
+3. atomically upgrades format 4 to format 5, publishes the results reference,
+   and transitions `ready_for_transcription` to `transcribing`;
+4. launches the worker only after that durable replacement succeeds.
+
+An explicit `transcribe <session> <config>` invocation may also enter from
+`transcribing` as a controlled restart. Rust validates a contiguous result
+prefix beginning at sequence 1, truncates only an incomplete final record back
+to the last validated newline, rebuilds and synchronises
+`transcript.partial.txt`, and resumes at the next item without rewind.
+
+All other entry states are rejected. Successful or failed Slice 8 worker
+completion leaves the state as `transcribing`; failure-state publication,
+rewind, final transcript publication, and transition to `complete` belong to
+Slice 9.
+
+The repository-owned worker is
+`songbird-recorder/python/transcription_worker.py`. Rust resolves it
+independently of the caller's working directory. The interpreter is selected
+from `ECHOSCRIBE_PYTHON` when set, otherwise `python` on Windows and `python3`
+elsewhere.
+
 The Python worker:
 
 1. loads faster-whisper once;
@@ -534,12 +567,19 @@ Timing is sufficient to derive overlaps. Explicit overlap references may be adde
 
 Commit ordering:
 
-1. append and flush the structured result;
-2. append and flush the human-readable line.
+1. append and synchronise the structured result;
+2. append and synchronise the human-readable line.
 
 The JSONL result is authoritative if a crash occurs between those writes.
 
 On resume, EchoScribe rebuilds `transcript.partial.txt` from the retained contiguous JSONL prefix before processing new work.
+
+Each retained result repeats the work item's required provenance: session and
+work-item identity, global sequence, Discord user and speaker metadata,
+session-relative timing, source track and range, text, and completed status.
+Controlled restart rejects gaps, duplicates, mismatches, and malformed interior
+records. Missing participant context remains represented by the defaults
+already materialised in the work item and never blocks transcription.
 
 ## 17. Transcription ordering
 
@@ -652,6 +692,15 @@ vad_enabled = false
 `merge_gap_ms` is required configuration, but this architecture does not assign a normative default. Its initial value must be documented as provisional and tuned against representative recordings.
 
 CLI options may override configuration for explicit diagnosis or reprocessing.
+
+The offline transcription loader reads only the transcription settings needed
+by the worker. It does not validate Discord credentials or IDs and does not
+read the mutable configured participant file.
+
+The vocabulary path is resolved relative to the named main configuration.
+Missing and empty or whitespace-only files produce a warning and no hotwords.
+A readable UTF-8 file contributes one phrase per trimmed non-blank line, with
+no comment syntax. Other I/O errors and invalid UTF-8 fail clearly.
 
 ## 20. Future live path
 

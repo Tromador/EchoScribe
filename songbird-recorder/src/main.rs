@@ -21,6 +21,7 @@ mod routine_recovery;
 mod session;
 mod telemetry;
 mod track_manifest;
+mod transcription;
 mod verify_tracks;
 mod work_items;
 
@@ -77,6 +78,10 @@ enum Command {
         session_directory: PathBuf,
     },
     BuildWorkItems {
+        session_directory: PathBuf,
+        config_path: PathBuf,
+    },
+    Transcribe {
         session_directory: PathBuf,
         config_path: PathBuf,
     },
@@ -271,6 +276,12 @@ async fn main() -> anyhow::Result<()> {
         } => {
             return work_items::run(&session_directory, &config_path);
         }
+        Command::Transcribe {
+            session_directory,
+            config_path,
+        } => {
+            return transcription::run(&session_directory, &config_path);
+        }
         Command::Export { session_directory } => {
             return recover::export(&session_directory);
         }
@@ -409,6 +420,7 @@ fn parse_command_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Res
                 | "recover-wav"
                 | "continue"
                 | "build-work-items"
+                | "transcribe"
                 | "export"
                 | "verify"
         )
@@ -460,6 +472,17 @@ fn parse_command_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Res
                     .ok_or_else(|| anyhow::anyhow!("build-work-items requires a config path"))?;
                 require_no_extra_args(&mut args)?;
                 Ok(Command::BuildWorkItems {
+                    session_directory,
+                    config_path,
+                })
+            }
+            Some("transcribe") => {
+                let config_path = args
+                    .next()
+                    .map(PathBuf::from)
+                    .ok_or_else(|| anyhow::anyhow!("transcribe requires a config path"))?;
+                require_no_extra_args(&mut args)?;
+                Ok(Command::Transcribe {
                     session_directory,
                     config_path,
                 })
@@ -675,6 +698,65 @@ mod tests {
                 .to_string()
                 .contains("requires a config path")
         );
+    }
+
+    #[test]
+    fn transcribe_selects_session_and_config_paths() {
+        let command = parse_command_args(
+            [
+                OsString::from("transcribe"),
+                OsString::from("recordings/session-123"),
+                OsString::from("echoscribe.toml"),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        let Command::Transcribe {
+            session_directory,
+            config_path,
+        } = command
+        else {
+            panic!("expected transcribe command");
+        };
+        assert_eq!(session_directory, Path::new("recordings/session-123"));
+        assert_eq!(config_path, Path::new("echoscribe.toml"));
+    }
+
+    #[test]
+    fn transcribe_requires_exactly_two_paths() {
+        let missing_session =
+            parse_command_args([OsString::from("transcribe")].into_iter()).unwrap_err();
+        assert!(
+            missing_session
+                .to_string()
+                .contains("requires a session directory")
+        );
+
+        let missing_config = parse_command_args(
+            [
+                OsString::from("transcribe"),
+                OsString::from("recordings/session-123"),
+            ]
+            .into_iter(),
+        )
+        .unwrap_err();
+        assert!(
+            missing_config
+                .to_string()
+                .contains("requires a config path")
+        );
+
+        let extra = parse_command_args(
+            [
+                OsString::from("transcribe"),
+                OsString::from("recordings/session-123"),
+                OsString::from("echoscribe.toml"),
+                OsString::from("extra"),
+            ]
+            .into_iter(),
+        )
+        .unwrap_err();
+        assert!(extra.to_string().contains("unexpected argument"));
     }
 
     #[test]

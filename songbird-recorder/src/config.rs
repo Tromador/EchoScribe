@@ -4,7 +4,7 @@
 //! recorder from another working directory does not change their meaning.
 
 use std::{
-    fs,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -87,6 +87,61 @@ pub(crate) struct TranscriptionConfig {
     pub(crate) beam_size: u32,
     pub(crate) vocabulary_file: PathBuf,
     pub(crate) resume_rewind_seconds: u64,
+}
+
+#[derive(Debug)]
+/// Settings needed by the offline Python worker, deliberately detached from
+/// Discord and the mutable participant source.
+pub(crate) struct OfflineTranscriptionConfig {
+    pub(crate) model: String,
+    pub(crate) language: String,
+    pub(crate) device: String,
+    pub(crate) compute_type: String,
+    pub(crate) beam_size: u32,
+    pub(crate) hotwords: Vec<String>,
+    pub(crate) vocabulary_warning: Option<String>,
+}
+
+impl OfflineTranscriptionConfig {
+    pub(crate) fn load(path: &Path) -> Result<Self> {
+        let text = fs::read_to_string(path)
+            .with_context(|| format!("failed to read configuration file {}", path.display()))?;
+        let file: FileConfig = toml::from_str(&text)
+            .with_context(|| format!("failed to parse configuration file {}", path.display()))?;
+
+        if file.version != SUPPORTED_CONFIG_VERSION {
+            bail!(
+                "unsupported configuration version {}; expected {}",
+                file.version,
+                SUPPORTED_CONFIG_VERSION
+            );
+        }
+        validate_nonempty("transcription.model", &file.transcription.model)?;
+        validate_nonempty("transcription.language", &file.transcription.language)?;
+        validate_nonempty("transcription.device", &file.transcription.device)?;
+        validate_nonempty(
+            "transcription.compute_type",
+            &file.transcription.compute_type,
+        )?;
+        if file.transcription.beam_size == 0 {
+            bail!("transcription.beam_size must be greater than zero");
+        }
+        if file.transcription.vocabulary_file.as_os_str().is_empty() {
+            bail!("transcription.vocabulary_file must not be empty");
+        }
+
+        let vocabulary_path = resolve_path(path, file.transcription.vocabulary_file);
+        let (hotwords, vocabulary_warning) = load_vocabulary(&vocabulary_path)?;
+        Ok(Self {
+            model: file.transcription.model,
+            language: file.transcription.language,
+            device: file.transcription.device,
+            compute_type: file.transcription.compute_type,
+            beam_size: file.transcription.beam_size,
+            hotwords,
+            vocabulary_warning,
+        })
+    }
 }
 
 #[allow(dead_code)]
@@ -236,6 +291,40 @@ fn resolve_path(config_path: &Path, value: PathBuf) -> PathBuf {
     }
 }
 
+fn load_vocabulary(path: &Path) -> Result<(Vec<String>, Option<String>)> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok((
+                Vec::new(),
+                Some(format!(
+                    "vocabulary file {} is missing; continuing without hotwords",
+                    path.display()
+                )),
+            ));
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read vocabulary file {}", path.display()));
+        }
+    };
+    let text = String::from_utf8(bytes)
+        .with_context(|| format!("vocabulary file {} is not valid UTF-8", path.display()))?;
+    let hotwords = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let warning = hotwords.is_empty().then(|| {
+        format!(
+            "vocabulary file {} is empty; continuing without hotwords",
+            path.display()
+        )
+    });
+    Ok((hotwords, warning))
+}
+
 fn validate_nonempty(field: &str, value: &str) -> Result<()> {
     if value.trim().is_empty() {
         bail!("{field} must not be empty");
@@ -324,6 +413,60 @@ merge_gap_ms = 750
 
         assert_eq!(merge_gap_ms, 750);
         assert!(!directory.join("participants.toml").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn offline_transcription_loads_trimmed_vocabulary_without_discord_or_participants() {
+        let directory = test_directory("offline-transcription");
+        let config_path = directory.join("echoscribe.toml");
+        let input = VALID_CONFIG
+            .replace(r#"token = "test-token""#, r#"token = """#)
+            .replace(r#"guild_id = "123""#, r#"guild_id = "not-a-number""#);
+        fs::write(&config_path, input).unwrap();
+        fs::write(
+            directory.join("vocabulary.txt"),
+            " Emperor Coaltongue \n\nDragon Lance\n",
+        )
+        .unwrap();
+
+        let config = OfflineTranscriptionConfig::load(&config_path).unwrap();
+
+        assert_eq!(config.model, "large-v3");
+        assert_eq!(config.hotwords, ["Emperor Coaltongue", "Dragon Lance"]);
+        assert_eq!(config.vocabulary_warning, None);
+        assert!(!directory.join("participants.toml").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn missing_and_empty_vocabulary_are_warning_only() {
+        for (label, contents) in [("missing", None), ("empty", Some(" \n\t\n"))] {
+            let directory = test_directory(label);
+            let config_path = directory.join("echoscribe.toml");
+            fs::write(&config_path, VALID_CONFIG).unwrap();
+            if let Some(contents) = contents {
+                fs::write(directory.join("vocabulary.txt"), contents).unwrap();
+            }
+
+            let config = OfflineTranscriptionConfig::load(&config_path).unwrap();
+
+            assert!(config.hotwords.is_empty());
+            assert!(config.vocabulary_warning.is_some());
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_vocabulary_fails_clearly() {
+        let directory = test_directory("invalid-vocabulary");
+        let config_path = directory.join("echoscribe.toml");
+        fs::write(&config_path, VALID_CONFIG).unwrap();
+        fs::write(directory.join("vocabulary.txt"), [0xff, 0xfe]).unwrap();
+
+        let error = OfflineTranscriptionConfig::load(&config_path).unwrap_err();
+
+        assert!(format!("{error:#}").contains("not valid UTF-8"));
         fs::remove_dir_all(directory).unwrap();
     }
 

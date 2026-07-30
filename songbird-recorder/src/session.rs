@@ -22,12 +22,14 @@ use crate::{
     artifacts::{
         EVENT_JOURNAL_FILE_NAME, PACKET_JOURNAL_FILE_NAME, PARTICIPANT_SNAPSHOT_FILE_NAME,
         PARTICIPANT_SNAPSHOT_FORMAT_VERSION, PLAYOUT_JOURNAL_FILE_NAME, TRACK_MANIFEST_FILE_NAME,
-        TRACK_MANIFEST_FORMAT_VERSION, WORK_ITEM_MANIFEST_FORMAT_VERSION, WORK_ITEM_MANIFEST_PATH,
+        TRACK_MANIFEST_FORMAT_VERSION, TRANSCRIPTION_RESULT_FORMAT_VERSION,
+        TRANSCRIPTION_RESULTS_PATH, WORK_ITEM_MANIFEST_FORMAT_VERSION, WORK_ITEM_MANIFEST_PATH,
     },
     participants::ParticipantContext,
 };
 
-pub(crate) const SESSION_FORMAT_VERSION: u16 = 4;
+pub(crate) const SESSION_FORMAT_VERSION: u16 = 5;
+pub(crate) const RECORDING_SESSION_FORMAT_VERSION: u16 = 4;
 pub(crate) const PREVIOUS_SESSION_FORMAT_VERSION: u16 = 3;
 pub(crate) const LEGACY_SESSION_FORMAT_VERSION: u16 = 2;
 pub(crate) const LEGACY_EVENT_FORMAT_VERSION: u16 = 1;
@@ -100,6 +102,8 @@ pub(crate) struct SessionFiles {
     pub(crate) tracks: FileDescription,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) work_items: Option<FileDescription>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) results: Option<FileDescription>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -147,7 +151,9 @@ pub(crate) struct SessionStore {
 impl SessionRecord {
     fn new(input: &NewSession<'_>) -> Self {
         Self {
-            format: SESSION_FORMAT_VERSION,
+            // Recording starts in format 4. Format 5 is a transcription-stage
+            // commitment and must not be claimed before results authority exists.
+            format: RECORDING_SESSION_FORMAT_VERSION,
             session_id: input.session_id.to_owned(),
             started_at_unix_millis: input.started_at_unix_millis,
             stopped_at_unix_millis: None,
@@ -179,6 +185,7 @@ impl SessionRecord {
                     format: TRACK_MANIFEST_FORMAT_VERSION,
                 },
                 work_items: None,
+                results: None,
             },
             failures: Vec::new(),
             checkpoints: Vec::new(),
@@ -190,11 +197,16 @@ impl SessionRecord {
         // malformed workflow authority must never be propagated.
         if !matches!(
             self.format,
-            PREVIOUS_SESSION_FORMAT_VERSION | SESSION_FORMAT_VERSION
+            PREVIOUS_SESSION_FORMAT_VERSION
+                | RECORDING_SESSION_FORMAT_VERSION
+                | SESSION_FORMAT_VERSION
         ) {
             return Err(invalid_data(format!(
-                "unsupported session format {}; expected {} or {}",
-                self.format, PREVIOUS_SESSION_FORMAT_VERSION, SESSION_FORMAT_VERSION
+                "unsupported session format {}; expected {}, {}, or {}",
+                self.format,
+                PREVIOUS_SESSION_FORMAT_VERSION,
+                RECORDING_SESSION_FORMAT_VERSION,
+                SESSION_FORMAT_VERSION
             )));
         }
         if self.session_id.trim().is_empty() {
@@ -298,6 +310,56 @@ impl SessionRecord {
                      {WORK_ITEM_MANIFEST_FORMAT_VERSION}"
                 )));
             }
+        }
+        if self.format < SESSION_FORMAT_VERSION && self.files.results.is_some() {
+            return Err(invalid_data(
+                "session formats 3 and 4 must not contain a results description",
+            ));
+        }
+        if self.format == SESSION_FORMAT_VERSION {
+            if self.files.work_items.is_none() || self.files.results.is_none() {
+                return Err(invalid_data(
+                    "session format 5 requires work_items and results descriptions",
+                ));
+            }
+            let description = self
+                .files
+                .results
+                .as_ref()
+                .expect("format-5 results presence checked above");
+            validate_relative_artifact_path("results", &description.path)?;
+            if description.path != TRANSCRIPTION_RESULTS_PATH
+                || description.format != TRANSCRIPTION_RESULT_FORMAT_VERSION
+            {
+                return Err(invalid_data(format!(
+                    "session file results must be {TRANSCRIPTION_RESULTS_PATH:?} format \
+                     {TRANSCRIPTION_RESULT_FORMAT_VERSION}"
+                )));
+            }
+        }
+        if matches!(
+            self.state,
+            WorkflowState::Transcribing
+                | WorkflowState::TranscriptionFailed
+                | WorkflowState::Complete
+        ) && self.format != SESSION_FORMAT_VERSION
+        {
+            return Err(invalid_data(
+                "transcription workflow states require session format 5",
+            ));
+        }
+        if self.format == SESSION_FORMAT_VERSION
+            && !matches!(
+                self.state,
+                WorkflowState::Transcribing
+                    | WorkflowState::TranscriptionFailed
+                    | WorkflowState::AwaitingOperator
+                    | WorkflowState::Complete
+            )
+        {
+            return Err(invalid_data(
+                "session format 5 requires a transcription workflow state",
+            ));
         }
 
         for failure in &self.failures {
@@ -447,7 +509,7 @@ impl SessionStore {
         }
 
         let mut updated = self.record.clone();
-        updated.format = SESSION_FORMAT_VERSION;
+        updated.format = RECORDING_SESSION_FORMAT_VERSION;
         updated.files.work_items = Some(FileDescription {
             path: WORK_ITEM_MANIFEST_PATH.to_owned(),
             format: WORK_ITEM_MANIFEST_FORMAT_VERSION,
@@ -455,6 +517,38 @@ impl SessionStore {
         updated.checkpoints.push(CheckpointRecord {
             completed_at_unix_millis,
             stage: "work_manifest_built".to_owned(),
+        });
+        self.persist(updated)
+    }
+
+    /// Commit the results authority and workflow transition together. The
+    /// caller must synchronise the empty results file before invoking this.
+    pub(crate) fn publish_transcription_start(
+        &mut self,
+        started_at_unix_millis: u64,
+    ) -> io::Result<()> {
+        if self.record.format != RECORDING_SESSION_FORMAT_VERSION
+            || self.record.state != WorkflowState::ReadyForTranscription
+            || self.record.files.work_items.is_none()
+            || self.record.files.results.is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "first transcription start requires a format-4 ready_for_transcription session \
+                 with work_items and without results",
+            ));
+        }
+
+        let mut updated = self.record.clone();
+        updated.format = SESSION_FORMAT_VERSION;
+        updated.state = WorkflowState::Transcribing;
+        updated.files.results = Some(FileDescription {
+            path: TRANSCRIPTION_RESULTS_PATH.to_owned(),
+            format: TRANSCRIPTION_RESULT_FORMAT_VERSION,
+        });
+        updated.checkpoints.push(CheckpointRecord {
+            completed_at_unix_millis: started_at_unix_millis,
+            stage: "transcription_started".to_owned(),
         });
         self.persist(updated)
     }
@@ -489,6 +583,19 @@ pub(crate) fn read_record(path: &Path) -> io::Result<SessionRecord> {
             "session format 3 must not contain a work_items field",
         ));
     }
+    if value
+        .get("format")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|format| format <= u64::from(RECORDING_SESSION_FORMAT_VERSION))
+        && value
+            .get("files")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|files| files.contains_key("results"))
+    {
+        return Err(invalid_data(
+            "session formats 3 and 4 must not contain a results field",
+        ));
+    }
     let record: SessionRecord = serde_json::from_value(value).map_err(io::Error::other)?;
     record.validate()?;
     Ok(record)
@@ -510,10 +617,6 @@ fn valid_transition(current: WorkflowState, next: WorkflowState) -> bool {
             | (
                 WorkflowState::RecordedIncomplete,
                 WorkflowState::AwaitingOperator
-            )
-            | (
-                WorkflowState::ReadyForTranscription,
-                WorkflowState::Transcribing
             )
             | (WorkflowState::Transcribing, WorkflowState::Complete)
             | (
@@ -781,7 +884,7 @@ mod tests {
         let store = create_store(&directory, &participants);
 
         assert_eq!(store.record().state, WorkflowState::Recording);
-        assert_eq!(store.record().format, SESSION_FORMAT_VERSION);
+        assert_eq!(store.record().format, RECORDING_SESSION_FORMAT_VERSION);
         assert_eq!(store.record().stopped_at_unix_millis, None);
         assert_eq!(store.record().configuration_version, 1);
         assert_eq!(store.record().discord.guild_id, "123");
@@ -794,6 +897,7 @@ mod tests {
         assert_eq!(store.record().files.tracks.path, "tracks.json");
         assert_eq!(store.record().files.tracks.format, 1);
         assert_eq!(store.record().files.work_items, None);
+        assert_eq!(store.record().files.results, None);
         assert!(store.record().failures.is_empty());
         assert!(store.record().checkpoints.is_empty());
 
@@ -874,7 +978,7 @@ mod tests {
         store.publish_work_manifest(3_000).unwrap();
 
         let reloaded = SessionStore::load(&directory).unwrap();
-        assert_eq!(reloaded.record().format, SESSION_FORMAT_VERSION);
+        assert_eq!(reloaded.record().format, RECORDING_SESSION_FORMAT_VERSION);
         assert_eq!(
             reloaded.record().files.work_items,
             Some(FileDescription {
@@ -889,6 +993,58 @@ mod tests {
         assert_eq!(
             reloaded.record().state,
             WorkflowState::ReadyForTranscription
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn format_four_rejects_a_results_field_even_when_null() {
+        let directory = test_directory("format-four-results");
+        let participants = ParticipantContext::empty_for_test();
+        let store = create_store(&directory, &participants);
+        let mut value = serde_json::to_value(store.record()).unwrap();
+        value["files"]["results"] = serde_json::Value::Null;
+        fs::write(
+            directory.join(SESSION_FILE_NAME),
+            serde_json::to_vec_pretty(&value).unwrap(),
+        )
+        .unwrap();
+
+        let error = SessionStore::load(&directory).err().unwrap();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("formats 3 and 4"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn transcription_start_publishes_format_results_and_state_together() {
+        let directory = test_directory("transcription-start");
+        let participants = ParticipantContext::empty_for_test();
+        let mut store = create_store(&directory, &participants);
+        store
+            .transition(WorkflowState::RecordedClean, 2_000)
+            .unwrap();
+        store
+            .transition(WorkflowState::ReadyForTranscription, 2_100)
+            .unwrap();
+        store.publish_work_manifest(2_200).unwrap();
+
+        store.publish_transcription_start(2_300).unwrap();
+
+        let reloaded = SessionStore::load(&directory).unwrap();
+        assert_eq!(reloaded.record().format, SESSION_FORMAT_VERSION);
+        assert_eq!(reloaded.record().state, WorkflowState::Transcribing);
+        assert_eq!(
+            reloaded.record().files.results,
+            Some(FileDescription {
+                path: TRANSCRIPTION_RESULTS_PATH.to_owned(),
+                format: TRANSCRIPTION_RESULT_FORMAT_VERSION,
+            })
+        );
+        assert_eq!(
+            reloaded.record().checkpoints.last().unwrap().stage,
+            "transcription_started"
         );
         fs::remove_dir_all(directory).unwrap();
     }

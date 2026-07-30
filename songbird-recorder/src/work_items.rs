@@ -762,7 +762,7 @@ mod tests {
         let after_first = SessionStore::load(&directory).unwrap();
         assert_eq!(
             after_first.record().format,
-            crate::session::SESSION_FORMAT_VERSION
+            crate::session::RECORDING_SESSION_FORMAT_VERSION
         );
         assert_eq!(
             after_first.record().files.work_items.as_ref().unwrap().path,

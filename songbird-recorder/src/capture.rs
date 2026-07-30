@@ -1677,7 +1677,10 @@ role = "GM"
 
         let session: serde_json::Value =
             serde_json::from_slice(&fs::read(session_path.join("session.json")).unwrap()).unwrap();
-        assert_eq!(session["format"], crate::session::SESSION_FORMAT_VERSION);
+        assert_eq!(
+            session["format"],
+            crate::session::RECORDING_SESSION_FORMAT_VERSION
+        );
         assert_eq!(session["state"], "ready_for_transcription");
         assert_eq!(session["discord"]["guild_id"], "123");
         assert_eq!(session["discord"]["channel_id"], "456");

@@ -438,14 +438,39 @@ Transcribe one session through one Python process and one faster-whisper model l
 
 ### Route
 
-- Rust launches the Python worker with configuration and manifest paths;
+- expose `transcribe <session> <config>`;
+- accept `ready_for_transcription` for first invocation and `transcribing` for
+  an explicit controlled restart; reject other states;
+- validate the published work manifest, complete routine tracks, and required
+  session-local artefacts;
+- introduce session format 5 with required work-items and results descriptions;
+- keep new recording sessions in format 4 and keep formats 3 and 4 readable
+  under their existing compatibility rules;
+- create and synchronise an empty `transcription/results.jsonl`, then publish
+  the format-5 results reference and transition to `transcribing` together
+  before launching the worker;
+- Rust launches the repository-owned Python worker with configuration,
+  manifest, result, output, and resume paths;
 - Python loads faster-whisper once;
 - work items are processed sequentially in global order;
 - each item is initially independent of previous Whisper text;
-- successful results append to `results.jsonl`;
-- corresponding lines append to `transcript.partial.txt`;
+- successful complete results append and synchronise to `results.jsonl`;
+- corresponding lines append and synchronise to `transcript.partial.txt`;
+- controlled restart accepts only a matching contiguous result prefix,
+  discards only a truncated final record, rebuilds the partial text from that
+  prefix, and resumes at the next item without rewind;
+- successful completion leaves the session in `transcribing`;
 - Python exits non-zero on failure;
 - no automatic retry.
+
+The worker is `songbird-recorder/python/transcription_worker.py`. Rust resolves
+it independently of the caller's working directory and selects
+`ECHOSCRIBE_PYTHON`, `python` on Windows, or `python3` otherwise.
+
+The offline transcription configuration loader does not validate Discord
+credentials or IDs and does not read the configured participant file.
+Vocabulary phrases are trimmed non-blank UTF-8 lines. Missing or empty
+vocabulary is warning-only; other I/O failures and invalid UTF-8 are errors.
 
 ### Required tests
 
@@ -472,6 +497,8 @@ Test:
 - no relevance filtering;
 - no AAR generation;
 - no cross-item Whisper conditioning.
+- no durable transcription-failure transition, rewind continuation, final
+  transcript rename, or transition to `complete` (Slice 9).
 
 ### External verification
 

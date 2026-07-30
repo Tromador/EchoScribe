@@ -4,3 +4,5 @@
 /recordings/
 /songbird-recorder/target/
 /docs/SLICE_0_RECONCILIATION.md
+__pycache__/
+*.pyc

@@ -142,6 +142,22 @@ The initial implementation uses:
 
 The initial implementation may begin transcription after recording has stopped and all required tracks have finalised successfully.
 
+Before one-stop orchestration is introduced, transcription is invoked explicitly:
+
+```text
+echoscribe transcribe <session> <config>
+```
+
+The first invocation requires `ready_for_transcription`. An explicit controlled
+restart may enter from `transcribing`, validates and retains only the globally
+contiguous committed result prefix, rebuilds the partial text transcript from
+that prefix, and resumes at the next work item without rewind. Other entry
+states are rejected.
+
+Slice 8 leaves successful and failed worker runs in `transcribing`. Durable
+transcription-failure state, rewind continuation, final transcript publication,
+and transition to `complete` belong to the later continuation stage.
+
 The transcription design must not assume that completed whole-session files are the only possible source of transcription audio.
 
 ## 9. Transcription range generation
@@ -200,6 +216,10 @@ EchoScribe retains machine-readable JSONL records for:
 
 The structured results are the durable authority for transcript reconstruction and automated downstream processing.
 
+The result authority is published before the worker starts. Each completed
+result is appended and synchronised before its corresponding human-readable
+line is appended and synchronised.
+
 Each committed result must include enough information to identify:
 
 - session;
@@ -251,7 +271,7 @@ When all required work items have committed successfully, it is finalised as:
 transcript.txt
 ```
 
-If a crash leaves JSONL and text output inconsistent, the text file is reconciled from committed JSONL results. Audio is not retranscribed merely to repair the display file.
+If a crash leaves JSONL and text output inconsistent, the text file is reconciled from committed JSONL results. Audio is not retranscribed merely to repair the display file. A truncated final JSONL record may be discarded back to the last complete synchronised newline; malformed interior records are not silently skipped.
 
 ## 13. Failure behaviour
 
@@ -371,8 +391,10 @@ The state model must distinguish at least:
 
 Failures and recovery actions must be recorded with enough information to explain why the session stopped and what action is required.
 
-The current session format is 4. Existing format-3 sessions remain readable and
-are upgraded to format 4 when a work-item manifest is successfully published.
+New recording sessions begin in session format 4. Session format 5 adds the
+authoritative transcription-results reference and is published atomically with
+the first transition to `transcribing`. Existing format-3 and format-4 sessions
+remain readable under their defined compatibility rules.
 
 ## 16. Normal orchestration
 
