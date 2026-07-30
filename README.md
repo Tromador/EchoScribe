@@ -55,12 +55,21 @@ caller's working directory, and forward all arguments to the application.
 .\echoscribe.ps1 inspect recordings\session-...
 .\echoscribe.ps1 build-work-items recordings\session-... echoscribe.toml
 .\echoscribe.ps1 transcribe recordings\session-... echoscribe.toml
+.\echoscribe.ps1 continue recordings\session-...
+.\echoscribe.ps1 continue recordings\session-... echoscribe.toml
 ```
 
 ```sh
 ./echoscribe.sh inspect recordings/session-...
 ./echoscribe.sh transcribe recordings/session-... echoscribe.toml
+./echoscribe.sh continue recordings/session-...
+./echoscribe.sh continue recordings/session-... echoscribe.toml
 ```
+
+The unconfigured `continue` form validates recording recovery. Supplying the
+configuration resumes a recorded transcription failure using its configured
+rewind interval. Successful transcription publishes
+`transcription/transcript.txt` inside the session directory.
 
 For development, invoke Cargo directly:
 

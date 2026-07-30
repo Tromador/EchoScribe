@@ -546,26 +546,61 @@ Resume failed transcription without restarting the entire session.
 
 ### Route
 
-- record the failed item and worker diagnostics;
-- set `transcription_failed` and await operator action;
-- find the last contiguous committed sequence;
-- apply configured `resume_rewind_seconds` default 120;
-- supersede results intersecting the rewind window;
-- rebuild `transcript.partial.txt` from valid JSONL;
-- launch one new worker;
-- resume in global chronological order;
-- finalise `transcript.txt` only after all items commit.
+- retain `continue <session>` for recording recovery of format-3 and format-4
+  sessions with no results description;
+- add `continue <session> <config>` for format-5 transcription continuation
+  from `awaiting_operator` or a stranded `transcription_failed`;
+- reject command, configuration, format, state, and artefact mismatches before
+  mutation;
+- expose `resume_rewind_seconds` through the Discord-independent offline
+  transcription loader;
+- after worker termination, validate the complete contiguous result prefix and
+  derive the next uncommitted sequence and item;
+- distinguish launch failure, non-zero exit, and signal termination;
+- atomically record attempted start, next item, and process diagnostics while
+  setting `transcription_failed`, then transition to `awaiting_operator`;
+- acquire the existing transcription lease before continuation repair;
+- for positive rewind, find the earliest result intersecting the configured
+  window ending at the last committed result's `end_ms`;
+- for zero rewind, retain the complete committed prefix;
+- keep JSONL contiguous by atomically replacing it with the retained prefix;
+- durably record `transcription_resume_prepared_<sequence>` before replacement;
+- reapply an unmatched prepared target after a crash instead of calculating a
+  second rewind;
+- rebuild and synchronise `transcript.partial.txt`;
+- atomically record `transcription_resume_applied_<sequence>` while
+  transitioning to `transcribing`;
+- after failure without forward progress, reuse the previous applied boundary;
+- after new committed progress, permit one new rewind calculation;
+- launch one new worker and resume in global chronological order;
+- after zero exit, require exactly one matching result for every work item,
+  deterministically rebuild text, atomically publish
+  `transcription/transcript.txt`, record completion, and transition to
+  `complete`;
+- retain the transcription lease through final publication and state update.
 
 ### Required tests
 
 - failure after several committed items;
+- next-uncommitted diagnostics derived after worker exit;
+- launch failure;
+- signal or status-less termination;
+- stranded `transcription_failed` continuation;
 - zero-second rewind;
 - 120-second rewind;
 - rewind crossing several work items;
+- overlapping work items preserving a contiguous prefix;
+- truncated final result repair;
 - no duplicate JSONL authority;
 - deterministic text reconstruction;
+- crash after prepared checkpoint;
+- crash after result replacement but before applied checkpoint;
+- repeated failure without progress does not rewind again;
+- later failure after new progress calculates a new rewind;
+- invalid command/config/session combinations;
 - refusal to continue from invalid state;
 - successful final rename;
+- failure of the completion session update remains recoverable;
 - persistent second failure returns to operator state.
 
 ### Non-goals

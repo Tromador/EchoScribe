@@ -553,6 +553,115 @@ impl SessionStore {
         self.persist(updated)
     }
 
+    /// Record a known worker failure and its workflow state in one authority
+    /// replacement. The later awaiting-operator transition is deliberately
+    /// separate so a crash leaves an explicitly continuable failed state.
+    pub(crate) fn publish_transcription_failure(
+        &mut self,
+        recorded_at_unix_millis: u64,
+        message: impl Into<String>,
+    ) -> io::Result<()> {
+        if self.record.format != SESSION_FORMAT_VERSION
+            || self.record.state != WorkflowState::Transcribing
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "transcription failure publication requires a format-5 transcribing session",
+            ));
+        }
+
+        let mut updated = self.record.clone();
+        updated.failures.push(FailureRecord {
+            recorded_at_unix_millis,
+            state: WorkflowState::Transcribing,
+            kind: "transcription_worker".to_owned(),
+            message: message.into(),
+        });
+        updated.state = WorkflowState::TranscriptionFailed;
+        self.persist(updated)
+    }
+
+    /// Persist the exact rewind target before derived authorities are replaced.
+    pub(crate) fn record_transcription_resume_prepared(
+        &mut self,
+        completed_at_unix_millis: u64,
+        sequence: u64,
+    ) -> io::Result<()> {
+        if self.record.format != SESSION_FORMAT_VERSION
+            || self.record.state != WorkflowState::AwaitingOperator
+            || sequence == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "resume preparation requires a non-zero sequence in a format-5 \
+                 awaiting_operator session",
+            ));
+        }
+
+        let mut updated = self.record.clone();
+        updated.checkpoints.push(CheckpointRecord {
+            completed_at_unix_millis,
+            stage: format!("transcription_resume_prepared_{sequence}"),
+        });
+        self.persist(updated)
+    }
+
+    /// Publish the matching applied checkpoint and resume transition together.
+    pub(crate) fn apply_transcription_resume(
+        &mut self,
+        completed_at_unix_millis: u64,
+        sequence: u64,
+    ) -> io::Result<()> {
+        let expected_prepared = format!("transcription_resume_prepared_{sequence}");
+        if self.record.format != SESSION_FORMAT_VERSION
+            || self.record.state != WorkflowState::AwaitingOperator
+            || sequence == 0
+            || self
+                .record
+                .checkpoints
+                .last()
+                .map(|checkpoint| checkpoint.stage.as_str())
+                != Some(expected_prepared.as_str())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "resume application requires the matching latest prepared checkpoint",
+            ));
+        }
+
+        let mut updated = self.record.clone();
+        updated.checkpoints.push(CheckpointRecord {
+            completed_at_unix_millis,
+            stage: format!("transcription_resume_applied_{sequence}"),
+        });
+        updated.state = WorkflowState::Transcribing;
+        self.persist(updated)
+    }
+
+    /// Commit successful transcript publication and workflow completion as one
+    /// durable state replacement.
+    pub(crate) fn publish_transcription_complete(
+        &mut self,
+        completed_at_unix_millis: u64,
+    ) -> io::Result<()> {
+        if self.record.format != SESSION_FORMAT_VERSION
+            || self.record.state != WorkflowState::Transcribing
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "transcription completion requires a format-5 transcribing session",
+            ));
+        }
+
+        let mut updated = self.record.clone();
+        updated.checkpoints.push(CheckpointRecord {
+            completed_at_unix_millis,
+            stage: "transcription_completed".to_owned(),
+        });
+        updated.state = WorkflowState::Complete;
+        self.persist(updated)
+    }
+
     fn persist(&mut self, updated: SessionRecord) -> io::Result<()> {
         // Do not mutate the in-memory authority until the replacement is
         // validated and durably published.

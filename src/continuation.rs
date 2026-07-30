@@ -16,7 +16,10 @@ use crate::{
     participants::ParticipantContext,
     recover,
     routine_recovery::{MappingTimeline, RECOVERY_COMPLETED_PREFIX, RECOVERY_STARTED_PREFIX},
-    session::{FailureRecord, SessionStore, WorkflowState},
+    session::{
+        FailureRecord, PREVIOUS_SESSION_FORMAT_VERSION, RECORDING_SESSION_FORMAT_VERSION,
+        SessionStore, WorkflowState,
+    },
     track_manifest::TrackManifest,
     verify_tracks,
 };
@@ -28,10 +31,18 @@ pub(crate) fn run(session_directory: &Path) -> Result<()> {
             session_directory.display()
         )
     })?;
-    if session.record().state != WorkflowState::AwaitingOperator {
+    if session.record().state != WorkflowState::AwaitingOperator
+        || !matches!(
+            session.record().format,
+            PREVIOUS_SESSION_FORMAT_VERSION | RECORDING_SESSION_FORMAT_VERSION
+        )
+        || session.record().files.results.is_some()
+    {
         bail!(
-            "continue requires session state awaiting_operator; found {}",
-            session.record().state.as_str()
+            "continue <session> requires a format-3 or format-4 awaiting_operator session \
+             without transcription results; found format {} state {}",
+            session.record().format,
+            session.record().state.as_str(),
         );
     }
 

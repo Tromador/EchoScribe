@@ -155,9 +155,10 @@ contiguous committed result prefix, rebuilds the partial text transcript from
 that prefix, and resumes at the next work item without rewind. Other entry
 states are rejected.
 
-Slice 8 leaves successful and failed worker runs in `transcribing`. Durable
-transcription-failure state, rewind continuation, final transcript publication,
-and transition to `complete` belong to the later continuation stage.
+A known worker failure is recorded durably and waits for explicit operator
+action. Transcription continuation applies a crash-idempotent rewind. A zero
+worker exit completes the session only after every work item has committed and
+the final transcript has been published.
 
 The repository root is the Cargo application root. The subordinate worker is
 `workers/faster-whisper/transcription_worker.py`; it is not an independent
@@ -282,10 +283,11 @@ During incomplete processing, the file is named:
 transcript.partial.txt
 ```
 
-When all required work items have committed successfully, it is finalised as:
+When all required work items have committed successfully, it is atomically
+finalised inside the session transcription directory as:
 
 ```text
-transcript.txt
+transcription/transcript.txt
 ```
 
 If a crash leaves JSONL and text output inconsistent, the text file is reconciled from committed JSONL results. Audio is not retranscribed merely to repair the display file. A truncated final JSONL record may be discarded back to the last complete synchronised newline; malformed interior records are not silently skipped.
@@ -353,9 +355,16 @@ EchoScribe must:
 
 - retain committed JSONL results;
 - retain `transcript.partial.txt`;
-- record the failed work item and worker diagnostics;
+- derive and record the next uncommitted work item after the worker has
+  terminated, together with the attempted start sequence and process
+  diagnostics;
 - mark the session as requiring operator action;
 - stop the normal pipeline.
+
+Failure publication atomically appends the failure evidence and sets
+`transcription_failed`, followed by a separate transition to
+`awaiting_operator`. A session stranded in `transcription_failed` because the
+second publication failed remains explicitly continuable.
 
 ## 14. Recovery and continuation
 
@@ -366,17 +375,25 @@ Conceptually:
 ```text
 echoscribe recover <session>
 echoscribe continue <session>
+echoscribe continue <session> <config>
 ```
 
 `recover` regenerates selected failed or incomplete derived tracks from the authoritative journals. It does not implicitly start transcription.
 
-`continue` validates durable session state and required artefacts before resuming the normal workflow.
+`continue <session>` validates recording recovery for a format-3 or format-4
+session with no transcription-results description.
+
+`continue <session> <config>` resumes a format-5 transcription failure from
+`awaiting_operator` or `transcription_failed`. The two forms reject mismatched
+session formats, artefact descriptions, states, and arguments before mutation.
 
 For transcription continuation:
 
 - resume from the last globally contiguous committed work item;
 - rewind by a configurable interval;
-- invalidate or supersede results intersecting the rewind window;
+- retain the complete committed authority until explicit continuation;
+- invalidate the rewind suffix by atomically replacing `results.jsonl` with
+  the retained contiguous prefix;
 - rebuild the partial text transcript from retained committed JSONL;
 - resume chronological processing without duplicating transcript lines.
 
@@ -388,6 +405,19 @@ resume_rewind_seconds = 120
 ```
 
 The documented default is 120 seconds. `0` disables rewind. A one-off CLI override may be provided.
+
+For a positive rewind, the boundary is the last committed result's `end_ms`
+minus the configured interval, saturated at zero. The earliest committed result
+whose range overlaps the interval begins the discarded suffix; all later
+results are also removed so the authority remains a contiguous global prefix.
+Zero rewind retains the complete committed prefix.
+
+Before replacing results, EchoScribe records the intended resume sequence.
+After replacing results and rebuilding text, it records the matching applied
+checkpoint while transitioning to `transcribing`. An interrupted or repeated
+continuation reapplies the recorded target rather than calculating another
+rewind. A later failure calculates a new rewind only after the worker has made
+forward progress beyond the previous attempt boundary.
 
 ## 15. Persistent session state
 

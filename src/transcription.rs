@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     artifacts::{
-        PARTIAL_TRANSCRIPT_FILE_NAME, TRANSCRIPTION_DIRECTORY_NAME,
+        FINAL_TRANSCRIPT_PATH, PARTIAL_TRANSCRIPT_FILE_NAME, TRANSCRIPTION_DIRECTORY_NAME,
         TRANSCRIPTION_RESULT_FORMAT_VERSION, TRANSCRIPTION_RESULTS_FILE_NAME,
         WORK_ITEM_MANIFEST_FORMAT_VERSION,
     },
@@ -35,8 +35,11 @@ use crate::{
 };
 
 const RESULTS_TEMP_FILE_NAME: &str = ".results.jsonl.tmp";
+const RESULTS_RESUME_TEMP_FILE_NAME: &str = ".results.jsonl.resume.tmp";
 const PARTIAL_TRANSCRIPT_TEMP_FILE_NAME: &str = ".transcript.partial.txt.tmp";
 const TRANSCRIPTION_LEASE_FILE_NAME: &str = "worker.lock";
+const RESUME_PREPARED_PREFIX: &str = "transcription_resume_prepared_";
+const RESUME_APPLIED_PREFIX: &str = "transcription_resume_applied_";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -189,6 +192,10 @@ pub(crate) fn run(session_directory: &Path, config_path: &Path) -> Result<()> {
     run_with_worker(session_directory, config_path, &SystemWorker)
 }
 
+pub(crate) fn continue_after_failure(session_directory: &Path, config_path: &Path) -> Result<()> {
+    continue_with_worker(session_directory, config_path, &SystemWorker)
+}
+
 fn run_with_worker(
     session_directory: &Path,
     config_path: &Path,
@@ -260,33 +267,409 @@ fn run_with_worker(
         .and_then(|value| value.checked_add(1))
         .ok_or_else(|| anyhow!("transcription result sequence overflow"))?;
 
-    let exit = worker.run(
-        &WorkerInvocation {
-            config_path: &config_path,
-            session_directory: &session_directory,
-            manifest_path: &manifest_path,
-            results_path: &results_path,
-            transcript_path: &transcript_path,
-            next_sequence,
-            settings: &settings,
-        },
+    run_worker_attempt(
+        &mut session,
+        &session_directory,
+        &config_path,
+        &manifest_path,
+        &results_path,
+        &transcript_path,
+        &work_items,
+        next_sequence,
+        &settings,
+        worker,
         &lease,
-    )?;
-    if !exit.success {
-        match exit.code {
-            Some(code) => bail!(
-                "Python transcription worker exited with status {code}; session remains transcribing"
-            ),
-            None => bail!(
-                "Python transcription worker terminated by signal; session remains transcribing"
-            ),
-        }
+    )
+}
+
+fn continue_with_worker(
+    session_directory: &Path,
+    config_path: &Path,
+    worker: &dyn WorkerProcess,
+) -> Result<()> {
+    let settings = OfflineTranscriptionConfig::load(config_path)?;
+    if let Some(warning) = &settings.vocabulary_warning {
+        eprintln!("Warning: {warning}.");
     }
 
-    println!(
-        "Python transcription worker completed for session {}; workflow remains transcribing.",
-        session.record().session_id
+    let session_directory = fs::canonicalize(session_directory).with_context(|| {
+        format!(
+            "failed to resolve session directory {}",
+            session_directory.display()
+        )
+    })?;
+    let config_path = fs::canonicalize(config_path).with_context(|| {
+        format!(
+            "failed to resolve configuration file {}",
+            config_path.display()
+        )
+    })?;
+    let mut session = SessionStore::load(&session_directory).with_context(|| {
+        format!(
+            "failed to load workflow state from {}",
+            session_directory.display()
+        )
+    })?;
+    validate_transcription_continuation_entry(session.record())?;
+
+    let manifest_path = session_directory.join(
+        &session
+            .record()
+            .files
+            .work_items
+            .as_ref()
+            .expect("continuation validation requires work_items")
+            .path,
     );
+    let tracks = validate_session_artifacts(&session_directory, session.record())?;
+    let work_items = read_work_manifest(&manifest_path, session.record(), &tracks)?;
+    let results_path = session_directory.join(
+        &session
+            .record()
+            .files
+            .results
+            .as_ref()
+            .expect("continuation validation requires results")
+            .path,
+    );
+
+    // Repair, rewind, text reconstruction, worker execution and final
+    // publication all share the same exclusive session ownership.
+    let lease = TranscriptionLease::acquire(&session_directory)?;
+    let committed = validate_and_repair_result_prefix(&results_path, &work_items)?;
+
+    if session.record().state == WorkflowState::TranscriptionFailed {
+        session
+            .transition(WorkflowState::AwaitingOperator, unix_millis_now()?)
+            .context("failed to publish awaiting_operator for transcription continuation")?;
+    }
+
+    let plan = select_resume_plan(session.record(), &committed, &work_items, &settings)?;
+    if !plan.previously_prepared {
+        session
+            .record_transcription_resume_prepared(unix_millis_now()?, plan.sequence)
+            .with_context(|| {
+                format!(
+                    "failed to record prepared transcription resume sequence {}",
+                    plan.sequence
+                )
+            })?;
+    }
+
+    let retained_count = usize::try_from(plan.sequence - 1)
+        .map_err(|_| anyhow!("resume sequence does not fit in memory"))?;
+    replace_results_prefix(&results_path, &committed[..retained_count])?;
+    let retained = committed[..retained_count].to_vec();
+    let transcript_path = session_directory.join(PARTIAL_TRANSCRIPT_FILE_NAME);
+    rebuild_partial_transcript(&session_directory, &transcript_path, &retained)?;
+    session
+        .apply_transcription_resume(unix_millis_now()?, plan.sequence)
+        .with_context(|| {
+            format!(
+                "results were rewound to sequence {} but the applied resume state was not published",
+                plan.sequence
+            )
+        })?;
+
+    run_worker_attempt(
+        &mut session,
+        &session_directory,
+        &config_path,
+        &manifest_path,
+        &results_path,
+        &transcript_path,
+        &work_items,
+        plan.sequence,
+        &settings,
+        worker,
+        &lease,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_worker_attempt(
+    session: &mut SessionStore,
+    session_directory: &Path,
+    config_path: &Path,
+    manifest_path: &Path,
+    results_path: &Path,
+    transcript_path: &Path,
+    work_items: &[WorkItem],
+    attempted_start_sequence: u64,
+    settings: &OfflineTranscriptionConfig,
+    worker: &dyn WorkerProcess,
+    lease: &TranscriptionLease,
+) -> Result<()> {
+    let invocation = WorkerInvocation {
+        config_path,
+        session_directory,
+        manifest_path,
+        results_path,
+        transcript_path,
+        next_sequence: attempted_start_sequence,
+        settings,
+    };
+    match worker.run(&invocation, lease) {
+        Err(error) => record_worker_failure(
+            session,
+            results_path,
+            work_items,
+            attempted_start_sequence,
+            format!("launch_failure: {error:#}"),
+        ),
+        Ok(exit) if !exit.success => {
+            let diagnostic = match exit.code {
+                Some(code) => format!("non_zero_exit: status {code}"),
+                None => "signal_termination: worker terminated without an exit status".to_owned(),
+            };
+            record_worker_failure(
+                session,
+                results_path,
+                work_items,
+                attempted_start_sequence,
+                diagnostic,
+            )
+        }
+        Ok(_) => {
+            let committed = validate_and_repair_result_prefix(results_path, work_items)?;
+            if committed.len() != work_items.len() {
+                return record_worker_failure(
+                    session,
+                    results_path,
+                    work_items,
+                    attempted_start_sequence,
+                    format!(
+                        "incomplete_zero_exit: committed {} of {} work items",
+                        committed.len(),
+                        work_items.len()
+                    ),
+                );
+            }
+            rebuild_partial_transcript(session_directory, transcript_path, &committed)?;
+            publish_final_transcript(session_directory, transcript_path)?;
+            session
+                .publish_transcription_complete(unix_millis_now()?)
+                .context("final transcript was published but session completion state was not")?;
+            println!(
+                "Transcription completed for session {}; final transcript: {}.",
+                session.record().session_id,
+                session_directory.join(FINAL_TRANSCRIPT_PATH).display()
+            );
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResumePlan {
+    sequence: u64,
+    previously_prepared: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResumeCheckpoint {
+    Prepared(u64),
+    Applied(u64),
+}
+
+fn validate_transcription_continuation_entry(record: &SessionRecord) -> Result<()> {
+    if record.format != SESSION_FORMAT_VERSION
+        || record.files.work_items.is_none()
+        || record.files.results.is_none()
+        || !matches!(
+            record.state,
+            WorkflowState::AwaitingOperator | WorkflowState::TranscriptionFailed
+        )
+    {
+        bail!(
+            "continue <session> <config> requires a format-5 awaiting_operator or \
+             transcription_failed session with work_items and results; found format {} state {}",
+            record.format,
+            record.state.as_str()
+        );
+    }
+    if !record.failures.iter().any(|failure| {
+        failure.kind == "transcription_worker" && failure.state == WorkflowState::Transcribing
+    }) {
+        bail!("transcription continuation requires durable transcription-failure evidence");
+    }
+    Ok(())
+}
+
+fn record_worker_failure(
+    session: &mut SessionStore,
+    results_path: &Path,
+    work_items: &[WorkItem],
+    attempted_start_sequence: u64,
+    process_diagnostic: String,
+) -> Result<()> {
+    // The worker may have committed several more items before terminating.
+    // Re-read authority now rather than trusting its original start sequence.
+    let committed = validate_and_repair_result_prefix(results_path, work_items)
+        .context("failed to derive post-worker committed result prefix")?;
+    let next_uncommitted_sequence = u64::try_from(committed.len())
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| anyhow!("transcription result sequence overflow"))?;
+    let next_work_item_id = work_items
+        .get(committed.len())
+        .map_or("none", |item| item.id.as_str());
+    let message = format!(
+        "attempted_start_sequence={attempted_start_sequence}; \
+         next_uncommitted_sequence={next_uncommitted_sequence}; \
+         next_work_item_id={next_work_item_id}; process={process_diagnostic}"
+    );
+
+    session
+        .publish_transcription_failure(unix_millis_now()?, &message)
+        .context("failed to publish durable transcription failure")?;
+    if let Err(error) = session.transition(WorkflowState::AwaitingOperator, unix_millis_now()?) {
+        bail!(
+            "transcription worker failed ({process_diagnostic}); failure is durable but the session \
+             remains transcription_failed because awaiting_operator publication failed: {error}"
+        );
+    }
+    bail!("transcription worker failed ({process_diagnostic}); session is awaiting operator action")
+}
+
+fn select_resume_plan(
+    record: &SessionRecord,
+    committed: &[TranscriptionResult],
+    work_items: &[WorkItem],
+    settings: &OfflineTranscriptionConfig,
+) -> Result<ResumePlan> {
+    let current_next = u64::try_from(committed.len())
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| anyhow!("transcription result sequence overflow"))?;
+    let maximum_next = u64::try_from(work_items.len())
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| anyhow!("work-item sequence overflow"))?;
+
+    let plan = match latest_resume_checkpoint(record)? {
+        Some(ResumeCheckpoint::Prepared(sequence)) => ResumePlan {
+            sequence,
+            previously_prepared: true,
+        },
+        Some(ResumeCheckpoint::Applied(sequence)) if current_next == sequence => ResumePlan {
+            // No forward progress: repeat the same boundary, not another rewind.
+            sequence,
+            previously_prepared: false,
+        },
+        Some(ResumeCheckpoint::Applied(sequence)) if current_next < sequence => {
+            bail!(
+                "result authority ends at sequence {} before the previously applied resume \
+                 sequence {sequence}",
+                current_next.saturating_sub(1)
+            )
+        }
+        _ => ResumePlan {
+            sequence: calculate_resume_sequence(committed, settings.resume_rewind_seconds)?,
+            previously_prepared: false,
+        },
+    };
+
+    if plan.sequence == 0 || plan.sequence > current_next || plan.sequence > maximum_next {
+        bail!(
+            "prepared transcription resume sequence {} is incompatible with committed prefix \
+             ending at sequence {}",
+            plan.sequence,
+            current_next.saturating_sub(1)
+        );
+    }
+    Ok(plan)
+}
+
+fn latest_resume_checkpoint(record: &SessionRecord) -> Result<Option<ResumeCheckpoint>> {
+    for checkpoint in record.checkpoints.iter().rev() {
+        if let Some(value) = checkpoint.stage.strip_prefix(RESUME_PREPARED_PREFIX) {
+            return Ok(Some(ResumeCheckpoint::Prepared(parse_resume_sequence(
+                value,
+            )?)));
+        }
+        if let Some(value) = checkpoint.stage.strip_prefix(RESUME_APPLIED_PREFIX) {
+            return Ok(Some(ResumeCheckpoint::Applied(parse_resume_sequence(
+                value,
+            )?)));
+        }
+    }
+    Ok(None)
+}
+
+fn parse_resume_sequence(value: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|sequence| *sequence != 0)
+        .ok_or_else(|| anyhow!("invalid transcription resume checkpoint sequence {value:?}"))
+}
+
+fn calculate_resume_sequence(
+    committed: &[TranscriptionResult],
+    rewind_seconds: u64,
+) -> Result<u64> {
+    let current_next = u64::try_from(committed.len())
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| anyhow!("transcription result sequence overflow"))?;
+    if rewind_seconds == 0 || committed.is_empty() {
+        return Ok(current_next);
+    }
+
+    let committed_end = committed
+        .last()
+        .expect("non-empty committed prefix checked above")
+        .end_ms;
+    let boundary = committed_end.saturating_sub(rewind_seconds.saturating_mul(1_000));
+    Ok(committed
+        .iter()
+        .find(|result| result.start_ms < committed_end && result.end_ms > boundary)
+        .map_or(current_next, |result| result.sequence))
+}
+
+fn replace_results_prefix(path: &Path, results: &[TranscriptionResult]) -> Result<()> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| anyhow!("results path has no parent directory"))?;
+    let temporary_path = directory.join(RESULTS_RESUME_TEMP_FILE_NAME);
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&temporary_path)
+        .with_context(|| format!("failed to create {}", temporary_path.display()))?;
+    let mut writer = BufWriter::new(file);
+    for result in results {
+        serde_json::to_writer(&mut writer, result)?;
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    drop(writer);
+    fs::rename(&temporary_path, path)
+        .with_context(|| format!("failed to replace results authority {}", path.display()))?;
+    File::open(directory)?
+        .sync_all()
+        .context("failed to synchronise transcription directory")?;
+    Ok(())
+}
+
+fn publish_final_transcript(session_directory: &Path, partial_path: &Path) -> Result<()> {
+    let transcription_directory = session_directory.join(TRANSCRIPTION_DIRECTORY_NAME);
+    let final_path = session_directory.join(FINAL_TRANSCRIPT_PATH);
+    fs::rename(partial_path, &final_path).with_context(|| {
+        format!(
+            "failed to publish final transcript {}",
+            final_path.display()
+        )
+    })?;
+    File::open(&transcription_directory)?
+        .sync_all()
+        .context("failed to synchronise transcription directory")?;
+    File::open(session_directory)?
+        .sync_all()
+        .context("failed to synchronise session directory")?;
     Ok(())
 }
 
@@ -746,6 +1129,7 @@ mod tests {
 
     struct FakeWorker {
         exit: WorkerExit,
+        commit_all: bool,
         invocations: Mutex<Vec<ObservedInvocation>>,
     }
 
@@ -756,6 +1140,7 @@ mod tests {
                     success: true,
                     code: Some(0),
                 },
+                commit_all: true,
                 invocations: Mutex::new(Vec::new()),
             }
         }
@@ -766,6 +1151,18 @@ mod tests {
                     success: false,
                     code: Some(17),
                 },
+                commit_all: false,
+                invocations: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn signal_failure() -> Self {
+            Self {
+                exit: WorkerExit {
+                    success: false,
+                    code: None,
+                },
+                commit_all: false,
                 invocations: Mutex::new(Vec::new()),
             }
         }
@@ -784,7 +1181,48 @@ mod tests {
                 transcript_path: invocation.transcript_path.to_owned(),
                 hotwords: invocation.settings.hotwords.clone(),
             });
+            if self.commit_all {
+                commit_remaining_results(invocation, usize::MAX)?;
+            }
             Ok(self.exit)
+        }
+    }
+
+    struct LaunchFailureWorker;
+
+    impl WorkerProcess for LaunchFailureWorker {
+        fn run(
+            &self,
+            _invocation: &WorkerInvocation<'_>,
+            _lease: &TranscriptionLease,
+        ) -> Result<WorkerExit> {
+            bail!("injected worker launch failure")
+        }
+    }
+
+    struct ProgressThenFailureWorker {
+        count: usize,
+        invocations: Mutex<Vec<ObservedInvocation>>,
+    }
+
+    impl WorkerProcess for ProgressThenFailureWorker {
+        fn run(
+            &self,
+            invocation: &WorkerInvocation<'_>,
+            _lease: &TranscriptionLease,
+        ) -> Result<WorkerExit> {
+            self.invocations.lock().unwrap().push(ObservedInvocation {
+                next_sequence: invocation.next_sequence,
+                manifest_path: invocation.manifest_path.to_owned(),
+                results_path: invocation.results_path.to_owned(),
+                transcript_path: invocation.transcript_path.to_owned(),
+                hotwords: invocation.settings.hotwords.clone(),
+            });
+            commit_remaining_results(invocation, self.count)?;
+            Ok(WorkerExit {
+                success: false,
+                code: Some(23),
+            })
         }
     }
 
@@ -875,19 +1313,22 @@ mod tests {
 
         let session = SessionStore::load(&directory).unwrap();
         assert_eq!(session.record().format, SESSION_FORMAT_VERSION);
-        assert_eq!(session.record().state, WorkflowState::Transcribing);
+        assert_eq!(session.record().state, WorkflowState::Complete);
         assert_eq!(
             session.record().files.results.as_ref().unwrap().path,
             crate::artifacts::TRANSCRIPTION_RESULTS_PATH
         );
         assert_eq!(
-            fs::read(directory.join(crate::artifacts::TRANSCRIPTION_RESULTS_PATH)).unwrap(),
-            b""
+            validate_and_repair_result_prefix(
+                &directory.join(crate::artifacts::TRANSCRIPTION_RESULTS_PATH),
+                &[item.clone()]
+            )
+            .unwrap()
+            .len(),
+            1
         );
-        assert_eq!(
-            fs::read(directory.join(PARTIAL_TRANSCRIPT_FILE_NAME)).unwrap(),
-            b""
-        );
+        assert!(!directory.join(PARTIAL_TRANSCRIPT_FILE_NAME).exists());
+        assert!(directory.join(FINAL_TRANSCRIPT_PATH).is_file());
         let invocations = worker.invocations.lock().unwrap();
         assert_eq!(invocations.len(), 1);
         assert_eq!(invocations[0].next_sequence, item.sequence);
@@ -901,7 +1342,7 @@ mod tests {
     #[test]
     fn controlled_restart_repairs_tail_rebuilds_text_and_skips_prefix() {
         let (directory, config_path, item) = ready_session("restart");
-        run_with_worker(&directory, &config_path, &FakeWorker::successful()).unwrap();
+        start_transcribing_session(&directory);
         let result = complete_result(&item, "All conversation stays here.");
         let mut bytes = serde_json::to_vec(&result).unwrap();
         bytes.extend_from_slice(b"\n{\"format\":");
@@ -926,7 +1367,7 @@ mod tests {
             expected_json
         );
         assert_eq!(
-            fs::read_to_string(directory.join(PARTIAL_TRANSCRIPT_FILE_NAME)).unwrap(),
+            fs::read_to_string(directory.join(FINAL_TRANSCRIPT_PATH)).unwrap(),
             "[00:00:00] Alice: All conversation stays here.\n"
         );
         let invocations = worker.invocations.lock().unwrap();
@@ -974,7 +1415,7 @@ mod tests {
         assert!(second_worker.invocations.lock().unwrap().is_empty());
 
         release_sender.send(()).unwrap();
-        first.join().unwrap().unwrap();
+        assert!(first.join().unwrap().is_err());
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1042,7 +1483,7 @@ mod tests {
     #[test]
     fn malformed_interior_result_is_rejected_without_worker_launch() {
         let (directory, config_path, item) = ready_session("bad-interior");
-        run_with_worker(&directory, &config_path, &FakeWorker::successful()).unwrap();
+        start_transcribing_session(&directory);
         let result = complete_result(&item, "Committed");
         fs::write(
             directory.join(crate::artifacts::TRANSCRIPTION_RESULTS_PATH),
@@ -1152,7 +1593,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_failure_returns_error_and_leaves_transcribing() {
+    fn worker_failure_records_diagnostics_and_waits_for_operator() {
         let (directory, config_path, _) = ready_session("worker-failure");
         let worker = FakeWorker::failed();
 
@@ -1161,9 +1602,548 @@ mod tests {
         assert!(error.to_string().contains("status 17"));
         assert_eq!(worker.invocations.lock().unwrap().len(), 1);
         let session = SessionStore::load(&directory).unwrap();
-        assert_eq!(session.record().state, WorkflowState::Transcribing);
-        assert!(session.record().failures.is_empty());
+        assert_eq!(session.record().state, WorkflowState::AwaitingOperator);
+        assert_eq!(session.record().failures.len(), 1);
+        assert_eq!(session.record().failures[0].kind, "transcription_worker");
+        assert!(
+            session.record().failures[0]
+                .message
+                .contains("attempted_start_sequence=1")
+        );
+        assert!(
+            session.record().failures[0]
+                .message
+                .contains("next_uncommitted_sequence=1")
+        );
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failure_diagnostics_use_results_committed_after_worker_start() {
+        let (directory, config_path, items) = session_with_items(
+            "progress-failure",
+            &[
+                (0, 10_000),
+                (20_000, 30_000),
+                (40_000, 50_000),
+                (60_000, 70_000),
+            ],
+        );
+        let worker = ProgressThenFailureWorker {
+            count: 3,
+            invocations: Mutex::new(Vec::new()),
+        };
+
+        let error = run_with_worker(&directory, &config_path, &worker).unwrap_err();
+
+        assert!(error.to_string().contains("status 23"));
+        let session = SessionStore::load(&directory).unwrap();
+        assert_eq!(session.record().state, WorkflowState::AwaitingOperator);
+        let message = &session.record().failures.last().unwrap().message;
+        assert!(message.contains("attempted_start_sequence=1"));
+        assert!(message.contains("next_uncommitted_sequence=4"));
+        assert!(message.contains(&format!("next_work_item_id={}", items[3].id)));
+        assert_eq!(
+            validate_and_repair_result_prefix(
+                &directory.join(crate::artifacts::TRANSCRIPTION_RESULTS_PATH),
+                &items
+            )
+            .unwrap()
+            .len(),
+            3
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn launch_and_signal_failures_are_distinguished_durably() {
+        for (label, worker, expected) in [
+            (
+                "launch-failure",
+                &LaunchFailureWorker as &dyn WorkerProcess,
+                "launch_failure",
+            ),
+            (
+                "signal-failure",
+                &FakeWorker::signal_failure() as &dyn WorkerProcess,
+                "signal_termination",
+            ),
+        ] {
+            let (directory, config_path, _) = ready_session(label);
+
+            let error = run_with_worker(&directory, &config_path, worker).unwrap_err();
+
+            assert!(error.to_string().contains(expected));
+            let session = SessionStore::load(&directory).unwrap();
+            assert_eq!(session.record().state, WorkflowState::AwaitingOperator);
+            assert!(
+                session
+                    .record()
+                    .failures
+                    .last()
+                    .unwrap()
+                    .message
+                    .contains(expected)
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn stranded_transcription_failed_session_can_continue() {
+        let (directory, config_path, _) = ready_session("stranded-failed");
+        fail_record_write_after(&directory, 2);
+
+        let error = run_with_worker(&directory, &config_path, &FakeWorker::failed()).unwrap_err();
+
+        assert!(error.to_string().contains("remains transcription_failed"));
+        assert_eq!(
+            SessionStore::load(&directory).unwrap().record().state,
+            WorkflowState::TranscriptionFailed
+        );
+
+        continue_with_worker(&directory, &config_path, &FakeWorker::successful()).unwrap();
+
+        assert_eq!(
+            SessionStore::load(&directory).unwrap().record().state,
+            WorkflowState::Complete
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn zero_rewind_retains_complete_prefix_without_duplicate_authority() {
+        let (directory, config_path, items) = session_with_items(
+            "zero-rewind",
+            &[
+                (0, 10_000),
+                (20_000, 30_000),
+                (40_000, 50_000),
+                (60_000, 70_000),
+            ],
+        );
+        set_rewind_seconds(&config_path, 0);
+        let first = ProgressThenFailureWorker {
+            count: 3,
+            invocations: Mutex::new(Vec::new()),
+        };
+        run_with_worker(&directory, &config_path, &first).unwrap_err();
+        let resumed = FakeWorker::successful();
+
+        continue_with_worker(&directory, &config_path, &resumed).unwrap();
+
+        assert_eq!(resumed.invocations.lock().unwrap()[0].next_sequence, 4);
+        let results = validate_and_repair_result_prefix(
+            &directory.join(crate::artifacts::TRANSCRIPTION_RESULTS_PATH),
+            &items,
+        )
+        .unwrap();
+        assert_eq!(results.len(), 4);
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.sequence)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4]
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn positive_rewind_uses_earliest_intersection_and_contiguous_prefix() {
+        let items = [
+            test_item(1, 0, 10_000),
+            test_item(2, 170_000, 190_000),
+            test_item(3, 175_000, 400_000),
+            test_item(4, 290_000, 300_000),
+        ];
+        let results = items
+            .iter()
+            .map(|item| complete_result(item, "overlap"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(calculate_resume_sequence(&results, 120).unwrap(), 2);
+        assert_eq!(calculate_resume_sequence(&results, 0).unwrap(), 5);
+    }
+
+    #[test]
+    fn continuation_repairs_a_truncated_final_result_before_rewind() {
+        let (directory, config_path, items) = failed_session_with_results(
+            "continuation-tail",
+            &[(0, 10_000), (130_000, 140_000), (260_000, 270_000)],
+            2,
+        );
+        let results_path = directory.join(crate::artifacts::TRANSCRIPTION_RESULTS_PATH);
+        let mut bytes = fs::read(&results_path).unwrap();
+        bytes.extend_from_slice(b"{\"format\":");
+        fs::write(&results_path, bytes).unwrap();
+        let worker = FakeWorker::successful();
+
+        continue_with_worker(&directory, &config_path, &worker).unwrap();
+
+        assert_eq!(worker.invocations.lock().unwrap()[0].next_sequence, 2);
+        assert_eq!(
+            validate_and_repair_result_prefix(&results_path, &items)
+                .unwrap()
+                .len(),
+            3
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn prepared_checkpoint_is_reapplied_without_recalculating_rewind() {
+        let (directory, config_path, items) = failed_session_with_results(
+            "prepared-crash",
+            &[(0, 10_000), (20_000, 30_000), (40_000, 50_000)],
+            3,
+        );
+        SessionStore::load(&directory)
+            .unwrap()
+            .record_transcription_resume_prepared(3_000, 2)
+            .unwrap();
+        let worker = FakeWorker::successful();
+
+        continue_with_worker(&directory, &config_path, &worker).unwrap();
+
+        assert_eq!(worker.invocations.lock().unwrap()[0].next_sequence, 2);
+        assert_eq!(
+            validate_and_repair_result_prefix(
+                &directory.join(crate::artifacts::TRANSCRIPTION_RESULTS_PATH),
+                &items
+            )
+            .unwrap()
+            .len(),
+            3
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn result_replacement_before_applied_checkpoint_is_idempotent() {
+        let (directory, config_path, items) = failed_session_with_results(
+            "replacement-crash",
+            &[(0, 10_000), (20_000, 30_000), (40_000, 50_000)],
+            3,
+        );
+        let results_path = directory.join(crate::artifacts::TRANSCRIPTION_RESULTS_PATH);
+        let committed = validate_and_repair_result_prefix(&results_path, &items).unwrap();
+        SessionStore::load(&directory)
+            .unwrap()
+            .record_transcription_resume_prepared(3_000, 2)
+            .unwrap();
+        replace_results_prefix(&results_path, &committed[..1]).unwrap();
+        fs::write(
+            directory.join(PARTIAL_TRANSCRIPT_FILE_NAME),
+            b"stale text\n",
+        )
+        .unwrap();
+        let worker = FakeWorker::successful();
+
+        continue_with_worker(&directory, &config_path, &worker).unwrap();
+
+        assert_eq!(worker.invocations.lock().unwrap()[0].next_sequence, 2);
+        assert_eq!(
+            fs::read_to_string(directory.join(FINAL_TRANSCRIPT_PATH)).unwrap(),
+            "[00:00:00] Alice: Result 1\n\
+             [00:00:20] Alice: Result 2\n\
+             [00:00:40] Alice: Result 3\n"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn applied_checkpoint_failure_is_recoverable_without_second_rewind() {
+        let (directory, config_path, _) = failed_session_with_results(
+            "applied-publish-crash",
+            &[(0, 10_000), (130_000, 140_000), (260_000, 270_000)],
+            3,
+        );
+        // Prepared checkpoint succeeds; applied checkpoint/state publication fails.
+        fail_record_write_after(&directory, 1);
+
+        let error =
+            continue_with_worker(&directory, &config_path, &FakeWorker::successful()).unwrap_err();
+
+        assert!(error.to_string().contains("applied resume state"));
+        let stranded = SessionStore::load(&directory).unwrap();
+        assert_eq!(stranded.record().state, WorkflowState::AwaitingOperator);
+        assert!(
+            stranded
+                .record()
+                .checkpoints
+                .last()
+                .unwrap()
+                .stage
+                .starts_with(RESUME_PREPARED_PREFIX)
+        );
+        let worker = FakeWorker::successful();
+        continue_with_worker(&directory, &config_path, &worker).unwrap();
+        assert_eq!(worker.invocations.lock().unwrap()[0].next_sequence, 3);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn repeated_failure_without_progress_reuses_attempt_boundary() {
+        let (directory, config_path, _) =
+            failed_session_with_results("no-progress", &[(0, 10_000), (130_000, 140_000)], 2);
+        let first = FakeWorker::failed();
+        continue_with_worker(&directory, &config_path, &first).unwrap_err();
+        let second = FakeWorker::failed();
+
+        continue_with_worker(&directory, &config_path, &second).unwrap_err();
+
+        assert_eq!(first.invocations.lock().unwrap()[0].next_sequence, 2);
+        assert_eq!(second.invocations.lock().unwrap()[0].next_sequence, 2);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn new_progress_allows_one_new_rewind_calculation() {
+        let (directory, config_path, _) = failed_session_with_results(
+            "new-progress",
+            &[
+                (0, 10_000),
+                (130_000, 140_000),
+                (260_000, 270_000),
+                (390_000, 400_000),
+            ],
+            2,
+        );
+        let progressing = ProgressThenFailureWorker {
+            count: 2,
+            invocations: Mutex::new(Vec::new()),
+        };
+        continue_with_worker(&directory, &config_path, &progressing).unwrap_err();
+        let next = FakeWorker::failed();
+
+        continue_with_worker(&directory, &config_path, &next).unwrap_err();
+
+        assert_eq!(progressing.invocations.lock().unwrap()[0].next_sequence, 2);
+        assert_eq!(next.invocations.lock().unwrap()[0].next_sequence, 3);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn transcription_continue_rejects_recording_format_without_mutation() {
+        let (directory, config_path, _) = ready_session("wrong-continue-route");
+        let before = fs::read(directory.join("session.json")).unwrap();
+
+        let error =
+            continue_with_worker(&directory, &config_path, &FakeWorker::successful()).unwrap_err();
+
+        assert!(error.to_string().contains("requires a format-5"));
+        assert_eq!(fs::read(directory.join("session.json")).unwrap(), before);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recording_continue_rejects_format_five_without_mutation() {
+        let (directory, _, _) =
+            failed_session_with_results("wrong-recording-route", &[(0, 10_000)], 0);
+        let before = fs::read(directory.join("session.json")).unwrap();
+
+        let error = crate::continuation::run(&directory).unwrap_err();
+
+        assert!(error.to_string().contains("format-3 or format-4"));
+        assert_eq!(fs::read(directory.join("session.json")).unwrap(), before);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn transcription_continue_rejects_transcribing_state() {
+        let (directory, config_path, _) = ready_session("transcribing-is-transcribe-only");
+        start_transcribing_session(&directory);
+        SessionStore::load(&directory)
+            .unwrap()
+            .record_failure(2_400, "transcription_worker", "historical test evidence")
+            .unwrap();
+        let before = fs::read(directory.join("session.json")).unwrap();
+
+        let error =
+            continue_with_worker(&directory, &config_path, &FakeWorker::successful()).unwrap_err();
+
+        assert!(error.to_string().contains("awaiting_operator or"));
+        assert_eq!(fs::read(directory.join("session.json")).unwrap(), before);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn partial_transcript_reconstruction_is_deterministic() {
+        let directory = test_directory("deterministic-text");
+        let path = directory.join(PARTIAL_TRANSCRIPT_FILE_NAME);
+        let results = [
+            complete_result(&test_item(1, 0, 10_000), "First"),
+            complete_result(&test_item(2, 65_000, 70_000), "Second"),
+        ];
+
+        rebuild_partial_transcript(&directory, &path, &results).unwrap();
+        let first = fs::read(&path).unwrap();
+        fs::write(&path, b"stale\n").unwrap();
+        rebuild_partial_transcript(&directory, &path, &results).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), first);
+        assert_eq!(
+            String::from_utf8(first).unwrap(),
+            "[00:00:00] Alice: First\n[00:01:05] Alice: Second\n"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn completion_state_failure_is_recoverable_by_explicit_transcribe_retry() {
+        let (directory, config_path, item) = ready_session("completion-state-failure");
+        // Transcription-start publication succeeds; completion publication fails.
+        fail_record_write_after(&directory, 1);
+
+        let error =
+            run_with_worker(&directory, &config_path, &FakeWorker::successful()).unwrap_err();
+
+        assert!(error.to_string().contains("completion state"));
+        assert_eq!(
+            SessionStore::load(&directory).unwrap().record().state,
+            WorkflowState::Transcribing
+        );
+        assert!(directory.join(FINAL_TRANSCRIPT_PATH).is_file());
+
+        run_with_worker(&directory, &config_path, &FakeWorker::successful()).unwrap();
+
+        let session = SessionStore::load(&directory).unwrap();
+        assert_eq!(session.record().state, WorkflowState::Complete);
+        assert_eq!(
+            validate_and_repair_result_prefix(
+                &directory.join(crate::artifacts::TRANSCRIPTION_RESULTS_PATH),
+                &[item]
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn start_transcribing_session(directory: &Path) {
+        prepare_empty_results(directory).unwrap();
+        SessionStore::load(directory)
+            .unwrap()
+            .publish_transcription_start(2_300)
+            .unwrap();
+    }
+
+    fn commit_remaining_results(invocation: &WorkerInvocation<'_>, maximum: usize) -> Result<()> {
+        let manifest = fs::read_to_string(invocation.manifest_path)?;
+        let items = manifest
+            .lines()
+            .map(serde_json::from_str::<WorkItem>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut results = OpenOptions::new()
+            .append(true)
+            .open(invocation.results_path)?;
+        let mut transcript = OpenOptions::new()
+            .append(true)
+            .open(invocation.transcript_path)?;
+        for item in items
+            .iter()
+            .filter(|item| item.sequence >= invocation.next_sequence)
+            .take(maximum)
+        {
+            let result = complete_result(item, &format!("Result {}", item.sequence));
+            serde_json::to_writer(&mut results, &result)?;
+            results.write_all(b"\n")?;
+            transcript.write_all(transcript_line(&result).as_bytes())?;
+        }
+        results.sync_all()?;
+        transcript.sync_all()?;
+        Ok(())
+    }
+
+    fn session_with_items(label: &str, ranges: &[(u64, u64)]) -> (PathBuf, PathBuf, Vec<WorkItem>) {
+        let (directory, config_path, _) = ready_session(label);
+        let items = ranges
+            .iter()
+            .enumerate()
+            .map(|(index, (start_ms, end_ms))| {
+                test_item(u64::try_from(index).unwrap() + 1, *start_ms, *end_ms)
+            })
+            .collect::<Vec<_>>();
+        write_work_items_and_track_duration(&directory, &items);
+        (directory, config_path, items)
+    }
+
+    fn failed_session_with_results(
+        label: &str,
+        ranges: &[(u64, u64)],
+        committed_count: usize,
+    ) -> (PathBuf, PathBuf, Vec<WorkItem>) {
+        let (directory, config_path, items) = session_with_items(label, ranges);
+        start_transcribing_session(&directory);
+        let results = items
+            .iter()
+            .take(committed_count)
+            .map(|item| complete_result(item, &format!("Result {}", item.sequence)))
+            .collect::<Vec<_>>();
+        replace_results_prefix(
+            &directory.join(crate::artifacts::TRANSCRIPTION_RESULTS_PATH),
+            &results,
+        )
+        .unwrap();
+        rebuild_partial_transcript(
+            &directory,
+            &directory.join(PARTIAL_TRANSCRIPT_FILE_NAME),
+            &results,
+        )
+        .unwrap();
+        let mut session = SessionStore::load(&directory).unwrap();
+        session
+            .publish_transcription_failure(
+                2_400,
+                "attempted_start_sequence=1; next_uncommitted_sequence=1; \
+                 next_work_item_id=test; process=test_failure",
+            )
+            .unwrap();
+        session
+            .transition(WorkflowState::AwaitingOperator, 2_500)
+            .unwrap();
+        (directory, config_path, items)
+    }
+
+    fn write_work_items_and_track_duration(directory: &Path, items: &[WorkItem]) {
+        let body = items
+            .iter()
+            .map(|item| serde_json::to_string(item).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(directory.join(WORK_ITEM_MANIFEST_PATH), body).unwrap();
+        let maximum_end_ms = items.iter().map(|item| item.end_ms).max().unwrap_or(1);
+        TrackManifest::new(
+            "session-transcription".to_owned(),
+            vec![TrackDescription::new(
+                11,
+                "Alice".to_owned(),
+                "player".to_owned(),
+                None,
+                "tracks/user-11.flac".to_owned(),
+                TrackState::Complete,
+                maximum_end_ms.saturating_mul(48),
+                vec![100],
+                None,
+            )],
+        )
+        .write(directory)
+        .unwrap();
+    }
+
+    fn set_rewind_seconds(config_path: &Path, seconds: u64) {
+        let config = fs::read_to_string(config_path).unwrap();
+        fs::write(
+            config_path,
+            config.replace(
+                "resume_rewind_seconds = 120",
+                &format!("resume_rewind_seconds = {seconds}"),
+            ),
+        )
+        .unwrap();
     }
 
     fn ready_session(label: &str) -> (PathBuf, PathBuf, WorkItem) {

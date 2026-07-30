@@ -76,6 +76,7 @@ enum Command {
     },
     Continue {
         session_directory: PathBuf,
+        config_path: Option<PathBuf>,
     },
     BuildWorkItems {
         session_directory: PathBuf,
@@ -267,8 +268,16 @@ async fn main() -> anyhow::Result<()> {
         Command::RecoverWav { session_directory } => {
             return recover::recover_wav(&session_directory);
         }
-        Command::Continue { session_directory } => {
-            return continuation::run(&session_directory);
+        Command::Continue {
+            session_directory,
+            config_path,
+        } => {
+            return match config_path {
+                Some(config_path) => {
+                    transcription::continue_after_failure(&session_directory, &config_path)
+                }
+                None => continuation::run(&session_directory),
+            };
         }
         Command::BuildWorkItems {
             session_directory,
@@ -462,8 +471,12 @@ fn parse_command_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Res
                 Ok(Command::RecoverWav { session_directory })
             }
             Some("continue") => {
+                let config_path = args.next().map(PathBuf::from);
                 require_no_extra_args(&mut args)?;
-                Ok(Command::Continue { session_directory })
+                Ok(Command::Continue {
+                    session_directory,
+                    config_path,
+                })
             }
             Some("build-work-items") => {
                 let config_path = args
@@ -647,10 +660,53 @@ mod tests {
             .into_iter(),
         )
         .unwrap();
-        let Command::Continue { session_directory } = command else {
+        let Command::Continue {
+            session_directory,
+            config_path,
+        } = command
+        else {
             panic!("expected continue command");
         };
         assert_eq!(session_directory, Path::new("recordings/session-123"));
+        assert_eq!(config_path, None);
+    }
+
+    #[test]
+    fn transcription_continue_selects_session_and_config_paths() {
+        let command = parse_command_args(
+            [
+                OsString::from("continue"),
+                OsString::from("recordings/session-123"),
+                OsString::from("echoscribe.toml"),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        let Command::Continue {
+            session_directory,
+            config_path,
+        } = command
+        else {
+            panic!("expected continue command");
+        };
+        assert_eq!(session_directory, Path::new("recordings/session-123"));
+        assert_eq!(config_path.as_deref(), Some(Path::new("echoscribe.toml")));
+    }
+
+    #[test]
+    fn continue_rejects_more_than_session_and_optional_config() {
+        let error = parse_command_args(
+            [
+                OsString::from("continue"),
+                OsString::from("recordings/session-123"),
+                OsString::from("echoscribe.toml"),
+                OsString::from("unexpected"),
+            ]
+            .into_iter(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unexpected argument"));
     }
 
     #[test]

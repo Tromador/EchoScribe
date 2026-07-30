@@ -15,6 +15,7 @@ pub(crate) const WORK_ITEM_MANIFEST_PATH: &str = "transcription/work-items.jsonl
 pub(crate) const TRANSCRIPTION_RESULTS_FILE_NAME: &str = "results.jsonl";
 pub(crate) const TRANSCRIPTION_RESULTS_PATH: &str = "transcription/results.jsonl";
 pub(crate) const PARTIAL_TRANSCRIPT_FILE_NAME: &str = "transcript.partial.txt";
+pub(crate) const FINAL_TRANSCRIPT_PATH: &str = "transcription/transcript.txt";
 
 pub(crate) const PARTICIPANT_SNAPSHOT_FORMAT_VERSION: u16 = 1;
 pub(crate) const TRACK_MANIFEST_FORMAT_VERSION: u16 = 1;

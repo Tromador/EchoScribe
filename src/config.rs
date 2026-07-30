@@ -98,6 +98,7 @@ pub(crate) struct OfflineTranscriptionConfig {
     pub(crate) device: String,
     pub(crate) compute_type: String,
     pub(crate) beam_size: u32,
+    pub(crate) resume_rewind_seconds: u64,
     pub(crate) hotwords: Vec<String>,
     pub(crate) vocabulary_warning: Option<String>,
 }
@@ -138,6 +139,7 @@ impl OfflineTranscriptionConfig {
             device: file.transcription.device,
             compute_type: file.transcription.compute_type,
             beam_size: file.transcription.beam_size,
+            resume_rewind_seconds: file.transcription.resume_rewind_seconds,
             hotwords,
             vocabulary_warning,
         })
@@ -433,6 +435,7 @@ merge_gap_ms = 750
         let config = OfflineTranscriptionConfig::load(&config_path).unwrap();
 
         assert_eq!(config.model, "large-v3");
+        assert_eq!(config.resume_rewind_seconds, 120);
         assert_eq!(config.hotwords, ["Emperor Coaltongue", "Dragon Lance"]);
         assert_eq!(config.vocabulary_warning, None);
         assert!(!directory.join("participants.toml").exists());

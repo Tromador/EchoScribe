@@ -77,7 +77,7 @@ entry points around `cargo run --release` and introduce no workflow authority.
 | `transcription/work-items.jsonl` | post-recording | derived processing plan | yes | yes |
 | `transcription/results.jsonl` | transcription | structured transcript authority | yes | by retranscription |
 | `transcript.partial.txt` | transcription | human view, incomplete | temporary | yes |
-| `transcript.txt` | successful completion | human product | yes | yes |
+| `transcription/transcript.txt` | successful completion | human product | yes | yes |
 
 The journals and session state are not deleted merely because routine tracks and transcripts exist.
 
@@ -535,10 +535,11 @@ manual lock deletion, or elapsed-time guesses.
 `worker.lock` is an incidental coordination artefact and is not added to the
 session artefact manifest.
 
-All other entry states are rejected. Successful or failed Slice 8 worker
-completion leaves the state as `transcribing`; failure-state publication,
-rewind, final transcript publication, and transition to `complete` belong to
-Slice 9.
+All other `transcribe` entry states are rejected. Slice 9 records a known
+worker failure atomically with `transcribing -> transcription_failed`, then
+publishes `transcription_failed -> awaiting_operator`. If that second
+replacement fails, explicit transcription continuation also accepts the
+stranded `transcription_failed` state.
 
 The repository-owned worker is
 `workers/faster-whisper/transcription_worker.py`. It is subordinate to the
@@ -675,12 +676,55 @@ FLAC and continues to block while unresolved.
 
 For transcription failure it:
 
-1. finds the last globally contiguous committed result;
-2. subtracts `resume_rewind_seconds`;
-3. invalidates or supersedes results intersecting the rewind window;
-4. rebuilds the partial text from retained valid JSONL;
-5. launches one new Python worker;
-6. resumes global chronological processing.
+1. acquires the exclusive transcription lease;
+2. validates and repairs only a truncated final JSONL record;
+3. reuses an unapplied prepared resume target, if one exists;
+4. otherwise finds the last globally contiguous committed result and calculates
+   the configured rewind target;
+5. durably records `transcription_resume_prepared_<sequence>`;
+6. atomically replaces and synchronises results with the exact retained prefix;
+7. rebuilds and synchronises the partial text from that prefix;
+8. atomically records `transcription_resume_applied_<sequence>` while
+   transitioning `awaiting_operator -> transcribing`;
+9. launches one new Python worker in global chronological order.
+
+The command forms are:
+
+```text
+continue <session>
+continue <session> <config>
+```
+
+The form without configuration is recording recovery only and requires a
+format-3 or format-4 `awaiting_operator` session without a results description.
+The configured form is transcription continuation only and requires a format-5
+session with work and result descriptions, durable transcription-failure
+evidence, and state `awaiting_operator` or `transcription_failed`. Arguments and
+validated session structure select the route; state alone does not.
+
+For positive rewind, `committed_end` is the final contiguous result's `end_ms`
+and the saturated boundary is `committed_end - resume_rewind_seconds * 1000`.
+The discarded suffix begins at the earliest committed result for which
+`start_ms < committed_end` and `end_ms > boundary`. Zero rewind retains the
+entire prefix. If no results are committed, sequence 1 is the target.
+
+Prepared and applied checkpoints make replacement idempotent across crashes. A
+retry reuses an unapplied target. After an applied attempt, failure without
+forward progress reuses that attempt boundary; new committed results permit a
+later continuation to calculate one new rewind from the new authority.
+
+After worker termination, failure diagnostics are derived from the authority
+then present, not from the originally supplied start sequence. Launch failure,
+non-zero exit, and signal termination are distinguished. Failure evidence
+records the attempted start sequence, next uncommitted sequence and work-item
+ID, and process diagnostic.
+
+After a zero worker exit, Rust verifies that every work item has exactly one
+matching result, deterministically rebuilds the partial transcript, atomically
+renames it to `transcription/transcript.txt`, synchronises the directory,
+records completion, and transitions `transcribing -> complete` while retaining
+the lease. A transcript left by a failed session update is derived output and
+is safely replaced by a later explicit retry.
 
 No automatic retry occurs.
 
