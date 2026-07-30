@@ -471,6 +471,13 @@ Transcribe one session through one Python process and one faster-whisper model l
 - controlled restart accepts only a matching contiguous result prefix,
   discards only a truncated final record, rebuilds the partial text from that
   prefix, and resumes at the next item without rewind;
+- acquire one exclusive per-session transcription lease before prefix repair or
+  text reconstruction and retain it for the complete worker lifetime;
+- pass a duplicated locked handle into the worker so an orphaned Python child
+  continues to exclude another invocation, while operating-system release
+  after the final handle closes provides stale/crash recovery;
+- reject a physical source which ends more than 47 frames before the requested
+  48 kHz range end, and commit no output for that item;
 - successful completion leaves the session in `transcribing`;
 - Python exits non-zero on failure;
 - no automatic retry.
@@ -502,6 +509,12 @@ Test:
 - worker non-zero exit on item failure;
 - retained prior results;
 - no duplicate output after controlled restart;
+- a blocking worker prevents a second invocation from repairing outputs or
+  launching another worker;
+- the lease remains held by a duplicated worker handle after the parent handle
+  closes and becomes acquirable after the final handle closes;
+- a final range overrun of at most 47 frames is accepted;
+- a materially truncated source commits neither a JSONL result nor a text line;
 - missing mapping metadata does not block transcription;
 - all captured conversation categories are preserved.
 

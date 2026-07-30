@@ -8,10 +8,10 @@ use std::{
     collections::HashMap,
     env,
     ffi::OsString,
-    fs::{self, File, OpenOptions},
+    fs::{self, File, OpenOptions, TryLockError},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -36,6 +36,7 @@ use crate::{
 
 const RESULTS_TEMP_FILE_NAME: &str = ".results.jsonl.tmp";
 const PARTIAL_TRANSCRIPT_TEMP_FILE_NAME: &str = ".transcript.partial.txt.tmp";
+const TRANSCRIPTION_LEASE_FILE_NAME: &str = "worker.lock";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -68,7 +69,11 @@ struct WorkerInvocation<'a> {
 }
 
 trait WorkerProcess {
-    fn run(&self, invocation: &WorkerInvocation<'_>) -> Result<WorkerExit>;
+    fn run(
+        &self,
+        invocation: &WorkerInvocation<'_>,
+        lease: &TranscriptionLease,
+    ) -> Result<WorkerExit>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,7 +85,11 @@ struct WorkerExit {
 struct SystemWorker;
 
 impl WorkerProcess for SystemWorker {
-    fn run(&self, invocation: &WorkerInvocation<'_>) -> Result<WorkerExit> {
+    fn run(
+        &self,
+        invocation: &WorkerInvocation<'_>,
+        lease: &TranscriptionLease,
+    ) -> Result<WorkerExit> {
         let worker_path = worker_script_path();
         if !worker_path.is_file() {
             bail!(
@@ -92,6 +101,9 @@ impl WorkerProcess for SystemWorker {
         let interpreter = python_interpreter()?;
         let mut command = Command::new(&interpreter);
         command
+            // The worker never reads stdin. Giving it a duplicate of the
+            // locked handle makes the OS retain the lease if Rust is killed.
+            .stdin(Stdio::from(lease.inherited_handle()?))
             .arg(&worker_path)
             .arg("--config")
             .arg(invocation.config_path)
@@ -129,6 +141,46 @@ impl WorkerProcess for SystemWorker {
         Ok(WorkerExit {
             success: status.success(),
             code: status.code(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct TranscriptionLease {
+    file: File,
+    path: PathBuf,
+}
+
+impl TranscriptionLease {
+    fn acquire(session_directory: &Path) -> Result<Self> {
+        let path = session_directory
+            .join(TRANSCRIPTION_DIRECTORY_NAME)
+            .join(TRANSCRIPTION_LEASE_FILE_NAME);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .with_context(|| format!("failed to open transcription lease {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { file, path }),
+            Err(TryLockError::WouldBlock) => bail!(
+                "transcription is already active for session {}; lease {} is held",
+                session_directory.display(),
+                path.display()
+            ),
+            Err(TryLockError::Error(error)) => Err(error).with_context(|| {
+                format!("failed to acquire transcription lease {}", path.display())
+            }),
+        }
+    }
+
+    fn inherited_handle(&self) -> Result<File> {
+        self.file.try_clone().with_context(|| {
+            format!(
+                "failed to duplicate transcription lease {} for worker",
+                self.path.display()
+            )
         })
     }
 }
@@ -178,6 +230,9 @@ fn run_with_worker(
     );
     let tracks = validate_session_artifacts(&session_directory, session.record())?;
     let work_items = read_work_manifest(&manifest_path, session.record(), &tracks)?;
+    // From this point through worker exit, no other invocation may inspect and
+    // repair the same append-oriented authority.
+    let lease = TranscriptionLease::acquire(&session_directory)?;
 
     if session.record().state == WorkflowState::ReadyForTranscription {
         prepare_empty_results(&session_directory)?;
@@ -205,15 +260,18 @@ fn run_with_worker(
         .and_then(|value| value.checked_add(1))
         .ok_or_else(|| anyhow!("transcription result sequence overflow"))?;
 
-    let exit = worker.run(&WorkerInvocation {
-        config_path: &config_path,
-        session_directory: &session_directory,
-        manifest_path: &manifest_path,
-        results_path: &results_path,
-        transcript_path: &transcript_path,
-        next_sequence,
-        settings: &settings,
-    })?;
+    let exit = worker.run(
+        &WorkerInvocation {
+            config_path: &config_path,
+            session_directory: &session_directory,
+            manifest_path: &manifest_path,
+            results_path: &results_path,
+            transcript_path: &transcript_path,
+            next_sequence,
+            settings: &settings,
+        },
+        &lease,
+    )?;
     if !exit.success {
         match exit.code {
             Some(code) => bail!(
@@ -661,8 +719,9 @@ fn unix_millis_now() -> Result<u64> {
 mod tests {
     use std::{
         env, process,
-        sync::Mutex,
-        time::{SystemTime, UNIX_EPOCH},
+        sync::{Mutex, mpsc},
+        thread,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use super::*;
@@ -713,7 +772,11 @@ mod tests {
     }
 
     impl WorkerProcess for FakeWorker {
-        fn run(&self, invocation: &WorkerInvocation<'_>) -> Result<WorkerExit> {
+        fn run(
+            &self,
+            invocation: &WorkerInvocation<'_>,
+            _lease: &TranscriptionLease,
+        ) -> Result<WorkerExit> {
             self.invocations.lock().unwrap().push(ObservedInvocation {
                 next_sequence: invocation.next_sequence,
                 manifest_path: invocation.manifest_path.to_owned(),
@@ -722,6 +785,26 @@ mod tests {
                 hotwords: invocation.settings.hotwords.clone(),
             });
             Ok(self.exit)
+        }
+    }
+
+    struct BlockingWorker {
+        started: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl WorkerProcess for BlockingWorker {
+        fn run(
+            &self,
+            _invocation: &WorkerInvocation<'_>,
+            _lease: &TranscriptionLease,
+        ) -> Result<WorkerExit> {
+            self.started.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+            Ok(WorkerExit {
+                success: true,
+                code: Some(0),
+            })
         }
     }
 
@@ -849,6 +932,110 @@ mod tests {
         let invocations = worker.invocations.lock().unwrap();
         assert_eq!(invocations.len(), 1);
         assert_eq!(invocations[0].next_sequence, 2);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn active_worker_excludes_second_invocation_before_output_repair() {
+        let (directory, config_path, _) = ready_session("exclusive-lease");
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let first_directory = directory.clone();
+        let first_config = config_path.clone();
+        let first = thread::spawn(move || {
+            let worker = BlockingWorker {
+                started: started_sender,
+                release: Mutex::new(release_receiver),
+            };
+            run_with_worker(&first_directory, &first_config, &worker)
+        });
+        started_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first worker did not start");
+
+        let results_path = directory.join(crate::artifacts::TRANSCRIPTION_RESULTS_PATH);
+        let transcript_path = directory.join(PARTIAL_TRANSCRIPT_FILE_NAME);
+        fs::write(&results_path, b"{\"unfinished\":").unwrap();
+        fs::write(&transcript_path, b"must not be rebuilt\n").unwrap();
+        let second_worker = FakeWorker::successful();
+
+        let error = run_with_worker(&directory, &config_path, &second_worker).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("transcription is already active")
+        );
+        assert_eq!(fs::read(&results_path).unwrap(), b"{\"unfinished\":");
+        assert_eq!(
+            fs::read(&transcript_path).unwrap(),
+            b"must not be rebuilt\n"
+        );
+        assert!(second_worker.invocations.lock().unwrap().is_empty());
+
+        release_sender.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn duplicated_worker_handle_retains_lease_until_last_close() {
+        let (directory, _, _) = ready_session("inherited-lease");
+        let lease = TranscriptionLease::acquire(&directory).unwrap();
+        let inherited = lease.inherited_handle().unwrap();
+        drop(lease);
+
+        let error = TranscriptionLease::acquire(&directory).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("transcription is already active")
+        );
+
+        drop(inherited);
+        let recovered = TranscriptionLease::acquire(&directory).unwrap();
+        drop(recovered);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn inherited_handle_excludes_restart_for_orphan_child_lifetime() {
+        const CHILD_ENVIRONMENT: &str = "ECHOSCRIBE_TEST_LEASE_CHILD";
+        const TEST_NAME: &str =
+            "transcription::tests::inherited_handle_excludes_restart_for_orphan_child_lifetime";
+
+        if env::var_os(CHILD_ENVIRONMENT).is_some() {
+            thread::sleep(Duration::from_secs(30));
+            return;
+        }
+
+        let (directory, _, _) = ready_session("orphan-child-lease");
+        let lease = TranscriptionLease::acquire(&directory).unwrap();
+        let mut child = process::Command::new(env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(TEST_NAME)
+            .arg("--nocapture")
+            .env(CHILD_ENVIRONMENT, "1")
+            .stdin(Stdio::from(lease.inherited_handle().unwrap()))
+            .spawn()
+            .unwrap();
+        drop(lease);
+
+        let conflict = TranscriptionLease::acquire(&directory);
+        let child_status = child.try_wait().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        assert!(child_status.is_none(), "lease child exited unexpectedly");
+        let error = conflict.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("transcription is already active")
+        );
+
+        let recovered = TranscriptionLease::acquire(&directory).unwrap();
+        drop(recovered);
         fs::remove_dir_all(directory).unwrap();
     }
 

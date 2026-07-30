@@ -187,6 +187,49 @@ class TranscriptionWorkerTests(unittest.TestCase):
         self.assertEqual(observed["write"][1], 48_000)
         self.assertFalse(ranged_path.exists())
 
+    def test_materially_truncated_source_commits_no_output(self):
+        write_manifest(
+            self.manifest,
+            [make_item(1, 11, "Alice", 0, 21, None)],
+        )
+        model = FakeModel([["must not be committed"]])
+
+        class TruncatedSource:
+            samplerate = 48_000
+            channels = 1
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *unused):
+                return None
+
+            def __len__(self):
+                return 900
+
+            def seek(self, unused):
+                raise AssertionError("truncated source must fail before seeking")
+
+            def read(self, unused, **options):
+                raise AssertionError("truncated source must fail before reading")
+
+        fake_soundfile = SimpleNamespace(
+            SoundFile=lambda unused: TruncatedSource(),
+            write=lambda *unused, **options: self.fail(
+                "truncated source must not be materialised"
+            ),
+        )
+        with mock.patch.dict(sys.modules, {"soundfile": fake_soundfile}):
+            with self.assertRaisesRegex(ValueError, "108 frames shorter"):
+                worker.process(
+                    make_args(self),
+                    model_factory=lambda unused: model,
+                )
+
+        self.assertEqual(self.results.read_bytes(), b"")
+        self.assertEqual(self.transcript.read_bytes(), b"")
+        self.assertEqual(model.calls, [])
+
     def test_start_sequence_prevents_duplicate_output(self):
         items = [
             make_item(1, 11, "Alice", 0, 500, None),

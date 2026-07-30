@@ -163,6 +163,12 @@ The repository root is the Cargo application root. The subordinate worker is
 `workers/faster-whisper/transcription_worker.py`; it is not an independent
 workflow authority and must not modify `session.json`.
 
+Only one transcription invocation may own a session at a time. Exclusive
+ownership covers result-prefix repair, partial-transcript reconstruction, and
+the complete worker lifetime. It must remain effective while an orphaned worker
+process is still running and become recoverable after every owning process has
+terminated.
+
 The transcription design must not assume that completed whole-session files are the only possible source of transcription audio.
 
 ## 9. Transcription range generation
@@ -193,6 +199,12 @@ Range generation must be composable so that VAD can later:
 - supplement playout-derived activity.
 
 VAD is not required in the first implementation, but the architecture must never make it difficult to introduce.
+
+A transcription worker must not silently shorten a published work-item source
+range. Clamping the requested end to the physical end of a 48 kHz track is
+permitted only for the final millisecond conversion discrepancy of at most 47
+PCM frames. A larger shortfall fails the item before any result or transcript
+line is committed.
 
 ## 10. Transcription content and ordering
 

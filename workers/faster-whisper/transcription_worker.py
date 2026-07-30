@@ -12,6 +12,8 @@ from pathlib import Path
 
 WORK_ITEM_FORMAT = 1
 RESULT_FORMAT = 1
+SOURCE_SAMPLE_RATE = 48_000
+MAX_END_ROUNDING_FRAMES = 47
 WORK_ITEM_FIELDS = {
     "format",
     "id",
@@ -127,14 +129,21 @@ def extract_audio_range(source_path, start_ms, end_ms):
     try:
         with soundfile.SoundFile(source_path) as source:
             sample_rate = source.samplerate
-            if sample_rate != 48_000 or source.channels != 1:
+            if sample_rate != SOURCE_SAMPLE_RATE or source.channels != 1:
                 raise ValueError(
                     f"routine source {source_path} is not mono 48 kHz audio"
                 )
             start_frame = start_ms * sample_rate // 1_000
-            # Millisecond work ranges round their end upwards. Clamp only at
-            # physical EOF so a valid nonstandard final frame is not rejected.
-            end_frame = min((end_ms * sample_rate + 999) // 1_000, len(source))
+            requested_end_frame = (end_ms * sample_rate + 999) // 1_000
+            end_overrun = max(0, requested_end_frame - len(source))
+            if end_overrun > MAX_END_ROUNDING_FRAMES:
+                raise ValueError(
+                    f"source {source_path} is {end_overrun} frames shorter than "
+                    f"the requested range ending at {end_ms} ms"
+                )
+            # Work-item milliseconds may round the physical final sample
+            # upwards by 47 frames, but a larger shortfall is damaged input.
+            end_frame = min(requested_end_frame, len(source))
             if start_frame >= end_frame:
                 raise ValueError(
                     f"source range {start_ms}..{end_ms} ms is outside {source_path}"

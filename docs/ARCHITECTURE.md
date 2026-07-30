@@ -523,6 +523,18 @@ prefix beginning at sequence 1, truncates only an incomplete final record back
 to the last validated newline, rebuilds and synchronises
 `transcript.partial.txt`, and resumes at the next item without rewind.
 
+Rust acquires an exclusive per-session transcription lease before result-prefix
+repair or partial-transcript reconstruction and retains it for the complete
+worker lifetime. The lock is held through an operating-system file lock on
+`transcription/worker.lock`; the persistent filename is not evidence of current
+ownership. A duplicated locked handle is inherited by the Python worker so an
+orphaned child continues to exclude another invocation after its Rust parent
+terminates. The operating system releases the lease after the last owning
+Rust/Python handle closes, permitting controlled restart without PID files,
+manual lock deletion, or elapsed-time guesses.
+`worker.lock` is an incidental coordination artefact and is not added to the
+session artefact manifest.
+
 All other entry states are rejected. Successful or failed Slice 8 worker
 completion leaves the state as `transcribing`; failure-state publication,
 rewind, final transcript publication, and transition to `complete` belong to
@@ -548,6 +560,11 @@ The Python worker:
 4. writes the corresponding plain-text line;
 5. exits zero only when all required items complete;
 6. exits non-zero on persistent item or worker failure.
+
+For a 48 kHz source range, the worker calculates the requested end frame before
+considering physical EOF. It may clamp only an overrun of at most 47 frames,
+which covers the final millisecond conversion discrepancy. A larger shortfall
+fails the item before either JSONL or text output is committed.
 
 The initial boundary is file manifests plus process exit status.
 
