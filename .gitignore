@@ -2,7 +2,7 @@
 /participants.toml
 /vocabulary.txt
 /recordings/
-/songbird-recorder/target/
+/target/
 /docs/SLICE_0_RECONCILIATION.md
 __pycache__/
 *.pyc

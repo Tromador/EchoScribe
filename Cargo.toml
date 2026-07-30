@@ -1,5 +1,5 @@
 [package]
-name = "songbird-recorder"
+name = "echoscribe"
 version = "0.1.0"
 edition = "2024"
 

@@ -41,6 +41,7 @@ Derived audio work is downstream of the authoritative consumer and may not block
 
 ## 2. Approved technology baseline
 
+- Root Cargo application package and generated binary named `echoscribe`.
 - Rust application runtime.
 - Serenity for Discord gateway integration.
 - Songbird for Discord voice receive and decoded PCM.
@@ -53,6 +54,12 @@ Derived audio work is downstream of the authoritative consumer and may not block
 - JSON/JSONL for durable machine-readable session and transcription records.
 
 A change to these choices is a material course change.
+
+The repository root is the Cargo package root. Songbird is the Discord voice
+dependency and recording subsystem; it is not the package or application name.
+Cargo-generated binaries remain under `target/debug/` and `target/release/`.
+The root `echoscribe.ps1` and `echoscribe.sh` launchers are thin convenience
+entry points around `cargo run --release` and introduce no workflow authority.
 
 ## 3. Authoritative and derived artefacts
 
@@ -521,11 +528,17 @@ completion leaves the state as `transcribing`; failure-state publication,
 rewind, final transcript publication, and transition to `complete` belong to
 Slice 9.
 
-The repository-owned worker is `transcription_worker.py` at the EchoScribe
-repository root. It is an application component rather than part of the
-Songbird recording crate. Rust resolves it independently of the caller's
-working directory. The interpreter is selected from `ECHOSCRIBE_PYTHON` when
-set, otherwise `python` on Windows and `python3` elsewhere.
+The repository-owned worker is
+`workers/faster-whisper/transcription_worker.py`. It is subordinate to the
+Rust application, which remains the sole workflow and session-state authority.
+Rust resolves it from the compile-time Cargo application root independently of
+the caller's working directory.
+
+The interpreter is selected from `ECHOSCRIBE_PYTHON` when set. An empty
+explicit value is an error. Otherwise EchoScribe prefers
+`.venv/Scripts/python.exe` on Windows or `.venv/bin/python` on POSIX, resolved
+from the application root, before falling back to `python` or `python3`
+respectively.
 
 The Python worker:
 

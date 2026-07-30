@@ -617,6 +617,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "echoscribe"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "flac-codec",
+ "hound",
+ "opus2",
+ "serde",
+ "serde_json",
+ "serenity",
+ "songbird",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "ed25519"
 version = "2.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3224,22 +3240,6 @@ dependencies = [
  "typenum",
  "url",
  "uuid",
-]
-
-[[package]]
-name = "songbird-recorder"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "flac-codec",
- "hound",
- "opus2",
- "serde",
- "serde_json",
- "serenity",
- "songbird",
- "tokio",
- "toml",
 ]
 
 [[package]]

@@ -51,6 +51,18 @@ The current implementation differs from the approved architecture in important w
 
 Useful code should be reused where it fits. It must not be treated as approval of the current workflow.
 
+## Application repository layout
+
+EchoScribe is the root Cargo application package and generated binary. The
+package is named `echoscribe`; Songbird remains its voice dependency and
+recording subsystem rather than the application identity.
+
+Current Rust source lives under root `src/`. The subordinate faster-whisper
+component lives under `workers/faster-whisper/`. Cargo-generated debug and
+release binaries remain under root `target/`. Root PowerShell and POSIX
+launchers provide `cargo run --release` convenience only and preserve Rust as
+the sole workflow authority.
+
 ---
 
 ## Slice 0 — Reconciliation map
@@ -463,10 +475,12 @@ Transcribe one session through one Python process and one faster-whisper model l
 - Python exits non-zero on failure;
 - no automatic retry.
 
-The application worker is `transcription_worker.py` at the repository root,
-outside the Songbird recording crate. Rust resolves it independently of the
-caller's working directory and selects `ECHOSCRIBE_PYTHON`, `python` on
-Windows, or `python3` otherwise.
+The application worker is
+`workers/faster-whisper/transcription_worker.py`. Rust resolves it from the
+compile-time root Cargo manifest directory independently of the caller's
+working directory. It selects `ECHOSCRIBE_PYTHON` first, then the platform
+interpreter in the repository-root `.venv` when present, and finally `python`
+on Windows or `python3` elsewhere. An explicitly empty override is an error.
 
 The offline transcription configuration loader does not validate Discord
 credentials or IDs and does not read the configured participant file.

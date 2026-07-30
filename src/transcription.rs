@@ -599,18 +599,51 @@ fn transcript_line(result: &TranscriptionResult) -> String {
 }
 
 fn python_interpreter() -> Result<OsString> {
-    match env::var_os("ECHOSCRIBE_PYTHON") {
-        Some(value) if !value.is_empty() => Ok(value),
+    select_python_interpreter(
+        env::var_os("ECHOSCRIBE_PYTHON"),
+        application_root(),
+        cfg!(windows),
+    )
+}
+
+fn select_python_interpreter(
+    explicit: Option<OsString>,
+    application_root: &Path,
+    windows: bool,
+) -> Result<OsString> {
+    match explicit {
+        Some(value) if !value.is_empty() => return Ok(value),
         Some(_) => bail!("ECHOSCRIBE_PYTHON is set but empty"),
-        None if cfg!(windows) => Ok(OsString::from("python")),
-        None => Ok(OsString::from("python3")),
+        None => {}
+    }
+
+    let virtual_environment = if windows {
+        application_root
+            .join(".venv")
+            .join("Scripts")
+            .join("python.exe")
+    } else {
+        application_root.join(".venv").join("bin").join("python")
+    };
+    if virtual_environment.is_file() {
+        return Ok(virtual_environment.into_os_string());
+    }
+
+    if windows {
+        Ok(OsString::from("python"))
+    } else {
+        Ok(OsString::from("python3"))
     }
 }
 
-fn worker_script_path() -> PathBuf {
+fn application_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("songbird-recorder manifest has a repository parent")
+}
+
+fn worker_script_path() -> PathBuf {
+    application_root()
+        .join("workers")
+        .join("faster-whisper")
         .join("transcription_worker.py")
 }
 
@@ -690,6 +723,59 @@ mod tests {
             });
             Ok(self.exit)
         }
+    }
+
+    #[test]
+    fn python_interpreter_prefers_override_then_root_virtual_environment() {
+        let directory = test_directory("python-selection");
+        let explicit = OsString::from("chosen-python");
+        assert_eq!(
+            select_python_interpreter(Some(explicit.clone()), &directory, false).unwrap(),
+            explicit
+        );
+        assert!(
+            select_python_interpreter(Some(OsString::new()), &directory, false)
+                .unwrap_err()
+                .to_string()
+                .contains("set but empty")
+        );
+
+        assert_eq!(
+            select_python_interpreter(None, &directory, false).unwrap(),
+            OsString::from("python3")
+        );
+        assert_eq!(
+            select_python_interpreter(None, &directory, true).unwrap(),
+            OsString::from("python")
+        );
+
+        let posix_python = directory.join(".venv").join("bin").join("python");
+        fs::create_dir_all(posix_python.parent().unwrap()).unwrap();
+        fs::write(&posix_python, b"").unwrap();
+        assert_eq!(
+            select_python_interpreter(None, &directory, false).unwrap(),
+            posix_python.as_os_str()
+        );
+
+        let windows_python = directory.join(".venv").join("Scripts").join("python.exe");
+        fs::create_dir_all(windows_python.parent().unwrap()).unwrap();
+        fs::write(&windows_python, b"").unwrap();
+        assert_eq!(
+            select_python_interpreter(None, &directory, true).unwrap(),
+            windows_python.as_os_str()
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn worker_path_is_rooted_at_the_application_manifest() {
+        assert_eq!(
+            worker_script_path(),
+            application_root()
+                .join("workers")
+                .join("faster-whisper")
+                .join("transcription_worker.py")
+        );
     }
 
     #[test]

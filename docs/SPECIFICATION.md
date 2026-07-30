@@ -133,6 +133,7 @@ EchoScribe transcribes locally on Zen using faster-whisper and CTranslate2.
 
 The initial implementation uses:
 
+- one operator-facing Rust application and generated binary named `echoscribe`;
 - one Python worker process per transcription session;
 - one model load per worker process;
 - globally chronological work-item processing;
@@ -157,6 +158,10 @@ states are rejected.
 Slice 8 leaves successful and failed worker runs in `transcribing`. Durable
 transcription-failure state, rewind continuation, final transcript publication,
 and transition to `complete` belong to the later continuation stage.
+
+The repository root is the Cargo application root. The subordinate worker is
+`workers/faster-whisper/transcription_worker.py`; it is not an independent
+workflow authority and must not modify `session.json`.
 
 The transcription design must not assume that completed whole-session files are the only possible source of transcription audio.
 
@@ -455,6 +460,15 @@ The primary operating environment is Zen:
 Avoiding a long mandatory post-session audio-encoding phase is a product requirement.
 
 Mort is outside EchoScribe's deployment and processing scope.
+
+Cargo writes generated executables beneath `target/debug/` and
+`target/release/`, named `echoscribe` with the platform executable suffix.
+Root PowerShell and POSIX launchers are convenience entry points which invoke
+the release Cargo application and do not add another orchestration layer.
+
+`ECHOSCRIBE_PYTHON` is the explicit worker-interpreter override. Without it,
+EchoScribe prefers the platform interpreter inside the repository-root `.venv`
+and only then falls back to `python` on Windows or `python3` elsewhere.
 
 ## 19. Current non-goals
 
