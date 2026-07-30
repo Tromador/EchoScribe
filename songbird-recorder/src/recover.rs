@@ -78,6 +78,15 @@ pub(crate) struct RecoverySummary {
     pub(crate) truncated_playout_tail: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Timing and activity evidence from one decoded playout decision.
+pub(crate) struct ReplayActivity {
+    pub(crate) elapsed_nanos: u64,
+    pub(crate) tick: u64,
+    pub(crate) ssrc: u32,
+    pub(crate) decoded_samples: u32,
+}
+
 pub(crate) fn recover_wav(session_directory: &Path) -> Result<()> {
     decode_session(session_directory, OutputKind::Recovery)
 }
@@ -167,6 +176,104 @@ pub(crate) fn replay_session_files(
         &session_directory.join(&files.playout.path),
         observe_frame,
     )
+}
+
+/// Validate authoritative journals and expose playout activity without
+/// needlessly decoding Opus when the caller only needs timing and attribution.
+pub(crate) fn replay_activity_session_files(
+    session_directory: &Path,
+    files: &SessionFiles,
+    mut observe_activity: impl FnMut(ReplayActivity) -> Result<()>,
+) -> Result<RecoverySummary> {
+    let packets_path = session_directory.join(&files.packets.path);
+    let playout_path = session_directory.join(&files.playout.path);
+    let packet_index = build_packet_index(&packets_path)?;
+    let packet_file = File::open(&packets_path)
+        .with_context(|| format!("failed to reopen packet journal {}", packets_path.display()))?;
+    let mut packet_reader = BufReader::new(packet_file);
+    let playout_file = File::open(&playout_path)
+        .with_context(|| format!("failed to open playout journal {}", playout_path.display()))?;
+    let mut playout_reader = BufReader::new(playout_file);
+    let playout_format = playout::read_file_header(&mut playout_reader).with_context(|| {
+        format!(
+            "invalid playout journal header in {}",
+            playout_path.display()
+        )
+    })?;
+
+    let mut summary = RecoverySummary {
+        packet_records: packet_index.records,
+        truncated_packet_tail: packet_index.truncated_tail,
+        ..RecoverySummary::default()
+    };
+    let mut clock = ReplayClock::default();
+
+    loop {
+        let record =
+            match playout::read_record(&mut playout_reader, playout_format).with_context(|| {
+                format!(
+                    "invalid playout journal record in {}",
+                    playout_path.display()
+                )
+            })? {
+                ReadPlayoutRecord::Record(record) => record,
+                ReadPlayoutRecord::EndOfFile => break,
+                ReadPlayoutRecord::TruncatedTail => {
+                    summary.truncated_playout_tail = true;
+                    break;
+                }
+            };
+        summary.decisions += 1;
+
+        if record.decoded_samples == 0 {
+            summary.skipped_undecoded += 1;
+            continue;
+        }
+
+        let elapsed_nanos = match record.decision {
+            PlayoutDecision::Loss => {
+                summary.loss_decisions += 1;
+                clock.estimate(record.tick)
+            }
+            PlayoutDecision::Packet {
+                sequence,
+                timestamp,
+                opus_payload: opus_bounds,
+            } => {
+                summary.packet_decisions += 1;
+                let key = (record.ssrc, sequence, timestamp);
+                let offset = packet_index.offsets.get(&key).ok_or_else(|| {
+                    anyhow!(
+                        "playout tick {} selects missing RTP packet SSRC {}, sequence {}, timestamp {}",
+                        record.tick,
+                        record.ssrc,
+                        sequence,
+                        timestamp
+                    )
+                })?;
+                let packet = read_packet_at(&mut packet_reader, *offset, key)?;
+                // The work builder does not need PCM, but it must still reject
+                // a playout decision whose retained Opus bounds are invalid.
+                let _ = opus_payload(&packet, opus_bounds)?;
+                clock.observe(record.tick, packet.arrival_nanos_since_session_start);
+                packet.arrival_nanos_since_session_start
+            }
+        };
+
+        summary.decoded_frames += 1;
+        summary.decoded_samples = summary
+            .decoded_samples
+            .checked_add(u64::from(record.decoded_samples))
+            .ok_or_else(|| anyhow!("decoded sample count overflow"))?;
+        observe_activity(ReplayActivity {
+            elapsed_nanos,
+            tick: record.tick,
+            ssrc: record.ssrc,
+            decoded_samples: record.decoded_samples,
+        })?;
+    }
+
+    Ok(summary)
 }
 
 fn replay_paths(

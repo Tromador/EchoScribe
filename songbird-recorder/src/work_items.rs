@@ -1,0 +1,978 @@
+//! Post-recording playout ranges and retained transcription work items.
+//!
+//! Authoritative replay supplies activity and mapping evidence, while
+//! `tracks.json` supplies the observed speaker name and aligned source file.
+//! Participant role and character context always comes from the immutable
+//! session-local TOML snapshot.
+
+use std::{
+    collections::{HashMap, HashSet},
+    fs::{self, File, OpenOptions},
+    io::{BufWriter, Write},
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{Context, Result, anyhow, bail};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    artifacts::{
+        TRANSCRIPTION_DIRECTORY_NAME, WORK_ITEM_MANIFEST_FILE_NAME,
+        WORK_ITEM_MANIFEST_FORMAT_VERSION,
+    },
+    config::SegmentationConfig,
+    diagnostics::{SAMPLE_RATE, SAMPLES_PER_TICK},
+    participants::{ParticipantContext, ParticipantRole},
+    recover,
+    routine_recovery::MappingTimeline,
+    session::{SessionStore, WorkflowState},
+    track_manifest::{TrackDescription, TrackManifest, TrackState},
+};
+
+const WORK_ITEM_TEMP_FILE_NAME: &str = ".work-items.jsonl.tmp";
+const SAMPLES_PER_MILLISECOND: u64 = SAMPLE_RATE as u64 / 1_000;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkItem {
+    pub(crate) format: u16,
+    pub(crate) id: String,
+    pub(crate) session_id: String,
+    pub(crate) sequence: u64,
+    pub(crate) discord_user_id: String,
+    pub(crate) speaker: String,
+    pub(crate) role: String,
+    pub(crate) character: Option<String>,
+    pub(crate) start_ms: u64,
+    pub(crate) end_ms: u64,
+    pub(crate) source: String,
+    pub(crate) source_start_ms: u64,
+    pub(crate) source_end_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Candidate boundary shared with future VAD refinement implementations.
+pub(crate) struct CandidateRange {
+    pub(crate) discord_user_id: u64,
+    pub(crate) start_sample: u64,
+    pub(crate) end_sample: u64,
+    pub(crate) source_start_sample: u64,
+    pub(crate) source_end_sample: u64,
+}
+
+/// Composable boundary for later VAD adjustment, splitting, or rejection.
+pub(crate) trait RangeRefiner {
+    fn refine(&self, candidates: Vec<CandidateRange>) -> Result<Vec<CandidateRange>>;
+}
+
+struct NoopRefiner;
+
+impl RangeRefiner for NoopRefiner {
+    fn refine(&self, candidates: Vec<CandidateRange>) -> Result<Vec<CandidateRange>> {
+        Ok(candidates)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AttributedFrame {
+    discord_user_id: u64,
+    tick: u64,
+    samples: u64,
+}
+
+#[derive(Default)]
+struct UserAlignment {
+    next_tick: u64,
+    output_samples: u64,
+    ranges: Vec<CandidateRange>,
+}
+
+pub(crate) fn run(session_directory: &Path, config_path: &Path) -> Result<()> {
+    let merge_gap_ms = SegmentationConfig::load_merge_gap_ms(config_path)?;
+    run_with_refiner(
+        session_directory,
+        merge_gap_ms,
+        &NoopRefiner,
+        unix_millis_now()?,
+    )
+}
+
+fn run_with_refiner(
+    session_directory: &Path,
+    merge_gap_ms: u64,
+    refiner: &dyn RangeRefiner,
+    completed_at_unix_millis: u64,
+) -> Result<()> {
+    let mut session = SessionStore::load(session_directory).with_context(|| {
+        format!(
+            "failed to load workflow state from {}",
+            session_directory.display()
+        )
+    })?;
+    if session.record().state != WorkflowState::ReadyForTranscription {
+        bail!(
+            "build-work-items requires session state ready_for_transcription; found {}",
+            session.record().state.as_str()
+        );
+    }
+
+    let participants_path = session_directory.join(&session.record().files.participants.path);
+    let participants = ParticipantContext::load(&participants_path).with_context(|| {
+        format!(
+            "failed to validate participant snapshot {}",
+            participants_path.display()
+        )
+    })?;
+
+    let track_manifest_path = session_directory.join(&session.record().files.tracks.path);
+    let tracks = TrackManifest::read(&track_manifest_path).with_context(|| {
+        format!(
+            "failed to read track manifest {}",
+            track_manifest_path.display()
+        )
+    })?;
+    validate_tracks(
+        session_directory,
+        session.record().session_id.as_str(),
+        &tracks,
+    )?;
+
+    let timeline =
+        MappingTimeline::read(&session_directory.join(&session.record().files.events.path))?;
+    if !timeline.unresolved_ssrcs().is_empty() {
+        let mut unresolved = timeline
+            .unresolved_ssrcs()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        unresolved.sort_unstable();
+        bail!(
+            "cannot build work items while SSRC mapping evidence remains unresolved for {}",
+            comma_join(unresolved)
+        );
+    }
+
+    let mut attributed_frames = Vec::new();
+    let mut unattributed_ssrcs = HashSet::new();
+    let replay = recover::replay_activity_session_files(
+        session_directory,
+        &session.record().files,
+        |activity| {
+            match timeline.user_at(activity.ssrc, activity.elapsed_nanos) {
+                Some(discord_user_id) => attributed_frames.push(AttributedFrame {
+                    discord_user_id,
+                    tick: activity.tick,
+                    samples: u64::from(activity.decoded_samples),
+                }),
+                None => {
+                    unattributed_ssrcs.insert(activity.ssrc);
+                }
+            }
+            Ok(())
+        },
+    )
+    .context("authoritative packet/playout journal validation failed")?;
+    if replay.truncated_packet_tail || replay.truncated_playout_tail {
+        bail!("cannot build work items with a truncated authoritative journal tail");
+    }
+    if replay.skipped_undecoded > 0 {
+        bail!(
+            "cannot build work items: {} playout decisions lack decoded-sample evidence",
+            replay.skipped_undecoded
+        );
+    }
+    if !unattributed_ssrcs.is_empty() {
+        let mut ssrcs = unattributed_ssrcs.into_iter().collect::<Vec<_>>();
+        ssrcs.sort_unstable();
+        bail!(
+            "cannot build work items: decoded PCM cannot be attributed safely for SSRCs {}",
+            comma_join(ssrcs)
+        );
+    }
+
+    let candidates = build_candidate_ranges(attributed_frames, merge_gap_ms)?;
+    validate_source_alignment(&candidates, &tracks)?;
+    let refined = refiner.refine(candidates)?;
+    let items = materialise_work_items(
+        session.record().session_id.as_str(),
+        refined,
+        &tracks,
+        &participants,
+    )?;
+
+    write_manifest_atomically(session_directory, &items)?;
+    session
+        .publish_work_manifest(completed_at_unix_millis)
+        .context("work manifest was published but session.json could not record it")?;
+
+    println!(
+        "Published {} chronological work item(s) for session {}.",
+        items.len(),
+        session.record().session_id
+    );
+    Ok(())
+}
+
+fn validate_tracks(
+    session_directory: &Path,
+    session_id: &str,
+    manifest: &TrackManifest,
+) -> Result<()> {
+    if manifest.session_id != session_id {
+        bail!(
+            "track manifest session ID {:?} does not match session.json ID {:?}",
+            manifest.session_id,
+            session_id
+        );
+    }
+
+    let mut incomplete_users = Vec::new();
+    for track in &manifest.tracks {
+        if track.state != TrackState::Complete {
+            incomplete_users.push(track.discord_user_id.clone());
+            continue;
+        }
+        let path = session_directory.join(&track.path);
+        if !path
+            .metadata()
+            .with_context(|| format!("failed to inspect routine track {}", path.display()))?
+            .is_file()
+        {
+            bail!("routine track {} is not a regular file", path.display());
+        }
+    }
+    if !incomplete_users.is_empty() {
+        bail!(
+            "cannot build work items with incomplete tracks for Discord users {}",
+            incomplete_users.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn build_candidate_ranges(
+    frames: Vec<AttributedFrame>,
+    merge_gap_ms: u64,
+) -> Result<Vec<CandidateRange>> {
+    let merge_gap_samples = merge_gap_ms
+        .checked_mul(SAMPLES_PER_MILLISECOND)
+        .ok_or_else(|| anyhow!("segmentation.merge_gap_ms is too large"))?;
+    let mut users = HashMap::<u64, UserAlignment>::new();
+
+    // Replay order matches the live writer input order. Simulating its silence
+    // insertion keeps source offsets exact even after nonstandard frame sizes.
+    for frame in frames {
+        let alignment = users.entry(frame.discord_user_id).or_default();
+        if frame.tick < alignment.next_tick {
+            bail!(
+                "playout tick {} for Discord user {} follows tick {}",
+                frame.tick,
+                frame.discord_user_id,
+                alignment.next_tick - 1
+            );
+        }
+
+        let missing_ticks = frame.tick - alignment.next_tick;
+        let inserted_silence = missing_ticks
+            .checked_mul(SAMPLES_PER_TICK)
+            .ok_or_else(|| anyhow!("aligned source offset overflow"))?;
+        let source_start_sample = alignment
+            .output_samples
+            .checked_add(inserted_silence)
+            .ok_or_else(|| anyhow!("aligned source offset overflow"))?;
+        let source_end_sample = source_start_sample
+            .checked_add(frame.samples)
+            .ok_or_else(|| anyhow!("aligned source range overflow"))?;
+        let start_sample = frame
+            .tick
+            .checked_mul(SAMPLES_PER_TICK)
+            .ok_or_else(|| anyhow!("session range offset overflow"))?;
+        let end_sample = start_sample
+            .checked_add(frame.samples)
+            .ok_or_else(|| anyhow!("session range overflow"))?;
+
+        alignment.ranges.push(CandidateRange {
+            discord_user_id: frame.discord_user_id,
+            start_sample,
+            end_sample,
+            source_start_sample,
+            source_end_sample,
+        });
+        alignment.next_tick = frame
+            .tick
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("playout tick overflow"))?;
+        alignment.output_samples = source_end_sample;
+    }
+
+    let mut merged = Vec::new();
+    for (_, mut alignment) in users {
+        let mut current: Option<CandidateRange> = None;
+        for range in alignment.ranges.drain(..) {
+            match current.as_mut() {
+                Some(existing)
+                    if range.start_sample
+                        <= existing
+                            .end_sample
+                            .checked_add(merge_gap_samples)
+                            .unwrap_or(u64::MAX) =>
+                {
+                    existing.end_sample = existing.end_sample.max(range.end_sample);
+                    existing.source_end_sample =
+                        existing.source_end_sample.max(range.source_end_sample);
+                }
+                Some(_) => {
+                    merged.push(current.replace(range).expect("current range exists"));
+                }
+                None => current = Some(range),
+            }
+        }
+        if let Some(range) = current {
+            merged.push(range);
+        }
+    }
+    Ok(merged)
+}
+
+fn validate_source_alignment(ranges: &[CandidateRange], manifest: &TrackManifest) -> Result<()> {
+    let source_lengths = ranges.iter().fold(HashMap::new(), |mut lengths, range| {
+        lengths
+            .entry(range.discord_user_id)
+            .and_modify(|length: &mut u64| *length = (*length).max(range.source_end_sample))
+            .or_insert(range.source_end_sample);
+        lengths
+    });
+    let tracks = manifest
+        .tracks
+        .iter()
+        .map(|track| {
+            (
+                track
+                    .discord_user_id
+                    .parse::<u64>()
+                    .expect("validated tracks contain numeric Discord IDs"),
+                track,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    for (user_id, source_length) in &source_lengths {
+        let track = tracks.get(user_id).ok_or_else(|| {
+            anyhow!("playout activity for Discord user {user_id} has no routine track")
+        })?;
+        if *source_length != track.length_samples {
+            bail!(
+                "playout activity reconstructs {} aligned samples for Discord user {}, \
+                 but tracks.json records {}",
+                source_length,
+                user_id,
+                track.length_samples
+            );
+        }
+    }
+    let mut tracks_without_activity = tracks
+        .keys()
+        .filter(|user_id| !source_lengths.contains_key(user_id))
+        .copied()
+        .collect::<Vec<_>>();
+    tracks_without_activity.sort_unstable();
+    if !tracks_without_activity.is_empty() {
+        bail!(
+            "complete routine tracks have no attributable playout activity for Discord users {}",
+            comma_join(tracks_without_activity)
+        );
+    }
+    Ok(())
+}
+
+fn materialise_work_items(
+    session_id: &str,
+    mut ranges: Vec<CandidateRange>,
+    manifest: &TrackManifest,
+    participants: &ParticipantContext,
+) -> Result<Vec<WorkItem>> {
+    ranges.sort_unstable_by_key(|range| {
+        (
+            range.start_sample,
+            range.discord_user_id,
+            range.end_sample,
+            range.source_start_sample,
+        )
+    });
+    let tracks = manifest
+        .tracks
+        .iter()
+        .map(|track| {
+            (
+                track
+                    .discord_user_id
+                    .parse::<u64>()
+                    .expect("validated tracks contain numeric Discord IDs"),
+                track,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    ranges
+        .into_iter()
+        .enumerate()
+        .map(|(index, range)| {
+            let track = tracks.get(&range.discord_user_id).ok_or_else(|| {
+                anyhow!(
+                    "playout activity for Discord user {} has no routine track",
+                    range.discord_user_id
+                )
+            })?;
+            validate_range(&range, track)?;
+
+            let sequence = u64::try_from(index)
+                .ok()
+                .and_then(|value| value.checked_add(1))
+                .ok_or_else(|| anyhow!("work item sequence overflow"))?;
+            let participant = participants.get(range.discord_user_id);
+            let role = participant
+                .map(|value| value.role)
+                .unwrap_or(ParticipantRole::Player)
+                .as_str()
+                .to_owned();
+            let character = participant.and_then(|value| value.character.clone());
+            let item = WorkItem {
+                format: WORK_ITEM_MANIFEST_FORMAT_VERSION,
+                id: format!("{session_id}:{sequence:06}"),
+                session_id: session_id.to_owned(),
+                sequence,
+                discord_user_id: range.discord_user_id.to_string(),
+                speaker: track.display_name.clone(),
+                role,
+                character,
+                start_ms: samples_to_millis_floor(range.start_sample),
+                end_ms: samples_to_millis_ceil(range.end_sample)?,
+                source: track.path.clone(),
+                source_start_ms: samples_to_millis_floor(range.source_start_sample),
+                source_end_ms: samples_to_millis_ceil(range.source_end_sample)?,
+            };
+            validate_work_item(&item)?;
+            Ok(item)
+        })
+        .collect()
+}
+
+fn validate_range(range: &CandidateRange, track: &TrackDescription) -> Result<()> {
+    if range.start_sample >= range.end_sample
+        || range.source_start_sample >= range.source_end_sample
+    {
+        bail!(
+            "range refiner produced an empty or reversed range for Discord user {}",
+            range.discord_user_id
+        );
+    }
+    if range.source_end_sample > track.length_samples {
+        bail!(
+            "source range for Discord user {} ends at sample {}, beyond track length {}",
+            range.discord_user_id,
+            range.source_end_sample,
+            track.length_samples
+        );
+    }
+    Ok(())
+}
+
+fn validate_work_item(item: &WorkItem) -> Result<()> {
+    if item.format != WORK_ITEM_MANIFEST_FORMAT_VERSION
+        || item.sequence == 0
+        || item.id.trim().is_empty()
+        || item.session_id.trim().is_empty()
+        || item
+            .discord_user_id
+            .parse::<u64>()
+            .ok()
+            .filter(|id| *id != 0)
+            .is_none()
+        || item.speaker.trim().is_empty()
+        || !matches!(item.role.as_str(), "player" | "gm")
+        || item.start_ms >= item.end_ms
+        || item.source_start_ms >= item.source_end_ms
+    {
+        bail!("invalid transcription work item {}", item.id);
+    }
+    Ok(())
+}
+
+fn write_manifest_atomically(session_directory: &Path, items: &[WorkItem]) -> Result<()> {
+    let directory = session_directory.join(TRANSCRIPTION_DIRECTORY_NAME);
+    fs::create_dir_all(&directory).with_context(|| {
+        format!(
+            "failed to create transcription directory {}",
+            directory.display()
+        )
+    })?;
+    File::open(session_directory)?
+        .sync_all()
+        .context("failed to synchronise session directory")?;
+
+    let temporary_path = directory.join(WORK_ITEM_TEMP_FILE_NAME);
+    let final_path = directory.join(WORK_ITEM_MANIFEST_FILE_NAME);
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&temporary_path)
+        .with_context(|| format!("failed to create {}", temporary_path.display()))?;
+    let mut writer = BufWriter::new(file);
+    for item in items {
+        serde_json::to_writer(&mut writer, item)?;
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    drop(writer);
+
+    fs::rename(&temporary_path, &final_path)
+        .with_context(|| format!("failed to publish work manifest {}", final_path.display()))?;
+    File::open(&directory)?
+        .sync_all()
+        .context("failed to synchronise transcription directory")?;
+    Ok(())
+}
+
+fn samples_to_millis_floor(samples: u64) -> u64 {
+    samples / SAMPLES_PER_MILLISECOND
+}
+
+fn samples_to_millis_ceil(samples: u64) -> Result<u64> {
+    samples
+        .checked_add(SAMPLES_PER_MILLISECOND - 1)
+        .map(|value| value / SAMPLES_PER_MILLISECOND)
+        .ok_or_else(|| anyhow!("millisecond range conversion overflow"))
+}
+
+fn comma_join(values: impl IntoIterator<Item = impl ToString>) -> String {
+    values
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn unix_millis_now() -> Result<u64> {
+    Ok(u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock precedes Unix epoch")?
+            .as_millis(),
+    )
+    .map_err(|_| anyhow!("current Unix timestamp does not fit in u64"))?)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        env,
+        fs::File,
+        process,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::*;
+    use crate::{
+        artifacts::{
+            EVENT_JOURNAL_FILE_NAME, PACKET_JOURNAL_FILE_NAME, PLAYOUT_JOURNAL_FILE_NAME,
+            TRACK_DIRECTORY_NAME, WORK_ITEM_MANIFEST_PATH,
+        },
+        journal,
+        playout::{self, PlayoutDecision, PlayoutRecord},
+        session::{
+            NewSession, PREVIOUS_SESSION_FORMAT_VERSION, SessionEvent, SessionStore,
+            fail_record_write_after, write_event,
+        },
+        track_manifest::{TrackDescription, TrackManifest},
+    };
+
+    fn frame(user: u64, tick: u64) -> AttributedFrame {
+        AttributedFrame {
+            discord_user_id: user,
+            tick,
+            samples: SAMPLES_PER_TICK,
+        }
+    }
+
+    #[test]
+    fn nearby_same_user_runs_merge_and_long_gaps_do_not() {
+        let ranges =
+            build_candidate_ranges(vec![frame(11, 10), frame(11, 20), frame(11, 80)], 750).unwrap();
+
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].discord_user_id, 11);
+        assert_eq!(ranges[0].start_sample, 10 * SAMPLES_PER_TICK);
+        assert_eq!(ranges[0].end_sample, 21 * SAMPLES_PER_TICK);
+        assert_eq!(ranges[1].start_sample, 80 * SAMPLES_PER_TICK);
+    }
+
+    #[test]
+    fn one_frame_of_short_speech_is_retained() {
+        let ranges = build_candidate_ranges(vec![frame(11, 10)], 750).unwrap();
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(
+            ranges[0].end_sample - ranges[0].start_sample,
+            SAMPLES_PER_TICK
+        );
+    }
+
+    #[test]
+    fn ssrc_independent_frames_for_one_user_share_one_range() {
+        // SSRC attribution has already resolved before this boundary; the
+        // stable user ID is the only grouping key.
+        let ranges = build_candidate_ranges(vec![frame(11, 10), frame(11, 11)], 750).unwrap();
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].discord_user_id, 11);
+        assert_eq!(ranges[0].end_sample, 12 * SAMPLES_PER_TICK);
+    }
+
+    #[test]
+    fn nonstandard_frames_preserve_exact_source_offsets() {
+        let ranges = build_candidate_ranges(
+            vec![
+                AttributedFrame {
+                    discord_user_id: 11,
+                    tick: 10,
+                    samples: 480,
+                },
+                frame(11, 11),
+            ],
+            750,
+        )
+        .unwrap();
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].source_start_sample, 10 * SAMPLES_PER_TICK);
+        assert_eq!(
+            ranges[0].source_end_sample,
+            10 * SAMPLES_PER_TICK + 480 + SAMPLES_PER_TICK
+        );
+        assert_eq!(ranges[0].end_sample, 12 * SAMPLES_PER_TICK);
+    }
+
+    #[test]
+    fn reconstructed_source_length_must_match_aligned_track() {
+        let ranges = build_candidate_ranges(vec![frame(11, 10)], 750).unwrap();
+        let manifest = TrackManifest::new(
+            "session-source-length".to_owned(),
+            vec![TrackDescription::new(
+                11,
+                "Alice".to_owned(),
+                "player".to_owned(),
+                None,
+                "tracks/user-11.flac".to_owned(),
+                TrackState::Complete,
+                12 * SAMPLES_PER_TICK,
+                vec![100],
+                None,
+            )],
+        );
+
+        let error = validate_source_alignment(&ranges, &manifest).unwrap_err();
+
+        assert!(error.to_string().contains("tracks.json records"));
+    }
+
+    struct SplitRefiner;
+
+    impl RangeRefiner for SplitRefiner {
+        fn refine(&self, candidates: Vec<CandidateRange>) -> Result<Vec<CandidateRange>> {
+            let range = &candidates[0];
+            let session_midpoint = range.start_sample + SAMPLES_PER_TICK;
+            let source_midpoint = range.source_start_sample + SAMPLES_PER_TICK;
+            Ok(vec![
+                CandidateRange {
+                    discord_user_id: range.discord_user_id,
+                    start_sample: range.start_sample,
+                    end_sample: session_midpoint,
+                    source_start_sample: range.source_start_sample,
+                    source_end_sample: source_midpoint,
+                },
+                CandidateRange {
+                    discord_user_id: range.discord_user_id,
+                    start_sample: session_midpoint,
+                    end_sample: range.end_sample,
+                    source_start_sample: source_midpoint,
+                    source_end_sample: range.source_end_sample,
+                },
+            ])
+        }
+    }
+
+    #[test]
+    fn refinement_interface_can_be_substituted_without_changing_builder() {
+        let candidates = build_candidate_ranges(vec![frame(11, 10), frame(11, 11)], 750).unwrap();
+        let refined = SplitRefiner.refine(candidates).unwrap();
+
+        assert_eq!(refined.len(), 2);
+        assert_eq!(refined[0].end_sample, refined[1].start_sample);
+    }
+
+    #[test]
+    fn complete_session_produces_stable_globally_ordered_manifest() {
+        let directory = ready_session_fixture();
+
+        run_with_refiner(&directory, 750, &NoopRefiner, 4_000).unwrap();
+        let first_bytes = fs::read(directory.join(WORK_ITEM_MANIFEST_PATH)).unwrap();
+        let first_items = read_items(&first_bytes);
+
+        assert_eq!(first_items.len(), 3);
+        assert_eq!(
+            first_items
+                .iter()
+                .map(|item| item.discord_user_id.as_str())
+                .collect::<Vec<_>>(),
+            ["11", "22", "11"]
+        );
+        assert_eq!(
+            first_items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "session-work-items:000001",
+                "session-work-items:000002",
+                "session-work-items:000003",
+            ]
+        );
+        assert_eq!((first_items[0].start_ms, first_items[0].end_ms), (200, 420));
+        assert_eq!(
+            (first_items[0].source_start_ms, first_items[0].source_end_ms),
+            (200, 420)
+        );
+        assert_eq!((first_items[1].start_ms, first_items[1].end_ms), (200, 220));
+        assert_eq!(
+            (first_items[2].start_ms, first_items[2].end_ms),
+            (2_000, 2_020)
+        );
+        assert_eq!(first_items[0].speaker, "Alice");
+        assert_eq!(first_items[0].role, "gm");
+        assert_eq!(
+            first_items[0].character.as_deref(),
+            Some("Emperor Coaltongue")
+        );
+        assert_eq!(first_items[1].role, "player");
+        assert_eq!(first_items[1].character, None);
+
+        let after_first = SessionStore::load(&directory).unwrap();
+        assert_eq!(
+            after_first.record().format,
+            crate::session::SESSION_FORMAT_VERSION
+        );
+        assert_eq!(
+            after_first.record().files.work_items.as_ref().unwrap().path,
+            WORK_ITEM_MANIFEST_PATH
+        );
+        assert_eq!(
+            after_first.record().state,
+            WorkflowState::ReadyForTranscription
+        );
+
+        run_with_refiner(&directory, 750, &NoopRefiner, 5_000).unwrap();
+        let second_bytes = fs::read(directory.join(WORK_ITEM_MANIFEST_PATH)).unwrap();
+        let after_second = SessionStore::load(&directory).unwrap();
+
+        assert_eq!(second_bytes, first_bytes);
+        assert_eq!(
+            after_second
+                .record()
+                .checkpoints
+                .iter()
+                .filter(|checkpoint| checkpoint.stage == "work_manifest_built")
+                .count(),
+            2
+        );
+        assert!(
+            !directory
+                .join(TRANSCRIPTION_DIRECTORY_NAME)
+                .join(WORK_ITEM_TEMP_FILE_NAME)
+                .exists()
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn command_boundary_refuses_a_session_not_ready_for_transcription() {
+        let directory = test_directory("wrong-state");
+        let participants = ParticipantContext::empty_for_test();
+        SessionStore::create(
+            &directory,
+            NewSession {
+                session_id: "session-wrong-state",
+                started_at_unix_millis: 1_000,
+                configuration_version: 1,
+                guild_id: "123",
+                channel_id: "456",
+                participants: &participants,
+            },
+        )
+        .unwrap();
+
+        let error = run_with_refiner(&directory, 750, &NoopRefiner, 2_000).unwrap_err();
+
+        assert!(error.to_string().contains("ready_for_transcription"));
+        assert!(!directory.join(WORK_ITEM_MANIFEST_PATH).exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn session_publish_failure_does_not_claim_a_work_manifest_checkpoint() {
+        let directory = ready_session_fixture();
+        fail_record_write_after(&directory, 0);
+
+        let error = run_with_refiner(&directory, 750, &NoopRefiner, 4_000).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("session.json could not record it")
+        );
+        assert!(directory.join(WORK_ITEM_MANIFEST_PATH).is_file());
+        let session = SessionStore::load(&directory).unwrap();
+        assert_eq!(session.record().format, PREVIOUS_SESSION_FORMAT_VERSION);
+        assert_eq!(session.record().files.work_items, None);
+        assert!(
+            session
+                .record()
+                .checkpoints
+                .iter()
+                .all(|checkpoint| checkpoint.stage != "work_manifest_built")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn ready_session_fixture() -> std::path::PathBuf {
+        let directory = test_directory("ready");
+        let source_participants = directory.join("configured-participants.toml");
+        fs::write(
+            &source_participants,
+            concat!(
+                "version = 1\n",
+                "[participants.\"11\"]\n",
+                "character = \"Emperor Coaltongue\"\n",
+                "role = \"GM\"\n",
+            ),
+        )
+        .unwrap();
+        let participants = ParticipantContext::load(&source_participants).unwrap();
+        let mut session = SessionStore::create(
+            &directory,
+            NewSession {
+                session_id: "session-work-items",
+                started_at_unix_millis: 1_000,
+                configuration_version: 1,
+                guild_id: "123",
+                channel_id: "456",
+                participants: &participants,
+            },
+        )
+        .unwrap();
+        session
+            .transition(WorkflowState::RecordedClean, 2_000)
+            .unwrap();
+        session
+            .transition(WorkflowState::ReadyForTranscription, 2_100)
+            .unwrap();
+
+        let mut packets = File::create(directory.join(PACKET_JOURNAL_FILE_NAME)).unwrap();
+        journal::write_file_header(&mut packets).unwrap();
+        packets.sync_all().unwrap();
+
+        let mut playout_file = File::create(directory.join(PLAYOUT_JOURNAL_FILE_NAME)).unwrap();
+        playout::write_file_header(&mut playout_file).unwrap();
+        for (tick, ssrc) in [(10, 100), (10, 200), (11, 100), (20, 101), (100, 101)] {
+            playout::write_record(
+                &mut playout_file,
+                &PlayoutRecord {
+                    tick,
+                    ssrc,
+                    decision: PlayoutDecision::Loss,
+                    decoded_samples: u32::try_from(SAMPLES_PER_TICK).unwrap(),
+                },
+            )
+            .unwrap();
+        }
+        playout_file.sync_all().unwrap();
+
+        let mut events = File::create(directory.join(EVENT_JOURNAL_FILE_NAME)).unwrap();
+        for (ssrc, user_id) in [(100, "11"), (101, "11"), (200, "22")] {
+            write_event(
+                &mut events,
+                &SessionEvent::speaker_mapping(0, ssrc, Some(user_id.to_owned()), 1),
+            )
+            .unwrap();
+        }
+        events.sync_all().unwrap();
+
+        let track_directory = directory.join(TRACK_DIRECTORY_NAME);
+        fs::create_dir(&track_directory).unwrap();
+        fs::write(track_directory.join("user-11.flac"), b"complete").unwrap();
+        fs::write(track_directory.join("user-22.flac"), b"complete").unwrap();
+        TrackManifest::new(
+            "session-work-items".to_owned(),
+            vec![
+                TrackDescription::new(
+                    11,
+                    "Alice".to_owned(),
+                    "player".to_owned(),
+                    None,
+                    "tracks/user-11.flac".to_owned(),
+                    TrackState::Complete,
+                    101 * SAMPLES_PER_TICK,
+                    vec![100, 101],
+                    None,
+                ),
+                TrackDescription::new(
+                    22,
+                    "Bob".to_owned(),
+                    "gm".to_owned(),
+                    Some("Mutable manifest context".to_owned()),
+                    "tracks/user-22.flac".to_owned(),
+                    TrackState::Complete,
+                    11 * SAMPLES_PER_TICK,
+                    vec![200],
+                    None,
+                ),
+            ],
+        )
+        .write(&directory)
+        .unwrap();
+
+        // Exercise the approved compatibility path rather than only format 4.
+        let mut record = session.record().clone();
+        record.format = PREVIOUS_SESSION_FORMAT_VERSION;
+        fs::write(
+            directory.join("session.json"),
+            serde_json::to_vec_pretty(&record).unwrap(),
+        )
+        .unwrap();
+        directory
+    }
+
+    fn read_items(bytes: &[u8]) -> Vec<WorkItem> {
+        bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect()
+    }
+
+    fn test_directory(label: &str) -> std::path::PathBuf {
+        let directory = env::temp_dir().join(format!(
+            "echoscribe-work-items-{label}-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        directory
+    }
+}

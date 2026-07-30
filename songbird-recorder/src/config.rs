@@ -97,6 +97,31 @@ pub(crate) struct SegmentationConfig {
     pub(crate) merge_gap_ms: u64,
 }
 
+impl SegmentationConfig {
+    /// Load the one setting required by offline range generation. This
+    /// deliberately avoids participant-file I/O, Discord construction, and
+    /// token validation.
+    pub(crate) fn load_merge_gap_ms(path: &Path) -> Result<u64> {
+        let text = fs::read_to_string(path)
+            .with_context(|| format!("failed to read configuration file {}", path.display()))?;
+        let file: FileConfig = toml::from_str(&text)
+            .with_context(|| format!("failed to parse configuration file {}", path.display()))?;
+
+        if file.version != SUPPORTED_CONFIG_VERSION {
+            bail!(
+                "unsupported configuration version {}; expected {}",
+                file.version,
+                SUPPORTED_CONFIG_VERSION
+            );
+        }
+        if file.segmentation.merge_gap_ms == 0 {
+            bail!("segmentation.merge_gap_ms must be greater than zero");
+        }
+
+        Ok(file.segmentation.merge_gap_ms)
+    }
+}
+
 #[allow(dead_code)]
 /// Fully validated runtime configuration with all local paths resolved.
 pub(crate) struct Config {
@@ -283,6 +308,22 @@ merge_gap_ms = 750
         assert!(!config.segmentation.vad_enabled);
         assert_eq!(config.segmentation.merge_gap_ms, 750);
 
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn offline_merge_gap_load_does_not_read_participants_or_validate_discord() {
+        let directory = test_directory("offline-segmentation");
+        let config_path = directory.join("echoscribe.toml");
+        let input = VALID_CONFIG
+            .replace(r#"token = "test-token""#, r#"token = """#)
+            .replace(r#"guild_id = "123""#, r#"guild_id = "not-a-number""#);
+        fs::write(&config_path, input).unwrap();
+
+        let merge_gap_ms = SegmentationConfig::load_merge_gap_ms(&config_path).unwrap();
+
+        assert_eq!(merge_gap_ms, 750);
+        assert!(!directory.join("participants.toml").exists());
         fs::remove_dir_all(directory).unwrap();
     }
 

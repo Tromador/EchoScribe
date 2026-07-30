@@ -22,6 +22,7 @@ mod session;
 mod telemetry;
 mod track_manifest;
 mod verify_tracks;
+mod work_items;
 
 use std::{
     collections::HashSet,
@@ -74,6 +75,10 @@ enum Command {
     },
     Continue {
         session_directory: PathBuf,
+    },
+    BuildWorkItems {
+        session_directory: PathBuf,
+        config_path: PathBuf,
     },
     Export {
         session_directory: PathBuf,
@@ -260,6 +265,12 @@ async fn main() -> anyhow::Result<()> {
         Command::Continue { session_directory } => {
             return continuation::run(&session_directory);
         }
+        Command::BuildWorkItems {
+            session_directory,
+            config_path,
+        } => {
+            return work_items::run(&session_directory, &config_path);
+        }
         Command::Export { session_directory } => {
             return recover::export(&session_directory);
         }
@@ -392,7 +403,15 @@ fn parse_command_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Res
 
     if matches!(
         first.to_str(),
-        Some("inspect" | "recover" | "recover-wav" | "continue" | "export" | "verify")
+        Some(
+            "inspect"
+                | "recover"
+                | "recover-wav"
+                | "continue"
+                | "build-work-items"
+                | "export"
+                | "verify"
+        )
     ) {
         let operation = first.to_string_lossy();
         let session_directory = args
@@ -433,6 +452,17 @@ fn parse_command_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Res
             Some("continue") => {
                 require_no_extra_args(&mut args)?;
                 Ok(Command::Continue { session_directory })
+            }
+            Some("build-work-items") => {
+                let config_path = args
+                    .next()
+                    .map(PathBuf::from)
+                    .ok_or_else(|| anyhow::anyhow!("build-work-items requires a config path"))?;
+                require_no_extra_args(&mut args)?;
+                Ok(Command::BuildWorkItems {
+                    session_directory,
+                    config_path,
+                })
             }
             Some("export") => {
                 require_no_extra_args(&mut args)?;
@@ -598,6 +628,53 @@ mod tests {
             panic!("expected continue command");
         };
         assert_eq!(session_directory, Path::new("recordings/session-123"));
+    }
+
+    #[test]
+    fn build_work_items_selects_session_and_config_paths() {
+        let command = parse_command_args(
+            [
+                OsString::from("build-work-items"),
+                OsString::from("recordings/session-123"),
+                OsString::from("echoscribe.toml"),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        let Command::BuildWorkItems {
+            session_directory,
+            config_path,
+        } = command
+        else {
+            panic!("expected build-work-items command");
+        };
+        assert_eq!(session_directory, Path::new("recordings/session-123"));
+        assert_eq!(config_path, Path::new("echoscribe.toml"));
+    }
+
+    #[test]
+    fn build_work_items_requires_exactly_two_paths() {
+        let missing_session =
+            parse_command_args([OsString::from("build-work-items")].into_iter()).unwrap_err();
+        assert!(
+            missing_session
+                .to_string()
+                .contains("requires a session directory")
+        );
+
+        let missing_config = parse_command_args(
+            [
+                OsString::from("build-work-items"),
+                OsString::from("recordings/session-123"),
+            ]
+            .into_iter(),
+        )
+        .unwrap_err();
+        assert!(
+            missing_config
+                .to_string()
+                .contains("requires a config path")
+        );
     }
 
     #[test]

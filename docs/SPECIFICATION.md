@@ -152,6 +152,18 @@ Nearby activity from the same participant is merged across a configurable silenc
 
 The exact merge threshold is a tuning parameter, not a permanent architectural constant.
 
+Before one-stop orchestration is introduced, the explicit offline command is:
+
+```text
+echoscribe build-work-items <session> <config>
+```
+
+It requires a session ready for transcription, reads only the required
+segmentation setting from the named main configuration, and uses participant
+metadata from the immutable session-local snapshot. It atomically replaces the
+retained work manifest without starting transcription or changing workflow
+state.
+
 Range generation must be composable so that VAD can later:
 
 - refine candidate boundaries;
@@ -358,6 +370,9 @@ The state model must distinguish at least:
 - complete.
 
 Failures and recovery actions must be recorded with enough information to explain why the session stopped and what action is required.
+
+The current session format is 4. Existing format-3 sessions remain readable and
+are upgraded to format 4 when a work-item manifest is successfully published.
 
 ## 16. Normal orchestration
 

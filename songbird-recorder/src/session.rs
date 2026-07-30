@@ -22,12 +22,13 @@ use crate::{
     artifacts::{
         EVENT_JOURNAL_FILE_NAME, PACKET_JOURNAL_FILE_NAME, PARTICIPANT_SNAPSHOT_FILE_NAME,
         PARTICIPANT_SNAPSHOT_FORMAT_VERSION, PLAYOUT_JOURNAL_FILE_NAME, TRACK_MANIFEST_FILE_NAME,
-        TRACK_MANIFEST_FORMAT_VERSION,
+        TRACK_MANIFEST_FORMAT_VERSION, WORK_ITEM_MANIFEST_FORMAT_VERSION, WORK_ITEM_MANIFEST_PATH,
     },
     participants::ParticipantContext,
 };
 
-pub(crate) const SESSION_FORMAT_VERSION: u16 = 3;
+pub(crate) const SESSION_FORMAT_VERSION: u16 = 4;
+pub(crate) const PREVIOUS_SESSION_FORMAT_VERSION: u16 = 3;
 pub(crate) const LEGACY_SESSION_FORMAT_VERSION: u16 = 2;
 pub(crate) const LEGACY_EVENT_FORMAT_VERSION: u16 = 1;
 pub(crate) const EVENT_FORMAT_VERSION: u16 = 2;
@@ -97,6 +98,8 @@ pub(crate) struct SessionFiles {
     pub(crate) events: FileDescription,
     pub(crate) participants: FileDescription,
     pub(crate) tracks: FileDescription,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) work_items: Option<FileDescription>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -175,6 +178,7 @@ impl SessionRecord {
                     path: TRACK_MANIFEST_FILE_NAME.to_owned(),
                     format: TRACK_MANIFEST_FORMAT_VERSION,
                 },
+                work_items: None,
             },
             failures: Vec::new(),
             checkpoints: Vec::new(),
@@ -184,10 +188,13 @@ impl SessionRecord {
     pub(crate) fn validate(&self) -> io::Result<()> {
         // Validation is intentionally repeated on read and before every write;
         // malformed workflow authority must never be propagated.
-        if self.format != SESSION_FORMAT_VERSION {
+        if !matches!(
+            self.format,
+            PREVIOUS_SESSION_FORMAT_VERSION | SESSION_FORMAT_VERSION
+        ) {
             return Err(invalid_data(format!(
-                "unsupported session format {}; expected {}",
-                self.format, SESSION_FORMAT_VERSION
+                "unsupported session format {}; expected {} or {}",
+                self.format, PREVIOUS_SESSION_FORMAT_VERSION, SESSION_FORMAT_VERSION
             )));
         }
         if self.session_id.trim().is_empty() {
@@ -276,6 +283,22 @@ impl SessionRecord {
                  {LEGACY_EVENT_FORMAT_VERSION} or {EVENT_FORMAT_VERSION}"
             )));
         }
+        if self.format == PREVIOUS_SESSION_FORMAT_VERSION && self.files.work_items.is_some() {
+            return Err(invalid_data(
+                "session format 3 must not contain a work_items description",
+            ));
+        }
+        if let Some(description) = &self.files.work_items {
+            validate_relative_artifact_path("work_items", &description.path)?;
+            if description.path != WORK_ITEM_MANIFEST_PATH
+                || description.format != WORK_ITEM_MANIFEST_FORMAT_VERSION
+            {
+                return Err(invalid_data(format!(
+                    "session file work_items must be {WORK_ITEM_MANIFEST_PATH:?} format \
+                     {WORK_ITEM_MANIFEST_FORMAT_VERSION}"
+                )));
+            }
+        }
 
         for failure in &self.failures {
             validate_label("failure kind", &failure.kind)?;
@@ -285,6 +308,15 @@ impl SessionRecord {
         }
         for checkpoint in &self.checkpoints {
             validate_label("checkpoint stage", &checkpoint.stage)?;
+        }
+        let has_work_manifest_checkpoint = self
+            .checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.stage == "work_manifest_built");
+        if self.files.work_items.is_some() != has_work_manifest_checkpoint {
+            return Err(invalid_data(
+                "work_items description and work_manifest_built checkpoint must appear together",
+            ));
         }
 
         Ok(())
@@ -398,6 +430,35 @@ impl SessionStore {
         self.persist(updated)
     }
 
+    /// Publish the cross-stage work-manifest reference and its checkpoint as
+    /// one workflow-authority replacement after the JSONL file is durable.
+    pub(crate) fn publish_work_manifest(
+        &mut self,
+        completed_at_unix_millis: u64,
+    ) -> io::Result<()> {
+        if self.record.state != WorkflowState::ReadyForTranscription {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "work manifest requires ready_for_transcription; found {}",
+                    self.record.state.as_str()
+                ),
+            ));
+        }
+
+        let mut updated = self.record.clone();
+        updated.format = SESSION_FORMAT_VERSION;
+        updated.files.work_items = Some(FileDescription {
+            path: WORK_ITEM_MANIFEST_PATH.to_owned(),
+            format: WORK_ITEM_MANIFEST_FORMAT_VERSION,
+        });
+        updated.checkpoints.push(CheckpointRecord {
+            completed_at_unix_millis,
+            stage: "work_manifest_built".to_owned(),
+        });
+        self.persist(updated)
+    }
+
     fn persist(&mut self, updated: SessionRecord) -> io::Result<()> {
         // Do not mutate the in-memory authority until the replacement is
         // validated and durably published.
@@ -416,7 +477,19 @@ pub(crate) fn read_record(path: &Path) -> io::Result<SessionRecord> {
     // A successfully parsed JSON object is still untrusted until every state,
     // path, format and identifier invariant has been checked.
     let bytes = fs::read(path)?;
-    let record: SessionRecord = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    if value.get("format").and_then(serde_json::Value::as_u64)
+        == Some(u64::from(PREVIOUS_SESSION_FORMAT_VERSION))
+        && value
+            .get("files")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|files| files.contains_key("work_items"))
+    {
+        return Err(invalid_data(
+            "session format 3 must not contain a work_items field",
+        ));
+    }
+    let record: SessionRecord = serde_json::from_value(value).map_err(io::Error::other)?;
     record.validate()?;
     Ok(record)
 }
@@ -708,6 +781,7 @@ mod tests {
         let store = create_store(&directory, &participants);
 
         assert_eq!(store.record().state, WorkflowState::Recording);
+        assert_eq!(store.record().format, SESSION_FORMAT_VERSION);
         assert_eq!(store.record().stopped_at_unix_millis, None);
         assert_eq!(store.record().configuration_version, 1);
         assert_eq!(store.record().discord.guild_id, "123");
@@ -719,6 +793,7 @@ mod tests {
         assert_eq!(store.record().files.participants.format, 1);
         assert_eq!(store.record().files.tracks.path, "tracks.json");
         assert_eq!(store.record().files.tracks.format, 1);
+        assert_eq!(store.record().files.work_items, None);
         assert!(store.record().failures.is_empty());
         assert!(store.record().checkpoints.is_empty());
 
@@ -731,11 +806,12 @@ mod tests {
     }
 
     #[test]
-    fn format_three_session_can_reference_a_format_one_event_journal() {
+    fn format_three_session_remains_readable() {
         let directory = test_directory("format-three-event-one");
         let participants = ParticipantContext::empty_for_test();
         let store = create_store(&directory, &participants);
         let mut record = store.record().clone();
+        record.format = PREVIOUS_SESSION_FORMAT_VERSION;
         record.files.events.format = LEGACY_EVENT_FORMAT_VERSION;
         fs::write(
             directory.join(SESSION_FILE_NAME),
@@ -745,11 +821,93 @@ mod tests {
 
         let reloaded = SessionStore::load(&directory).unwrap();
 
-        assert_eq!(reloaded.record().format, SESSION_FORMAT_VERSION);
+        assert_eq!(reloaded.record().format, PREVIOUS_SESSION_FORMAT_VERSION);
+        assert_eq!(reloaded.record().files.work_items, None);
         assert_eq!(
             reloaded.record().files.events.format,
             LEGACY_EVENT_FORMAT_VERSION
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn format_three_rejects_a_work_items_field_even_when_null() {
+        let directory = test_directory("format-three-work-items");
+        let participants = ParticipantContext::empty_for_test();
+        let store = create_store(&directory, &participants);
+        let mut value = serde_json::to_value(store.record()).unwrap();
+        value["format"] = PREVIOUS_SESSION_FORMAT_VERSION.into();
+        value["files"]["work_items"] = serde_json::Value::Null;
+        fs::write(
+            directory.join(SESSION_FILE_NAME),
+            serde_json::to_vec_pretty(&value).unwrap(),
+        )
+        .unwrap();
+
+        let error = SessionStore::load(&directory).err().unwrap();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("format 3"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn publishing_work_manifest_upgrades_format_three_atomically() {
+        let directory = test_directory("work-manifest-upgrade");
+        let participants = ParticipantContext::empty_for_test();
+        let mut store = create_store(&directory, &participants);
+        store
+            .transition(WorkflowState::RecordedClean, 2_000)
+            .unwrap();
+        store
+            .transition(WorkflowState::ReadyForTranscription, 2_100)
+            .unwrap();
+        let mut record = store.record().clone();
+        record.format = PREVIOUS_SESSION_FORMAT_VERSION;
+        fs::write(
+            directory.join(SESSION_FILE_NAME),
+            serde_json::to_vec_pretty(&record).unwrap(),
+        )
+        .unwrap();
+        let mut store = SessionStore::load(&directory).unwrap();
+
+        store.publish_work_manifest(3_000).unwrap();
+
+        let reloaded = SessionStore::load(&directory).unwrap();
+        assert_eq!(reloaded.record().format, SESSION_FORMAT_VERSION);
+        assert_eq!(
+            reloaded.record().files.work_items,
+            Some(FileDescription {
+                path: WORK_ITEM_MANIFEST_PATH.to_owned(),
+                format: WORK_ITEM_MANIFEST_FORMAT_VERSION,
+            })
+        );
+        assert_eq!(
+            reloaded.record().checkpoints.last().unwrap().stage,
+            "work_manifest_built"
+        );
+        assert_eq!(
+            reloaded.record().state,
+            WorkflowState::ReadyForTranscription
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn work_items_reference_and_checkpoint_cannot_be_published_separately() {
+        let directory = test_directory("work-manifest-pair");
+        let participants = ParticipantContext::empty_for_test();
+        let store = create_store(&directory, &participants);
+        let mut record = store.record().clone();
+        record.files.work_items = Some(FileDescription {
+            path: WORK_ITEM_MANIFEST_PATH.to_owned(),
+            format: WORK_ITEM_MANIFEST_FORMAT_VERSION,
+        });
+
+        let error = record.validate().unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("must appear together"));
         fs::remove_dir_all(directory).unwrap();
     }
 

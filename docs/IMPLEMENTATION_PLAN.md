@@ -147,7 +147,9 @@ Make `session.json` a versioned durable workflow record.
 - make later stages read the session-local snapshot rather than the configured
   source file;
 - record the track-manifest path and format in the `files` section;
-- use session format 3 with Discord IDs represented as JSON strings;
+- use session format 3 with Discord IDs represented as JSON strings (the
+  format current at Slice 2; Slice 7 introduces the approved format-4
+  successor);
 - record failures and stage checkpoints;
 - update state through atomic file replacement or another crash-safe method;
 - keep existing journal formats unchanged unless a versioned metadata reference is required.
@@ -387,7 +389,20 @@ Produce chronological, time-ranged transcription work items from healthy aligned
 - merge nearby same-user activity using configurable `merge_gap_ms`;
 - create stable work-item IDs;
 - sort globally by start time with deterministic tie-breaking;
-- write retained `transcription/work-items.jsonl`;
+- expose `build-work-items <session> <config>` as the explicit offline command;
+- require `ready_for_transcription` and validate session-local artefacts plus
+  complete routine tracks;
+- load `merge_gap_ms` without depending on Discord connectivity, the Discord
+  token, or the mutable configured participant file;
+- obtain participant metadata from the immutable session-local snapshot;
+- atomically replace retained `transcription/work-items.jsonl`;
+- introduce session format 4 with an optional work-item file description;
+- keep format-3 sessions readable with no work-item description, reject that
+  field in format 3, and upgrade format 3 to format 4 after successful
+  work-manifest publication;
+- publish the work-item description and `work_manifest_built` checkpoint
+  together in one atomic `session.json` replacement;
+- leave `ready_for_transcription` unchanged;
 - define a refinement interface that later VAD can implement.
 
 ### Required tests
@@ -406,6 +421,7 @@ Produce chronological, time-ranged transcription work items from healthy aligned
 
 - no VAD model;
 - no transcription;
+- no automatic post-recording orchestration;
 - no tuning claim beyond documented provisional defaults.
 
 ### Stop condition

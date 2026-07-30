@@ -310,7 +310,8 @@ Diagnostic failure must not affect authoritative capture or routine FLAC.
 ## 11. Session metadata and state
 
 `session.json` is a versioned durable workflow record. The current session
-record format is 3.
+record format is 4. Format 3 remains readable for sessions created before the
+work-item artefact reference was introduced.
 
 It contains:
 
@@ -321,6 +322,7 @@ It contains:
 - authoritative packet, playout, and event journal descriptions;
 - participant snapshot path and format;
 - track manifest path and format;
+- optional transcription work-manifest path and format;
 - current workflow state;
 - failure records;
 - completed stage checkpoints.
@@ -328,6 +330,11 @@ It contains:
 The participant snapshot and track manifest references are recorded in the
 `files` section alongside the authoritative journals. Participant entries
 remain in the separate session-local `participants.toml`.
+
+New sessions use format 4 with no work-manifest reference until the artefact has
+been published. Format-3 sessions imply no work-manifest reference and must not
+contain the field. Successful work-item generation upgrades a format-3 session
+to format 4.
 
 Minimum states:
 
@@ -429,6 +436,18 @@ The initial implementation uses playout activity without VAD.
 
 Tuning values are configuration, not architecture.
 
+Before normal one-stop orchestration is introduced, the range builder is
+invoked explicitly:
+
+```text
+build-work-items <session> <config>
+```
+
+The command requires `ready_for_transcription`, validates the session-local
+artefacts and complete routine tracks, and reads only `merge_gap_ms` from the
+named main configuration. Participant metadata comes from the immutable
+session-local snapshot, not the configured participant source.
+
 ## 14. Transcription work manifest
 
 `transcription/work-items.jsonl` contains one item per candidate range in global chronological order.
@@ -456,6 +475,12 @@ Minimum record shape:
 The manifest is retained for replay and diagnosis.
 
 Work item IDs are stable for the generated manifest.
+
+Publication uses a synchronised temporary file followed by atomic replacement
+of `transcription/work-items.jsonl`. After publication, the work-item file
+description and `work_manifest_built` checkpoint are committed together in one
+atomic `session.json` replacement. Repeated generation replaces the manifest
+deterministically, leaves the workflow state unchanged, and does not append.
 
 ## 15. Rust/Python boundary
 

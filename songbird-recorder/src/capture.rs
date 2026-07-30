@@ -1677,7 +1677,7 @@ role = "GM"
 
         let session: serde_json::Value =
             serde_json::from_slice(&fs::read(session_path.join("session.json")).unwrap()).unwrap();
-        assert_eq!(session["format"], 3);
+        assert_eq!(session["format"], crate::session::SESSION_FORMAT_VERSION);
         assert_eq!(session["state"], "ready_for_transcription");
         assert_eq!(session["discord"]["guild_id"], "123");
         assert_eq!(session["discord"]["channel_id"], "456");
@@ -1693,6 +1693,7 @@ role = "GM"
             "participants.toml"
         );
         assert_eq!(session["files"]["tracks"]["path"], "tracks.json");
+        assert!(session["files"].get("work_items").is_none());
         assert!(session_path.join("participants.toml").is_file());
 
         let events = fs::read_to_string(session_path.join("events.ndjson")).unwrap();
