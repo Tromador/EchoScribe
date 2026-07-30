@@ -609,7 +609,8 @@ fn python_interpreter() -> Result<OsString> {
 
 fn worker_script_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("python")
+        .parent()
+        .expect("songbird-recorder manifest has a repository parent")
         .join("transcription_worker.py")
 }
 

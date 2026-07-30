@@ -521,11 +521,11 @@ completion leaves the state as `transcribing`; failure-state publication,
 rewind, final transcript publication, and transition to `complete` belong to
 Slice 9.
 
-The repository-owned worker is
-`songbird-recorder/python/transcription_worker.py`. Rust resolves it
-independently of the caller's working directory. The interpreter is selected
-from `ECHOSCRIBE_PYTHON` when set, otherwise `python` on Windows and `python3`
-elsewhere.
+The repository-owned worker is `transcription_worker.py` at the EchoScribe
+repository root. It is an application component rather than part of the
+Songbird recording crate. Rust resolves it independently of the caller's
+working directory. The interpreter is selected from `ECHOSCRIBE_PYTHON` when
+set, otherwise `python` on Windows and `python3` elsewhere.
 
 The Python worker:
 

@@ -1,5 +1,0 @@
-# Direct runtime dependencies for the Slice 8 transcription worker.
-# Transitive dependencies such as PyAV, NumPy and CFFI are resolved by pip.
-faster-whisper==1.2.1
-ctranslate2==4.8.1
-soundfile==0.14.0

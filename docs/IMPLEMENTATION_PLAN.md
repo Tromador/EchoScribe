@@ -463,9 +463,10 @@ Transcribe one session through one Python process and one faster-whisper model l
 - Python exits non-zero on failure;
 - no automatic retry.
 
-The worker is `songbird-recorder/python/transcription_worker.py`. Rust resolves
-it independently of the caller's working directory and selects
-`ECHOSCRIBE_PYTHON`, `python` on Windows, or `python3` otherwise.
+The application worker is `transcription_worker.py` at the repository root,
+outside the Songbird recording crate. Rust resolves it independently of the
+caller's working directory and selects `ECHOSCRIBE_PYTHON`, `python` on
+Windows, or `python3` otherwise.
 
 The offline transcription configuration loader does not validate Discord
 credentials or IDs and does not read the configured participant file.

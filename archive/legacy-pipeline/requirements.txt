@@ -1,0 +1,7 @@
+torch
+soundfile
+tqdm
+faster-whisper
+ctranslate2>=4.7.1
+numpy
+matplotlib

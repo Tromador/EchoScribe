@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 
-MODULE_PATH = Path(__file__).with_name("transcription_worker.py")
+MODULE_PATH = Path(__file__).resolve().parents[1] / "transcription_worker.py"
 SPEC = importlib.util.spec_from_file_location("transcription_worker", MODULE_PATH)
 worker = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(worker)
