@@ -382,6 +382,22 @@ impl SessionStore {
         self.persist(updated)
     }
 
+    /// Record a related set of stage checkpoints in one durable replacement.
+    pub(crate) fn record_checkpoints(
+        &mut self,
+        completed_at_unix_millis: u64,
+        stages: impl IntoIterator<Item = String>,
+    ) -> io::Result<()> {
+        let mut updated = self.record.clone();
+        updated
+            .checkpoints
+            .extend(stages.into_iter().map(|stage| CheckpointRecord {
+                completed_at_unix_millis,
+                stage,
+            }));
+        self.persist(updated)
+    }
+
     fn persist(&mut self, updated: SessionRecord) -> io::Result<()> {
         // Do not mutate the in-memory authority until the replacement is
         // validated and durably published.

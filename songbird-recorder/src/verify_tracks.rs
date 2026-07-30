@@ -37,6 +37,23 @@ pub(crate) fn run(session_directory: &Path) -> Result<()> {
         );
     }
 
+    let verified_tracks = verify_complete_manifest(session_directory, &manifest)?;
+
+    println!(
+        "Verified {verified_tracks} routine FLAC track(s) for session {}.",
+        manifest.session_id
+    );
+    Ok(())
+}
+
+/// Fully decode and validate every routine track described as complete.
+///
+/// Explicit `verify` and operator-controlled `continue` share this check so a
+/// continuation cannot apply a weaker meaning of “healthy”.
+pub(crate) fn verify_complete_manifest(
+    session_directory: &Path,
+    manifest: &TrackManifest,
+) -> Result<u64> {
     let mut incomplete_users = Vec::new();
     let mut verified_tracks = 0_u64;
     for track in &manifest.tracks {
@@ -107,9 +124,5 @@ pub(crate) fn run(session_directory: &Path) -> Result<()> {
         );
     }
 
-    println!(
-        "Verified {verified_tracks} routine FLAC track(s) for session {}.",
-        manifest.session_id
-    );
-    Ok(())
+    Ok(verified_tracks)
 }

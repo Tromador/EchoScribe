@@ -28,7 +28,7 @@ use crate::{
     flac_tracks::FlacTrackWriter,
     journal::{self, PacketRecord, ReadRecord as ReadPacketRecord},
     playout::{self, OpusPayloadBounds, PlayoutDecision, ReadRecord as ReadPlayoutRecord},
-    session::{EVENT_FORMAT_VERSION, LEGACY_EVENT_FORMAT_VERSION, SessionEvent},
+    session::{EVENT_FORMAT_VERSION, LEGACY_EVENT_FORMAT_VERSION, SessionEvent, SessionFiles},
 };
 
 type PacketKey = (u32, u16, u32);
@@ -65,17 +65,19 @@ struct RecoveryDecoder {
 }
 
 #[derive(Default)]
-struct RecoverySummary {
-    decisions: u64,
-    packet_decisions: u64,
-    loss_decisions: u64,
-    decoded_frames: u64,
-    decoded_samples: u64,
-    skipped_undecoded: u64,
-    truncated_playout_tail: bool,
+pub(crate) struct RecoverySummary {
+    pub(crate) packet_records: u64,
+    pub(crate) decisions: u64,
+    pub(crate) packet_decisions: u64,
+    pub(crate) loss_decisions: u64,
+    pub(crate) decoded_frames: u64,
+    pub(crate) decoded_samples: u64,
+    pub(crate) skipped_undecoded: u64,
+    pub(crate) truncated_packet_tail: bool,
+    pub(crate) truncated_playout_tail: bool,
 }
 
-pub(crate) fn run(session_directory: &Path) -> Result<()> {
+pub(crate) fn recover_wav(session_directory: &Path) -> Result<()> {
     decode_session(session_directory, OutputKind::Recovery)
 }
 
@@ -84,14 +86,98 @@ pub(crate) fn export(session_directory: &Path) -> Result<()> {
 }
 
 fn decode_session(session_directory: &Path, output_kind: OutputKind) -> Result<()> {
-    let packets_path = session_directory.join(PACKET_JOURNAL_FILE_NAME);
-    let playout_path = session_directory.join(PLAYOUT_JOURNAL_FILE_NAME);
+    let mut output = AudioWriter::new(session_directory, output_kind).with_context(|| {
+        format!(
+            "failed to create {} output in {}",
+            output_kind.operation(),
+            session_directory.display()
+        )
+    })?;
+    let summary = replay_session(session_directory, |frame| {
+        output.write_frame(frame).map_err(Into::into)
+    })?;
 
-    let packet_index = build_packet_index(&packets_path)?;
-    let packet_file = File::open(&packets_path)
+    let tracks = output.finalize()?;
+
+    println!(
+        "{} {} decoded frames ({} samples) from {} playout decisions: \
+         {} packets, {} losses, {} undecoded decisions skipped.",
+        output_kind.past_tense(),
+        summary.decoded_frames,
+        summary.decoded_samples,
+        summary.decisions,
+        summary.packet_decisions,
+        summary.loss_decisions,
+        summary.skipped_undecoded
+    );
+    println!(
+        "Packet index: {} records, {}.",
+        summary.packet_records,
+        tail_description(summary.truncated_packet_tail)
+    );
+    println!(
+        "Playout journal: {}.",
+        tail_description(summary.truncated_playout_tail)
+    );
+    if matches!(output_kind, OutputKind::Tracks) {
+        write_track_manifest(session_directory, &tracks)?;
+    }
+
+    for track in tracks {
+        println!(
+            "{} SSRC {}: {}, first tick {}, {} frames, {} source samples, \
+             {} inserted silence samples, {} nonstandard frames.",
+            output_kind.track_description(),
+            track.ssrc,
+            track.path.display(),
+            track.first_tick,
+            track.frames,
+            track.source_samples,
+            track.inserted_silence_samples,
+            track.nonstandard_frames
+        );
+    }
+
+    Ok(())
+}
+
+/// Replay authoritative packet and playout evidence into decoded PCM.
+///
+/// Routine recovery and diagnostic output share this decoder so packet
+/// selection, loss concealment, and sample-count checks cannot drift apart.
+pub(crate) fn replay_session(
+    session_directory: &Path,
+    observe_frame: impl FnMut(DecodedFrame) -> Result<()>,
+) -> Result<RecoverySummary> {
+    replay_paths(
+        &session_directory.join(PACKET_JOURNAL_FILE_NAME),
+        &session_directory.join(PLAYOUT_JOURNAL_FILE_NAME),
+        observe_frame,
+    )
+}
+
+pub(crate) fn replay_session_files(
+    session_directory: &Path,
+    files: &SessionFiles,
+    observe_frame: impl FnMut(DecodedFrame) -> Result<()>,
+) -> Result<RecoverySummary> {
+    replay_paths(
+        &session_directory.join(&files.packets.path),
+        &session_directory.join(&files.playout.path),
+        observe_frame,
+    )
+}
+
+fn replay_paths(
+    packets_path: &Path,
+    playout_path: &Path,
+    mut observe_frame: impl FnMut(DecodedFrame) -> Result<()>,
+) -> Result<RecoverySummary> {
+    let packet_index = build_packet_index(packets_path)?;
+    let packet_file = File::open(packets_path)
         .with_context(|| format!("failed to reopen packet journal {}", packets_path.display()))?;
     let mut packet_reader = BufReader::new(packet_file);
-    let playout_file = File::open(&playout_path)
+    let playout_file = File::open(playout_path)
         .with_context(|| format!("failed to open playout journal {}", playout_path.display()))?;
     let mut playout_reader = BufReader::new(playout_file);
     let playout_format = playout::read_file_header(&mut playout_reader).with_context(|| {
@@ -101,15 +187,13 @@ fn decode_session(session_directory: &Path, output_kind: OutputKind) -> Result<(
         )
     })?;
 
-    let mut output = AudioWriter::new(session_directory, output_kind).with_context(|| {
-        format!(
-            "failed to create {} output in {}",
-            output_kind.operation(),
-            session_directory.display()
-        )
-    })?;
     let mut decoders = HashMap::<u32, RecoveryDecoder>::new();
-    let mut summary = RecoverySummary::default();
+    let mut summary = RecoverySummary {
+        packet_records: packet_index.records,
+        truncated_packet_tail: packet_index.truncated_tail,
+        ..RecoverySummary::default()
+    };
+    let mut clock = ReplayClock::default();
 
     // Playout order, not packet arrival order, defines recovered PCM timing and
     // loss positions.
@@ -138,12 +222,15 @@ fn decode_session(session_directory: &Path, output_kind: OutputKind) -> Result<(
         let decoder = decoders
             .entry(record.ssrc)
             .or_insert(RecoveryDecoder::new()?);
-        let samples = match record.decision {
+        let (samples, elapsed_nanos) = match record.decision {
             PlayoutDecision::Loss => {
                 // Decode loss through the same stateful Opus decoder so packet
                 // loss concealment matches the original live playout.
                 summary.loss_decisions += 1;
-                decoder.decode_loss(record.decoded_samples)?
+                (
+                    decoder.decode_loss(record.decoded_samples)?,
+                    clock.estimate(record.tick),
+                )
             }
             PlayoutDecision::Packet {
                 sequence,
@@ -165,62 +252,54 @@ fn decode_session(session_directory: &Path, output_kind: OutputKind) -> Result<(
                 })?;
                 let packet = read_packet_at(&mut packet_reader, *offset, key)?;
                 let payload = opus_payload(&packet, opus_bounds)?;
-                decoder.decode_packet(payload, record.decoded_samples)?
+                let elapsed_nanos = packet.arrival_nanos_since_session_start;
+                clock.observe(record.tick, elapsed_nanos);
+                (
+                    decoder.decode_packet(payload, record.decoded_samples)?,
+                    elapsed_nanos,
+                )
             }
         };
 
         summary.decoded_frames += 1;
         summary.decoded_samples += samples.len() as u64;
-        output.write_frame(DecodedFrame {
-            elapsed_nanos: record.tick.saturating_mul(20_000_000),
+        observe_frame(DecodedFrame {
+            elapsed_nanos,
             tick: record.tick,
             ssrc: record.ssrc,
             samples,
         })?;
     }
 
-    let tracks = output.finalize()?;
+    Ok(summary)
+}
 
-    println!(
-        "{} {} decoded frames ({} samples) from {} playout decisions: \
-         {} packets, {} losses, {} undecoded decisions skipped.",
-        output_kind.past_tense(),
-        summary.decoded_frames,
-        summary.decoded_samples,
-        summary.decisions,
-        summary.packet_decisions,
-        summary.loss_decisions,
-        summary.skipped_undecoded
-    );
-    println!(
-        "Packet index: {} records, {}.",
-        packet_index.records,
-        tail_description(packet_index.truncated_tail)
-    );
-    println!(
-        "Playout journal: {}.",
-        tail_description(summary.truncated_playout_tail)
-    );
-    if matches!(output_kind, OutputKind::Tracks) {
-        write_track_manifest(session_directory, &tracks)?;
+#[derive(Default)]
+struct ReplayClock {
+    anchor: Option<(u64, u64)>,
+}
+
+impl ReplayClock {
+    fn observe(&mut self, tick: u64, elapsed_nanos: u64) {
+        self.anchor = Some((tick, elapsed_nanos));
     }
 
-    for track in tracks {
-        println!(
-            "{} SSRC {}: {}, first tick {}, {} frames, {} source samples, \
-             {} inserted silence samples, {} nonstandard frames.",
-            output_kind.track_description(),
-            track.ssrc,
-            track.path.display(),
-            track.first_tick,
-            track.frames,
-            track.source_samples,
-            track.inserted_silence_samples,
-            track.nonstandard_frames
-        );
+    fn estimate(&self, tick: u64) -> u64 {
+        const NANOS_PER_TICK: u64 = 20_000_000;
+        match self.anchor {
+            Some((anchor_tick, anchor_elapsed)) if tick >= anchor_tick => anchor_elapsed
+                .saturating_add(
+                    tick.saturating_sub(anchor_tick)
+                        .saturating_mul(NANOS_PER_TICK),
+                ),
+            Some((anchor_tick, anchor_elapsed)) => anchor_elapsed.saturating_sub(
+                anchor_tick
+                    .saturating_sub(tick)
+                    .saturating_mul(NANOS_PER_TICK),
+            ),
+            None => tick.saturating_mul(NANOS_PER_TICK),
+        }
     }
-
-    Ok(())
 }
 
 impl OutputKind {
@@ -557,7 +636,9 @@ impl RecoveryDecoder {
     fn decode_loss(&mut self, expected_samples: u32) -> Result<Vec<i16>> {
         let mut samples = vec![0_i16; self.decode_capacity];
         let decoded = self.decoder.decode(&[], &mut samples, false)?;
-        samples.truncate(2 * decoded);
+        // The approved decode path is mono; opus2 already returns the decoded
+        // sample count for that one channel.
+        samples.truncate(decoded);
         verify_sample_count(samples, expected_samples)
     }
 }

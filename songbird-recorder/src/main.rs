@@ -7,6 +7,7 @@
 mod artifacts;
 mod capture;
 mod config;
+mod continuation;
 mod diagnostics;
 mod flac_tracks;
 mod identity;
@@ -16,6 +17,7 @@ mod live_flac;
 mod participants;
 mod playout;
 mod recover;
+mod routine_recovery;
 mod session;
 mod telemetry;
 mod track_manifest;
@@ -57,11 +59,28 @@ struct Handler {
 #[derive(Debug)]
 /// Parsed top-level operation. Only `Record` constructs a Discord client.
 enum Command {
-    Record { config_path: PathBuf },
-    Inspect { session_directory: PathBuf },
-    Recover { session_directory: PathBuf },
-    Export { session_directory: PathBuf },
-    Verify { session_directory: PathBuf },
+    Record {
+        config_path: PathBuf,
+    },
+    Inspect {
+        session_directory: PathBuf,
+    },
+    Recover {
+        session_directory: PathBuf,
+        user_ids: Vec<u64>,
+    },
+    RecoverWav {
+        session_directory: PathBuf,
+    },
+    Continue {
+        session_directory: PathBuf,
+    },
+    Export {
+        session_directory: PathBuf,
+    },
+    Verify {
+        session_directory: PathBuf,
+    },
 }
 
 #[async_trait]
@@ -229,8 +248,17 @@ async fn main() -> anyhow::Result<()> {
         Command::Inspect { session_directory } => {
             return inspect::run(&session_directory);
         }
-        Command::Recover { session_directory } => {
-            return recover::run(&session_directory);
+        Command::Recover {
+            session_directory,
+            user_ids,
+        } => {
+            return routine_recovery::run(&session_directory, &user_ids);
+        }
+        Command::RecoverWav { session_directory } => {
+            return recover::recover_wav(&session_directory);
+        }
+        Command::Continue { session_directory } => {
+            return continuation::run(&session_directory);
         }
         Command::Export { session_directory } => {
             return recover::export(&session_directory);
@@ -364,21 +392,56 @@ fn parse_command_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Res
 
     if matches!(
         first.to_str(),
-        Some("inspect" | "recover" | "export" | "verify")
+        Some("inspect" | "recover" | "recover-wav" | "continue" | "export" | "verify")
     ) {
         let operation = first.to_string_lossy();
         let session_directory = args
             .next()
             .map(PathBuf::from)
             .ok_or_else(|| anyhow::anyhow!("{operation} requires a session directory"))?;
-        if let Some(extra) = args.next() {
-            bail!("unexpected argument {:?}", extra);
-        }
         match first.to_str() {
-            Some("inspect") => Ok(Command::Inspect { session_directory }),
-            Some("recover") => Ok(Command::Recover { session_directory }),
-            Some("export") => Ok(Command::Export { session_directory }),
-            Some("verify") => Ok(Command::Verify { session_directory }),
+            Some("recover") => {
+                let mut user_ids = args
+                    .map(|value| {
+                        let display = value.to_string_lossy();
+                        display
+                            .parse::<u64>()
+                            .ok()
+                            .filter(|user_id| *user_id != 0)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "recover user ID {display:?} must be a non-zero unsigned Discord ID"
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                user_ids.sort_unstable();
+                user_ids.dedup();
+                Ok(Command::Recover {
+                    session_directory,
+                    user_ids,
+                })
+            }
+            Some("inspect") => {
+                require_no_extra_args(&mut args)?;
+                Ok(Command::Inspect { session_directory })
+            }
+            Some("recover-wav") => {
+                require_no_extra_args(&mut args)?;
+                Ok(Command::RecoverWav { session_directory })
+            }
+            Some("continue") => {
+                require_no_extra_args(&mut args)?;
+                Ok(Command::Continue { session_directory })
+            }
+            Some("export") => {
+                require_no_extra_args(&mut args)?;
+                Ok(Command::Export { session_directory })
+            }
+            Some("verify") => {
+                require_no_extra_args(&mut args)?;
+                Ok(Command::Verify { session_directory })
+            }
             _ => unreachable!("command was matched above"),
         }
     } else {
@@ -389,6 +452,13 @@ fn parse_command_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Res
             config_path: PathBuf::from(first),
         })
     }
+}
+
+fn require_no_extra_args(args: &mut impl Iterator<Item = std::ffi::OsString>) -> Result<()> {
+    if let Some(extra) = args.next() {
+        bail!("unexpected argument {:?}", extra);
+    }
+    Ok(())
 }
 
 async fn stop_capture(
@@ -468,8 +538,64 @@ mod tests {
             .into_iter(),
         )
         .unwrap();
-        let Command::Recover { session_directory } = command else {
+        let Command::Recover {
+            session_directory,
+            user_ids,
+        } = command
+        else {
             panic!("expected recover command");
+        };
+        assert_eq!(session_directory, Path::new("recordings/session-123"));
+        assert!(user_ids.is_empty());
+    }
+
+    #[test]
+    fn recover_accepts_and_normalises_explicit_user_ids() {
+        let command = parse_command_args(
+            [
+                OsString::from("recover"),
+                OsString::from("recordings/session-123"),
+                OsString::from("22"),
+                OsString::from("11"),
+                OsString::from("22"),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        let Command::Recover { user_ids, .. } = command else {
+            panic!("expected recover command");
+        };
+        assert_eq!(user_ids, [11, 22]);
+    }
+
+    #[test]
+    fn diagnostic_recovery_has_an_explicit_wav_command() {
+        let command = parse_command_args(
+            [
+                OsString::from("recover-wav"),
+                OsString::from("recordings/session-123"),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        let Command::RecoverWav { session_directory } = command else {
+            panic!("expected recover-wav command");
+        };
+        assert_eq!(session_directory, Path::new("recordings/session-123"));
+    }
+
+    #[test]
+    fn continue_selects_one_session_directory() {
+        let command = parse_command_args(
+            [
+                OsString::from("continue"),
+                OsString::from("recordings/session-123"),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        let Command::Continue { session_directory } = command else {
+            panic!("expected continue command");
         };
         assert_eq!(session_directory, Path::new("recordings/session-123"));
     }
