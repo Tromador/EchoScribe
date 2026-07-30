@@ -560,6 +560,10 @@ Resume failed transcription without restarting the entire session.
 - atomically record attempted start, next item, and process diagnostics while
   setting `transcription_failed`, then transition to `awaiting_operator`;
 - acquire the existing transcription lease before continuation repair;
+- acquire that lease before loading `session.json`, route/state validation, or
+  resolving any session-declared path for either transcription command;
+- keep session artefact validation, result/text mutation, worker execution,
+  final publication, and workflow updates within the protected region;
 - for positive rewind, find the earliest result intersecting the configured
   window ending at the last committed result's `end_ms`;
 - for zero rewind, retain the complete committed prefix;
@@ -577,11 +581,18 @@ Resume failed transcription without restarting the entire session.
   deterministically rebuild text, atomically publish
   `transcription/transcript.txt`, record completion, and transition to
   `complete`;
-- retain the transcription lease through final publication and state update.
+- retain the transcription lease through final publication and state update;
+- route every post-worker result-authority validation error through durable
+  transcription failure publication;
+- retain newline-terminated malformed or mismatched records unchanged and
+  record their safely validated prefix plus earliest unsafe work item;
+- continue to repair only a truncated final byte tail automatically.
 
 ### Required tests
 
 - failure after several committed items;
+- delayed stale observations in both transcription command paths reload
+  authority after lease acquisition and cannot overwrite a completed session;
 - next-uncommitted diagnostics derived after worker exit;
 - launch failure;
 - signal or status-less termination;
@@ -591,6 +602,11 @@ Resume failed transcription without restarting the entire session.
 - rewind crossing several work items;
 - overlapping work items preserving a contiguous prefix;
 - truncated final result repair;
+- valid prefix followed by a complete malformed result and non-zero exit;
+- mismatched result followed by zero exit;
+- durable operator state for both result-integrity failures;
+- failed second result-integrity state publication leaves a recoverable
+  `transcription_failed` session;
 - no duplicate JSONL authority;
 - deterministic text reconstruction;
 - crash after prepared checkpoint;

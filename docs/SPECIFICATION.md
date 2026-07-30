@@ -165,10 +165,12 @@ The repository root is the Cargo application root. The subordinate worker is
 workflow authority and must not modify `session.json`.
 
 Only one transcription invocation may own a session at a time. Exclusive
-ownership covers result-prefix repair, partial-transcript reconstruction, and
-the complete worker lifetime. It must remain effective while an orphaned worker
-process is still running and become recoverable after every owning process has
-terminated.
+ownership is acquired before loading `session.json` or resolving any
+session-declared path. It covers workflow and route validation, session-local
+artefact validation, result-prefix repair, partial-transcript reconstruction,
+the complete worker lifetime, final publication, and workflow updates. It must
+remain effective while an orphaned worker process is still running and become
+recoverable after every owning process has terminated.
 
 The transcription design must not assume that completed whole-session files are the only possible source of transcription audio.
 
@@ -365,6 +367,13 @@ Failure publication atomically appends the failure evidence and sets
 `transcription_failed`, followed by a separate transition to
 `awaiting_operator`. A session stranded in `transcription_failed` because the
 second publication failed remains explicitly continuable.
+
+Result-authority validation after worker termination is part of failure
+handling. A newline-terminated malformed or provenance-mismatched result is not
+discarded or skipped. EchoScribe records the process outcome, integrity error,
+safely validated prefix length, and earliest unsafe sequence and work item
+before waiting for operator action. Only an incomplete final byte tail may be
+truncated automatically.
 
 ## 14. Recovery and continuation
 

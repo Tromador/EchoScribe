@@ -8,6 +8,7 @@ use std::{
     collections::HashMap,
     env,
     ffi::OsString,
+    fmt,
     fs::{self, File, OpenOptions, TryLockError},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
@@ -201,6 +202,15 @@ fn run_with_worker(
     config_path: &Path,
     worker: &dyn WorkerProcess,
 ) -> Result<()> {
+    run_with_worker_before_lease(session_directory, config_path, worker, || {})
+}
+
+fn run_with_worker_before_lease(
+    session_directory: &Path,
+    config_path: &Path,
+    worker: &dyn WorkerProcess,
+    before_lease: impl FnOnce(),
+) -> Result<()> {
     let settings = OfflineTranscriptionConfig::load(config_path)?;
     if let Some(warning) = &settings.vocabulary_warning {
         eprintln!("Warning: {warning}.");
@@ -218,6 +228,10 @@ fn run_with_worker(
             config_path.display()
         )
     })?;
+    before_lease();
+    // Every session-derived read happens after ownership is exclusive. A
+    // caller delayed before this point cannot carry stale authority forward.
+    let lease = TranscriptionLease::acquire(&session_directory)?;
     let mut session = SessionStore::load(&session_directory).with_context(|| {
         format!(
             "failed to load workflow state from {}",
@@ -237,9 +251,6 @@ fn run_with_worker(
     );
     let tracks = validate_session_artifacts(&session_directory, session.record())?;
     let work_items = read_work_manifest(&manifest_path, session.record(), &tracks)?;
-    // From this point through worker exit, no other invocation may inspect and
-    // repair the same append-oriented authority.
-    let lease = TranscriptionLease::acquire(&session_directory)?;
 
     if session.record().state == WorkflowState::ReadyForTranscription {
         prepare_empty_results(&session_directory)?;
@@ -287,6 +298,15 @@ fn continue_with_worker(
     config_path: &Path,
     worker: &dyn WorkerProcess,
 ) -> Result<()> {
+    continue_with_worker_before_lease(session_directory, config_path, worker, || {})
+}
+
+fn continue_with_worker_before_lease(
+    session_directory: &Path,
+    config_path: &Path,
+    worker: &dyn WorkerProcess,
+    before_lease: impl FnOnce(),
+) -> Result<()> {
     let settings = OfflineTranscriptionConfig::load(config_path)?;
     if let Some(warning) = &settings.vocabulary_warning {
         eprintln!("Warning: {warning}.");
@@ -304,6 +324,10 @@ fn continue_with_worker(
             config_path.display()
         )
     })?;
+    before_lease();
+    // Continuation route selection and every path derived from session.json are
+    // protected by the same lease as result repair and worker execution.
+    let lease = TranscriptionLease::acquire(&session_directory)?;
     let mut session = SessionStore::load(&session_directory).with_context(|| {
         format!(
             "failed to load workflow state from {}",
@@ -333,9 +357,6 @@ fn continue_with_worker(
             .path,
     );
 
-    // Repair, rewind, text reconstruction, worker execution and final
-    // publication all share the same exclusive session ownership.
-    let lease = TranscriptionLease::acquire(&session_directory)?;
     let committed = validate_and_repair_result_prefix(&results_path, &work_items)?;
 
     if session.record().state == WorkflowState::TranscriptionFailed {
@@ -409,55 +430,64 @@ fn run_worker_attempt(
         next_sequence: attempted_start_sequence,
         settings,
     };
-    match worker.run(&invocation, lease) {
-        Err(error) => record_worker_failure(
-            session,
-            results_path,
-            work_items,
-            attempted_start_sequence,
-            format!("launch_failure: {error:#}"),
-        ),
-        Ok(exit) if !exit.success => {
-            let diagnostic = match exit.code {
+    let (worker_succeeded, process_diagnostic) = match worker.run(&invocation, lease) {
+        Err(error) => (false, format!("launch_failure: {error:#}")),
+        Ok(exit) if exit.success => (true, "zero_exit".to_owned()),
+        Ok(exit) => (
+            false,
+            match exit.code {
                 Some(code) => format!("non_zero_exit: status {code}"),
                 None => "signal_termination: worker terminated without an exit status".to_owned(),
-            };
-            record_worker_failure(
+            },
+        ),
+    };
+
+    let committed = match validate_and_repair_result_prefix_detailed(results_path, work_items) {
+        Ok(committed) => committed,
+        Err(integrity) => {
+            return record_result_integrity_failure(
                 session,
-                results_path,
-                work_items,
                 attempted_start_sequence,
-                diagnostic,
-            )
-        }
-        Ok(_) => {
-            let committed = validate_and_repair_result_prefix(results_path, work_items)?;
-            if committed.len() != work_items.len() {
-                return record_worker_failure(
-                    session,
-                    results_path,
-                    work_items,
-                    attempted_start_sequence,
-                    format!(
-                        "incomplete_zero_exit: committed {} of {} work items",
-                        committed.len(),
-                        work_items.len()
-                    ),
-                );
-            }
-            rebuild_partial_transcript(session_directory, transcript_path, &committed)?;
-            publish_final_transcript(session_directory, transcript_path)?;
-            session
-                .publish_transcription_complete(unix_millis_now()?)
-                .context("final transcript was published but session completion state was not")?;
-            println!(
-                "Transcription completed for session {}; final transcript: {}.",
-                session.record().session_id,
-                session_directory.join(FINAL_TRANSCRIPT_PATH).display()
+                &process_diagnostic,
+                &integrity,
             );
-            Ok(())
         }
+    };
+
+    if !worker_succeeded {
+        return record_worker_failure(
+            session,
+            work_items,
+            &committed,
+            attempted_start_sequence,
+            process_diagnostic,
+        );
     }
+    if committed.len() != work_items.len() {
+        return record_worker_failure(
+            session,
+            work_items,
+            &committed,
+            attempted_start_sequence,
+            format!(
+                "incomplete_zero_exit: committed {} of {} work items",
+                committed.len(),
+                work_items.len()
+            ),
+        );
+    }
+
+    rebuild_partial_transcript(session_directory, transcript_path, &committed)?;
+    publish_final_transcript(session_directory, transcript_path)?;
+    session
+        .publish_transcription_complete(unix_millis_now()?)
+        .context("final transcript was published but session completion state was not")?;
+    println!(
+        "Transcription completed for session {}; final transcript: {}.",
+        session.record().session_id,
+        session_directory.join(FINAL_TRANSCRIPT_PATH).display()
+    );
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -498,15 +528,11 @@ fn validate_transcription_continuation_entry(record: &SessionRecord) -> Result<(
 
 fn record_worker_failure(
     session: &mut SessionStore,
-    results_path: &Path,
     work_items: &[WorkItem],
+    committed: &[TranscriptionResult],
     attempted_start_sequence: u64,
     process_diagnostic: String,
 ) -> Result<()> {
-    // The worker may have committed several more items before terminating.
-    // Re-read authority now rather than trusting its original start sequence.
-    let committed = validate_and_repair_result_prefix(results_path, work_items)
-        .context("failed to derive post-worker committed result prefix")?;
     let next_uncommitted_sequence = u64::try_from(committed.len())
         .ok()
         .and_then(|value| value.checked_add(1))
@@ -519,9 +545,34 @@ fn record_worker_failure(
          next_uncommitted_sequence={next_uncommitted_sequence}; \
          next_work_item_id={next_work_item_id}; process={process_diagnostic}"
     );
+    publish_transcription_failure_and_wait(session, &message, &process_diagnostic)
+}
 
+fn record_result_integrity_failure(
+    session: &mut SessionStore,
+    attempted_start_sequence: u64,
+    process_diagnostic: &str,
+    integrity: &ResultAuthorityFailure,
+) -> Result<()> {
+    let message = format!(
+        "attempted_start_sequence={attempted_start_sequence}; process={process_diagnostic}; \
+         result_integrity_error={}; safely_validated_prefix_length={}; \
+         earliest_unsafe_sequence={}; earliest_unsafe_work_item_id={}",
+        integrity.message,
+        integrity.safely_validated_prefix_length,
+        integrity.earliest_unsafe_sequence,
+        integrity.earliest_unsafe_work_item_id
+    );
+    publish_transcription_failure_and_wait(session, &message, process_diagnostic)
+}
+
+fn publish_transcription_failure_and_wait(
+    session: &mut SessionStore,
+    message: &str,
+    process_diagnostic: &str,
+) -> Result<()> {
     session
-        .publish_transcription_failure(unix_millis_now()?, &message)
+        .publish_transcription_failure(unix_millis_now()?, message)
         .context("failed to publish durable transcription failure")?;
     if let Err(error) = session.transition(WorkflowState::AwaitingOperator, unix_millis_now()?) {
         bail!(
@@ -916,12 +967,68 @@ fn prepare_empty_results(session_directory: &Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct ResultAuthorityFailure {
+    message: String,
+    safely_validated_prefix_length: usize,
+    earliest_unsafe_sequence: u64,
+    earliest_unsafe_work_item_id: String,
+}
+
+impl fmt::Display for ResultAuthorityFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}; safely validated prefix length {}; earliest unsafe sequence {}; \
+             earliest unsafe work item {}",
+            self.message,
+            self.safely_validated_prefix_length,
+            self.earliest_unsafe_sequence,
+            self.earliest_unsafe_work_item_id
+        )
+    }
+}
+
+impl std::error::Error for ResultAuthorityFailure {}
+
+fn result_authority_failure(
+    message: impl Into<String>,
+    safely_validated_prefix_length: usize,
+    work_items: &[WorkItem],
+) -> ResultAuthorityFailure {
+    let earliest_unsafe_sequence = u64::try_from(safely_validated_prefix_length)
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .unwrap_or(u64::MAX);
+    let earliest_unsafe_work_item_id = work_items
+        .get(safely_validated_prefix_length)
+        .map_or_else(|| "none".to_owned(), |item| item.id.clone());
+    ResultAuthorityFailure {
+        message: message.into(),
+        safely_validated_prefix_length,
+        earliest_unsafe_sequence,
+        earliest_unsafe_work_item_id,
+    }
+}
+
 fn validate_and_repair_result_prefix(
     path: &Path,
     work_items: &[WorkItem],
 ) -> Result<Vec<TranscriptionResult>> {
-    let bytes =
-        fs::read(path).with_context(|| format!("failed to read results {}", path.display()))?;
+    validate_and_repair_result_prefix_detailed(path, work_items).map_err(anyhow::Error::new)
+}
+
+fn validate_and_repair_result_prefix_detailed(
+    path: &Path,
+    work_items: &[WorkItem],
+) -> std::result::Result<Vec<TranscriptionResult>, ResultAuthorityFailure> {
+    let bytes = fs::read(path).map_err(|error| {
+        result_authority_failure(
+            format!("failed to read results {}: {error}", path.display()),
+            0,
+            work_items,
+        )
+    })?;
     let committed_length = if bytes.is_empty() || bytes.ends_with(b"\n") {
         bytes.len()
     } else {
@@ -938,38 +1045,85 @@ fn validate_and_repair_result_prefix(
             if result_body.is_empty() {
                 break;
             }
-            bail!(
-                "blank interior transcription result at line {} in {}",
-                index + 1,
-                path.display()
-            );
+            return Err(result_authority_failure(
+                format!(
+                    "blank interior transcription result at line {} in {}",
+                    index + 1,
+                    path.display()
+                ),
+                results.len(),
+                work_items,
+            ));
         }
-        let result: TranscriptionResult = serde_json::from_slice(line).with_context(|| {
-            format!(
-                "malformed interior transcription result at line {} in {}",
-                index + 1,
-                path.display()
+        let result: TranscriptionResult = serde_json::from_slice(line).map_err(|error| {
+            result_authority_failure(
+                format!(
+                    "malformed interior transcription result at line {} in {}: {error}",
+                    index + 1,
+                    path.display()
+                ),
+                results.len(),
+                work_items,
             )
         })?;
         let work_item = work_items.get(results.len()).ok_or_else(|| {
-            anyhow!(
-                "transcription results contain sequence {} beyond the work manifest",
-                result.sequence
+            result_authority_failure(
+                format!(
+                    "transcription results contain sequence {} beyond the work manifest",
+                    result.sequence
+                ),
+                results.len(),
+                work_items,
             )
         })?;
-        validate_result_matches_work_item(&result, work_item)?;
+        validate_result_matches_work_item(&result, work_item).map_err(|error| {
+            result_authority_failure(error.to_string(), results.len(), work_items)
+        })?;
         results.push(result);
     }
 
     if committed_length != bytes.len() {
-        let file = OpenOptions::new().write(true).open(path)?;
-        file.set_len(
-            u64::try_from(committed_length)
-                .map_err(|_| anyhow!("result prefix length does not fit in u64"))?,
-        )?;
-        file.sync_all()?;
+        let file = OpenOptions::new().write(true).open(path).map_err(|error| {
+            result_authority_failure(
+                format!(
+                    "failed to open truncated results {} for repair: {error}",
+                    path.display()
+                ),
+                results.len(),
+                work_items,
+            )
+        })?;
+        file.set_len(u64::try_from(committed_length).map_err(|_| {
+            result_authority_failure(
+                "result prefix length does not fit in u64",
+                results.len(),
+                work_items,
+            )
+        })?)
+        .map_err(|error| {
+            result_authority_failure(
+                format!("failed to truncate result byte tail: {error}"),
+                results.len(),
+                work_items,
+            )
+        })?;
+        file.sync_all().map_err(|error| {
+            result_authority_failure(
+                format!("failed to synchronise repaired results: {error}"),
+                results.len(),
+                work_items,
+            )
+        })?;
         if let Some(directory) = path.parent() {
-            File::open(directory)?.sync_all()?;
+            File::open(directory)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| {
+                    result_authority_failure(
+                        format!("failed to synchronise repaired result directory: {error}"),
+                        results.len(),
+                        work_items,
+                    )
+                })?;
         }
     }
     Ok(results)
@@ -1102,7 +1256,7 @@ fn unix_millis_now() -> Result<u64> {
 mod tests {
     use std::{
         env, process,
-        sync::{Mutex, mpsc},
+        sync::{Arc, Mutex, mpsc},
         thread,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
@@ -1222,6 +1376,57 @@ mod tests {
             Ok(WorkerExit {
                 success: false,
                 code: Some(23),
+            })
+        }
+    }
+
+    struct MalformedThenFailureWorker;
+
+    impl WorkerProcess for MalformedThenFailureWorker {
+        fn run(
+            &self,
+            invocation: &WorkerInvocation<'_>,
+            _lease: &TranscriptionLease,
+        ) -> Result<WorkerExit> {
+            commit_remaining_results(invocation, 1)?;
+            let mut results = OpenOptions::new()
+                .append(true)
+                .open(invocation.results_path)?;
+            results.write_all(b"{malformed complete record}\n")?;
+            results.sync_all()?;
+            Ok(WorkerExit {
+                success: false,
+                code: Some(31),
+            })
+        }
+    }
+
+    struct MismatchedThenZeroWorker;
+
+    impl WorkerProcess for MismatchedThenZeroWorker {
+        fn run(
+            &self,
+            invocation: &WorkerInvocation<'_>,
+            _lease: &TranscriptionLease,
+        ) -> Result<WorkerExit> {
+            let manifest = fs::read_to_string(invocation.manifest_path)?;
+            let item: WorkItem = serde_json::from_str(
+                manifest
+                    .lines()
+                    .next()
+                    .ok_or_else(|| anyhow!("test manifest is empty"))?,
+            )?;
+            let mut result = complete_result(&item, "Mismatched");
+            result.speaker = "Wrong speaker".to_owned();
+            let mut results = OpenOptions::new()
+                .append(true)
+                .open(invocation.results_path)?;
+            serde_json::to_writer(&mut results, &result)?;
+            results.write_all(b"\n")?;
+            results.sync_all()?;
+            Ok(WorkerExit {
+                success: true,
+                code: Some(0),
             })
         }
     }
@@ -1416,6 +1621,114 @@ mod tests {
 
         release_sender.send(()).unwrap();
         assert!(first.join().unwrap().is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn delayed_invocation_reloads_authority_after_acquiring_lease() {
+        let (directory, config_path, _) = ready_session("stale-authority");
+        let (observed_sender, observed_receiver) = mpsc::channel();
+        let (resume_sender, resume_receiver) = mpsc::channel();
+        let delayed_directory = directory.clone();
+        let delayed_config = config_path.clone();
+        let delayed_worker = Arc::new(FakeWorker::successful());
+        let delayed_worker_thread = Arc::clone(&delayed_worker);
+        let delayed = thread::spawn(move || {
+            run_with_worker_before_lease(
+                &delayed_directory,
+                &delayed_config,
+                delayed_worker_thread.as_ref(),
+                || {
+                    let stale = SessionStore::load(&delayed_directory).unwrap();
+                    assert_eq!(stale.record().state, WorkflowState::ReadyForTranscription);
+                    observed_sender.send(()).unwrap();
+                    resume_receiver.recv().unwrap();
+                },
+            )
+        });
+        observed_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("delayed invocation did not observe old authority");
+
+        run_with_worker(&directory, &config_path, &FakeWorker::successful()).unwrap();
+        let session_before = fs::read(directory.join("session.json")).unwrap();
+        let results_before =
+            fs::read(directory.join(crate::artifacts::TRANSCRIPTION_RESULTS_PATH)).unwrap();
+        let final_before = fs::read(directory.join(FINAL_TRANSCRIPT_PATH)).unwrap();
+        assert!(!directory.join(PARTIAL_TRANSCRIPT_FILE_NAME).exists());
+
+        resume_sender.send(()).unwrap();
+        let error = delayed.join().unwrap().unwrap_err();
+
+        assert!(error.to_string().contains("found complete"));
+        assert!(delayed_worker.invocations.lock().unwrap().is_empty());
+        assert_eq!(
+            fs::read(directory.join("session.json")).unwrap(),
+            session_before
+        );
+        assert_eq!(
+            fs::read(directory.join(crate::artifacts::TRANSCRIPTION_RESULTS_PATH)).unwrap(),
+            results_before
+        );
+        assert_eq!(
+            fs::read(directory.join(FINAL_TRANSCRIPT_PATH)).unwrap(),
+            final_before
+        );
+        assert!(!directory.join(PARTIAL_TRANSCRIPT_FILE_NAME).exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn delayed_configured_continue_reloads_authority_after_lease() {
+        let (directory, config_path, _) =
+            failed_session_with_results("stale-continue-authority", &[(0, 10_000)], 0);
+        let (observed_sender, observed_receiver) = mpsc::channel();
+        let (resume_sender, resume_receiver) = mpsc::channel();
+        let delayed_directory = directory.clone();
+        let delayed_config = config_path.clone();
+        let delayed_worker = Arc::new(FakeWorker::successful());
+        let delayed_worker_thread = Arc::clone(&delayed_worker);
+        let delayed = thread::spawn(move || {
+            continue_with_worker_before_lease(
+                &delayed_directory,
+                &delayed_config,
+                delayed_worker_thread.as_ref(),
+                || {
+                    let stale = SessionStore::load(&delayed_directory).unwrap();
+                    assert_eq!(stale.record().state, WorkflowState::AwaitingOperator);
+                    observed_sender.send(()).unwrap();
+                    resume_receiver.recv().unwrap();
+                },
+            )
+        });
+        observed_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("delayed continuation did not observe old authority");
+
+        continue_with_worker(&directory, &config_path, &FakeWorker::successful()).unwrap();
+        let session_before = fs::read(directory.join("session.json")).unwrap();
+        let results_before =
+            fs::read(directory.join(crate::artifacts::TRANSCRIPTION_RESULTS_PATH)).unwrap();
+        let final_before = fs::read(directory.join(FINAL_TRANSCRIPT_PATH)).unwrap();
+
+        resume_sender.send(()).unwrap();
+        let error = delayed.join().unwrap().unwrap_err();
+
+        assert!(error.to_string().contains("found format 5 state complete"));
+        assert!(delayed_worker.invocations.lock().unwrap().is_empty());
+        assert_eq!(
+            fs::read(directory.join("session.json")).unwrap(),
+            session_before
+        );
+        assert_eq!(
+            fs::read(directory.join(crate::artifacts::TRANSCRIPTION_RESULTS_PATH)).unwrap(),
+            results_before
+        );
+        assert_eq!(
+            fs::read(directory.join(FINAL_TRANSCRIPT_PATH)).unwrap(),
+            final_before
+        );
+        assert!(!directory.join(PARTIAL_TRANSCRIPT_FILE_NAME).exists());
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1651,6 +1964,78 @@ mod tests {
             .unwrap()
             .len(),
             3
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn malformed_complete_result_after_nonzero_exit_is_durable_and_untouched() {
+        let (directory, config_path, items) = session_with_items(
+            "malformed-post-worker",
+            &[(0, 10_000), (20_000, 30_000), (40_000, 50_000)],
+        );
+
+        let error =
+            run_with_worker(&directory, &config_path, &MalformedThenFailureWorker).unwrap_err();
+
+        assert!(error.to_string().contains("status 31"));
+        let results_path = directory.join(crate::artifacts::TRANSCRIPTION_RESULTS_PATH);
+        let results = fs::read(&results_path).unwrap();
+        assert!(results.ends_with(b"{malformed complete record}\n"));
+        let session = SessionStore::load(&directory).unwrap();
+        assert_eq!(session.record().state, WorkflowState::AwaitingOperator);
+        let failure = &session.record().failures.last().unwrap().message;
+        assert!(failure.contains("process=non_zero_exit: status 31"));
+        assert!(failure.contains("result_integrity_error=malformed interior"));
+        assert!(failure.contains("safely_validated_prefix_length=1"));
+        assert!(failure.contains("earliest_unsafe_sequence=2"));
+        assert!(failure.contains(&format!("earliest_unsafe_work_item_id={}", items[1].id)));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn mismatched_result_after_zero_exit_is_durable_and_untouched() {
+        let (directory, config_path, item) = ready_session("mismatched-post-worker");
+
+        let error =
+            run_with_worker(&directory, &config_path, &MismatchedThenZeroWorker).unwrap_err();
+
+        assert!(error.to_string().contains("zero_exit"));
+        let results_path = directory.join(crate::artifacts::TRANSCRIPTION_RESULTS_PATH);
+        let results_before = fs::read(&results_path).unwrap();
+        assert!(results_before.ends_with(b"\n"));
+        let session = SessionStore::load(&directory).unwrap();
+        assert_eq!(session.record().state, WorkflowState::AwaitingOperator);
+        let failure = &session.record().failures.last().unwrap().message;
+        assert!(failure.contains("process=zero_exit"));
+        assert!(failure.contains("result_integrity_error=transcription result sequence 1"));
+        assert!(failure.contains("safely_validated_prefix_length=0"));
+        assert!(failure.contains("earliest_unsafe_sequence=1"));
+        assert!(failure.contains(&format!("earliest_unsafe_work_item_id={}", item.id)));
+        assert_eq!(fs::read(&results_path).unwrap(), results_before);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn result_integrity_failure_can_remain_recoverably_transcription_failed() {
+        let (directory, config_path, _) = ready_session("integrity-stranded");
+        // Start and atomic failure publication succeed; awaiting_operator fails.
+        fail_record_write_after(&directory, 2);
+
+        let error =
+            run_with_worker(&directory, &config_path, &MismatchedThenZeroWorker).unwrap_err();
+
+        assert!(error.to_string().contains("remains transcription_failed"));
+        let session = SessionStore::load(&directory).unwrap();
+        assert_eq!(session.record().state, WorkflowState::TranscriptionFailed);
+        assert!(
+            session
+                .record()
+                .failures
+                .last()
+                .unwrap()
+                .message
+                .contains("result_integrity_error=transcription result sequence 1")
         );
         fs::remove_dir_all(directory).unwrap();
     }

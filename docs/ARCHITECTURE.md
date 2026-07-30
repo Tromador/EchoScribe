@@ -523,9 +523,12 @@ prefix beginning at sequence 1, truncates only an incomplete final record back
 to the last validated newline, rebuilds and synchronises
 `transcript.partial.txt`, and resumes at the next item without rewind.
 
-Rust acquires an exclusive per-session transcription lease before result-prefix
-repair or partial-transcript reconstruction and retains it for the complete
-worker lifetime. The lock is held through an operating-system file lock on
+Rust acquires an exclusive per-session transcription lease before loading
+`session.json`. Session state and route validation, work/result path resolution,
+track and work-manifest validation, result-prefix repair, text mutation, worker
+execution, final publication, and workflow updates all occur while that lease
+is held. No session-derived data read before ownership may be carried into the
+protected operation. The lock is held through an operating-system file lock on
 `transcription/worker.lock`; the persistent filename is not evidence of current
 ownership. A duplicated locked handle is inherited by the Python worker so an
 orphaned child continues to exclude another invocation after its Rust parent
@@ -718,6 +721,14 @@ then present, not from the originally supplied start sequence. Launch failure,
 non-zero exit, and signal termination are distinguished. Failure evidence
 records the attempted start sequence, next uncommitted sequence and work-item
 ID, and process diagnostic.
+
+If post-worker result validation encounters a newline-terminated malformed or
+provenance-mismatched record, that authority is not truncated or skipped.
+Failure evidence instead records the process diagnostic, result-integrity
+error, safely validated prefix length, and earliest unsafe sequence and work
+item. The same durable `transcription_failed` then `awaiting_operator` route
+applies after non-zero, signal, launch, and zero-exit outcomes. Only a truncated
+final byte tail is repaired automatically.
 
 After a zero worker exit, Rust verifies that every work item has exactly one
 matching result, deterministically rebuilds the partial transcript, atomically
