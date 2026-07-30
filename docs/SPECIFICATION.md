@@ -164,13 +164,16 @@ The repository root is the Cargo application root. The subordinate worker is
 `workers/faster-whisper/transcription_worker.py`; it is not an independent
 workflow authority and must not modify `session.json`.
 
-Only one transcription invocation may own a session at a time. Exclusive
-ownership is acquired before loading `session.json` or resolving any
-session-declared path. It covers workflow and route validation, session-local
-artefact validation, result-prefix repair, partial-transcript reconstruction,
-the complete worker lifetime, final publication, and workflow updates. It must
-remain effective while an orphaned worker process is still running and become
-recoverable after every owning process has terminated.
+Only one offline operation which mutates session authority or a
+session-declared artefact may own a session at a time. `recover`,
+`continue <session>`, `build-work-items`, `transcribe`, and configured
+transcription `continue` share that exclusive ownership boundary. Ownership is
+acquired before loading `session.json` or resolving any session-declared path
+and is retained through validation, derived-artefact publication, worker
+execution where applicable, and workflow updates. It must remain effective
+while an orphaned worker process is still running and become recoverable after
+every owning process has terminated. Read-only inspection and verification do
+not require exclusive ownership.
 
 The transcription design must not assume that completed whole-session files are the only possible source of transcription audio.
 
@@ -395,6 +398,11 @@ session with no transcription-results description.
 `continue <session> <config>` resumes a format-5 transcription failure from
 `awaiting_operator` or `transcription_failed`. The two forms reject mismatched
 session formats, artefact descriptions, states, and arguments before mutation.
+
+All three mutating routes acquire the shared per-session operation lease before
+loading workflow authority. A delayed invocation must therefore reload and
+validate current authority after it obtains ownership rather than publishing a
+stale `SessionStore`.
 
 For transcription continuation:
 

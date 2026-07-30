@@ -402,6 +402,8 @@ Produce chronological, time-ranged transcription work items from healthy aligned
 - create stable work-item IDs;
 - sort globally by start time with deterministic tie-breaking;
 - expose `build-work-items <session> <config>` as the explicit offline command;
+- acquire the shared per-session operation lease before loading workflow
+  authority and retain it through manifest and session publication;
 - require `ready_for_transcription` and validate session-local artefacts plus
   complete routine tracks;
 - load `merge_gap_ms` without depending on Discord connectivity, the Discord
@@ -471,8 +473,9 @@ Transcribe one session through one Python process and one faster-whisper model l
 - controlled restart accepts only a matching contiguous result prefix,
   discards only a truncated final record, rebuilds the partial text from that
   prefix, and resumes at the next item without rewind;
-- acquire one exclusive per-session transcription lease before prefix repair or
-  text reconstruction and retain it for the complete worker lifetime;
+- acquire the shared per-session operation lease before loading workflow
+  authority, prefix repair, or text reconstruction and retain it for the
+  complete worker lifetime;
 - pass a duplicated locked handle into the worker so an orphaned Python child
   continues to exclude another invocation, while operating-system release
   after the final handle closes provides stale/crash recovery;
@@ -559,9 +562,11 @@ Resume failed transcription without restarting the entire session.
 - distinguish launch failure, non-zero exit, and signal termination;
 - atomically record attempted start, next item, and process diagnostics while
   setting `transcription_failed`, then transition to `awaiting_operator`;
-- acquire the existing transcription lease before continuation repair;
+- use the shared per-session operation lease for `recover`, recording
+  `continue`, `build-work-items`, `transcribe`, and configured transcription
+  `continue`;
 - acquire that lease before loading `session.json`, route/state validation, or
-  resolving any session-declared path for either transcription command;
+  resolving any session-declared path for every mutating offline command;
 - keep session artefact validation, result/text mutation, worker execution,
   final publication, and workflow updates within the protected region;
 - for positive rewind, find the earliest result intersecting the configured
@@ -581,7 +586,8 @@ Resume failed transcription without restarting the entire session.
   deterministically rebuild text, atomically publish
   `transcription/transcript.txt`, record completion, and transition to
   `complete`;
-- retain the transcription lease through final publication and state update;
+- retain the shared session-operation lease through final publication and state
+  update;
 - route every post-worker result-authority validation error through durable
   transcription failure publication;
 - retain newline-terminated malformed or mismatched records unchanged and
@@ -593,6 +599,12 @@ Resume failed transcription without restarting the entire session.
 - failure after several committed items;
 - delayed stale observations in both transcription command paths reload
   authority after lease acquisition and cannot overwrite a completed session;
+- a delayed work-manifest builder reloads completed authority after lease
+  acquisition and cannot alter session, work, result, partial, or final
+  transcript artefacts;
+- a blocking transcription worker excludes work-manifest publication;
+- recording recovery and recording continuation cannot publish while another
+  mutating session operation owns the lease;
 - next-uncommitted diagnostics derived after worker exit;
 - launch failure;
 - signal or status-less termination;

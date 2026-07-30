@@ -523,15 +523,22 @@ prefix beginning at sequence 1, truncates only an incomplete final record back
 to the last validated newline, rebuilds and synchronises
 `transcript.partial.txt`, and resumes at the next item without rewind.
 
-Rust acquires an exclusive per-session transcription lease before loading
-`session.json`. Session state and route validation, work/result path resolution,
-track and work-manifest validation, result-prefix repair, text mutation, worker
-execution, final publication, and workflow updates all occur while that lease
-is held. No session-derived data read before ownership may be carried into the
-protected operation. The lock is held through an operating-system file lock on
+Rust uses one exclusive per-session operation lease for every offline command
+which mutates session authority or a session-declared artefact: `recover`,
+recording `continue`, `build-work-items`, `transcribe`, and configured
+transcription `continue`. Each route acquires the lease before loading
+`session.json`; session state and route validation, declared-path resolution,
+derived-artefact publication, and related workflow updates occur while it is
+held. No session-derived data read before ownership may be carried into the
+protected operation. Read-only commands such as `inspect` and `verify` do not
+take exclusive ownership.
+
+The lock remains an operating-system file lock on
 `transcription/worker.lock`; the persistent filename is not evidence of current
-ownership. A duplicated locked handle is inherited by the Python worker so an
-orphaned child continues to exclude another invocation after its Rust parent
+ownership. The transcription directory may be created solely to open this
+coordination file before state validation, but no workflow authority is mutated
+at that point. A duplicated locked handle is inherited by the Python worker so
+an orphaned child continues to exclude another invocation after its Rust parent
 terminates. The operating system releases the lease after the last owning
 Rust/Python handle closes, permitting controlled restart without PID files,
 manual lock deletion, or elapsed-time guesses.
@@ -640,6 +647,8 @@ No recovery or transcription starts automatically.
 
 `recover <session>`:
 
+- acquires the shared session-operation lease before loading workflow
+  authority;
 - validates authoritative journals;
 - with no user IDs, regenerates every track currently marked incomplete;
 - with one or more Discord user IDs, regenerates exactly those tracks;
@@ -662,6 +671,8 @@ remain in `session.json`.
 
 `continue <session>`:
 
+- acquires the shared session-operation lease before loading workflow
+  authority;
 - validates session state;
 - validates required journals and session artefacts;
 - derives the complete required Discord-user set by resolving every decoded
@@ -679,7 +690,8 @@ FLAC and continues to block while unresolved.
 
 For transcription failure it:
 
-1. acquires the exclusive transcription lease;
+1. acquires the shared session-operation lease before loading workflow
+   authority;
 2. validates and repairs only a truncated final JSONL record;
 3. reuses an unapplied prepared resume target, if one exists;
 4. otherwise finds the last globally contiguous committed result and calculates

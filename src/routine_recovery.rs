@@ -24,6 +24,7 @@ use flac_codec::{
 use crate::{
     artifacts::TRACK_DIRECTORY_NAME,
     diagnostics::{CHANNELS, DecodedFrame, SAMPLE_RATE, SAMPLES_PER_TICK},
+    operation_lease::SessionOperationLease,
     recover,
     session::{
         EVENT_FORMAT_VERSION, LEGACY_EVENT_FORMAT_VERSION, SessionEvent, SessionFiles,
@@ -40,7 +41,14 @@ pub(crate) const RECOVERY_COMPLETED_PREFIX: &str = "track_recovery_completed_use
 
 /// Recover all incomplete tracks, or exactly the explicitly named users.
 pub(crate) fn run(session_directory: &Path, requested_users: &[u64]) -> Result<()> {
-    let mut session = SessionStore::load(session_directory).with_context(|| {
+    let session_directory = fs::canonicalize(session_directory).with_context(|| {
+        format!(
+            "failed to resolve session directory {}",
+            session_directory.display()
+        )
+    })?;
+    let _lease = SessionOperationLease::acquire(&session_directory)?;
+    let mut session = SessionStore::load(&session_directory).with_context(|| {
         format!(
             "failed to load workflow state from {}",
             session_directory.display()
@@ -74,7 +82,7 @@ pub(crate) fn run(session_directory: &Path, requested_users: &[u64]) -> Result<(
     )?;
 
     let result = recover_selected(
-        session_directory,
+        &session_directory,
         &session.record().files,
         &mut manifest,
         &targets,
@@ -855,6 +863,33 @@ mod tests {
         let manifest = TrackManifest::read(&directory.join(TRACK_MANIFEST_FILE_NAME)).unwrap();
         assert_eq!(manifest.tracks[0].state, TrackState::Incomplete);
         assert!(!directory.join("tracks/user-11.flac").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recovery_cannot_publish_while_another_session_operation_owns_the_lease() {
+        let directory = fixture("operation-lease", &[(11, 100)]);
+        let lease = SessionOperationLease::acquire(&directory).unwrap();
+        let session_before = fs::read(directory.join("session.json")).unwrap();
+        let manifest_before = fs::read(directory.join(TRACK_MANIFEST_FILE_NAME)).unwrap();
+
+        let error = run(&directory, &[]).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("another mutating operation is already active")
+        );
+        assert_eq!(
+            fs::read(directory.join("session.json")).unwrap(),
+            session_before
+        );
+        assert_eq!(
+            fs::read(directory.join(TRACK_MANIFEST_FILE_NAME)).unwrap(),
+            manifest_before
+        );
+        assert!(!directory.join("tracks/user-11.flac").exists());
+        drop(lease);
         fs::remove_dir_all(directory).unwrap();
     }
 

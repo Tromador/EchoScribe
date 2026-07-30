@@ -9,7 +9,7 @@ use std::{
     env,
     ffi::OsString,
     fmt,
-    fs::{self, File, OpenOptions, TryLockError},
+    fs::{self, File, OpenOptions},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -26,6 +26,7 @@ use crate::{
         WORK_ITEM_MANIFEST_FORMAT_VERSION,
     },
     config::OfflineTranscriptionConfig,
+    operation_lease::SessionOperationLease,
     participants::ParticipantContext,
     session::{
         RECORDING_SESSION_FORMAT_VERSION, SESSION_FORMAT_VERSION, SessionRecord, SessionStore,
@@ -38,7 +39,6 @@ use crate::{
 const RESULTS_TEMP_FILE_NAME: &str = ".results.jsonl.tmp";
 const RESULTS_RESUME_TEMP_FILE_NAME: &str = ".results.jsonl.resume.tmp";
 const PARTIAL_TRANSCRIPT_TEMP_FILE_NAME: &str = ".transcript.partial.txt.tmp";
-const TRANSCRIPTION_LEASE_FILE_NAME: &str = "worker.lock";
 const RESUME_PREPARED_PREFIX: &str = "transcription_resume_prepared_";
 const RESUME_APPLIED_PREFIX: &str = "transcription_resume_applied_";
 
@@ -76,7 +76,7 @@ trait WorkerProcess {
     fn run(
         &self,
         invocation: &WorkerInvocation<'_>,
-        lease: &TranscriptionLease,
+        lease: &SessionOperationLease,
     ) -> Result<WorkerExit>;
 }
 
@@ -92,7 +92,7 @@ impl WorkerProcess for SystemWorker {
     fn run(
         &self,
         invocation: &WorkerInvocation<'_>,
-        lease: &TranscriptionLease,
+        lease: &SessionOperationLease,
     ) -> Result<WorkerExit> {
         let worker_path = worker_script_path();
         if !worker_path.is_file() {
@@ -149,46 +149,6 @@ impl WorkerProcess for SystemWorker {
     }
 }
 
-#[derive(Debug)]
-struct TranscriptionLease {
-    file: File,
-    path: PathBuf,
-}
-
-impl TranscriptionLease {
-    fn acquire(session_directory: &Path) -> Result<Self> {
-        let path = session_directory
-            .join(TRANSCRIPTION_DIRECTORY_NAME)
-            .join(TRANSCRIPTION_LEASE_FILE_NAME);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&path)
-            .with_context(|| format!("failed to open transcription lease {}", path.display()))?;
-        match file.try_lock() {
-            Ok(()) => Ok(Self { file, path }),
-            Err(TryLockError::WouldBlock) => bail!(
-                "transcription is already active for session {}; lease {} is held",
-                session_directory.display(),
-                path.display()
-            ),
-            Err(TryLockError::Error(error)) => Err(error).with_context(|| {
-                format!("failed to acquire transcription lease {}", path.display())
-            }),
-        }
-    }
-
-    fn inherited_handle(&self) -> Result<File> {
-        self.file.try_clone().with_context(|| {
-            format!(
-                "failed to duplicate transcription lease {} for worker",
-                self.path.display()
-            )
-        })
-    }
-}
-
 pub(crate) fn run(session_directory: &Path, config_path: &Path) -> Result<()> {
     run_with_worker(session_directory, config_path, &SystemWorker)
 }
@@ -231,7 +191,7 @@ fn run_with_worker_before_lease(
     before_lease();
     // Every session-derived read happens after ownership is exclusive. A
     // caller delayed before this point cannot carry stale authority forward.
-    let lease = TranscriptionLease::acquire(&session_directory)?;
+    let lease = SessionOperationLease::acquire(&session_directory)?;
     let mut session = SessionStore::load(&session_directory).with_context(|| {
         format!(
             "failed to load workflow state from {}",
@@ -327,7 +287,7 @@ fn continue_with_worker_before_lease(
     before_lease();
     // Continuation route selection and every path derived from session.json are
     // protected by the same lease as result repair and worker execution.
-    let lease = TranscriptionLease::acquire(&session_directory)?;
+    let lease = SessionOperationLease::acquire(&session_directory)?;
     let mut session = SessionStore::load(&session_directory).with_context(|| {
         format!(
             "failed to load workflow state from {}",
@@ -419,7 +379,7 @@ fn run_worker_attempt(
     attempted_start_sequence: u64,
     settings: &OfflineTranscriptionConfig,
     worker: &dyn WorkerProcess,
-    lease: &TranscriptionLease,
+    lease: &SessionOperationLease,
 ) -> Result<()> {
     let invocation = WorkerInvocation {
         config_path,
@@ -1326,7 +1286,7 @@ mod tests {
         fn run(
             &self,
             invocation: &WorkerInvocation<'_>,
-            _lease: &TranscriptionLease,
+            _lease: &SessionOperationLease,
         ) -> Result<WorkerExit> {
             self.invocations.lock().unwrap().push(ObservedInvocation {
                 next_sequence: invocation.next_sequence,
@@ -1348,7 +1308,7 @@ mod tests {
         fn run(
             &self,
             _invocation: &WorkerInvocation<'_>,
-            _lease: &TranscriptionLease,
+            _lease: &SessionOperationLease,
         ) -> Result<WorkerExit> {
             bail!("injected worker launch failure")
         }
@@ -1363,7 +1323,7 @@ mod tests {
         fn run(
             &self,
             invocation: &WorkerInvocation<'_>,
-            _lease: &TranscriptionLease,
+            _lease: &SessionOperationLease,
         ) -> Result<WorkerExit> {
             self.invocations.lock().unwrap().push(ObservedInvocation {
                 next_sequence: invocation.next_sequence,
@@ -1386,7 +1346,7 @@ mod tests {
         fn run(
             &self,
             invocation: &WorkerInvocation<'_>,
-            _lease: &TranscriptionLease,
+            _lease: &SessionOperationLease,
         ) -> Result<WorkerExit> {
             commit_remaining_results(invocation, 1)?;
             let mut results = OpenOptions::new()
@@ -1407,7 +1367,7 @@ mod tests {
         fn run(
             &self,
             invocation: &WorkerInvocation<'_>,
-            _lease: &TranscriptionLease,
+            _lease: &SessionOperationLease,
         ) -> Result<WorkerExit> {
             let manifest = fs::read_to_string(invocation.manifest_path)?;
             let item: WorkItem = serde_json::from_str(
@@ -1440,7 +1400,7 @@ mod tests {
         fn run(
             &self,
             _invocation: &WorkerInvocation<'_>,
-            _lease: &TranscriptionLease,
+            _lease: &SessionOperationLease,
         ) -> Result<WorkerExit> {
             self.started.send(()).unwrap();
             self.release.lock().unwrap().recv().unwrap();
@@ -1610,7 +1570,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("transcription is already active")
+                .contains("another mutating operation is already active")
         );
         assert_eq!(fs::read(&results_path).unwrap(), b"{\"unfinished\":");
         assert_eq!(
@@ -1621,6 +1581,40 @@ mod tests {
 
         release_sender.send(()).unwrap();
         assert!(first.join().unwrap().is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn active_worker_excludes_work_manifest_rebuild() {
+        let (directory, config_path, _) = ready_session("worker-excludes-builder");
+        let work_items_path = directory.join(WORK_ITEM_MANIFEST_PATH);
+        let work_items_before = fs::read(&work_items_path).unwrap();
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let worker_directory = directory.clone();
+        let worker_config = config_path.clone();
+        let active = thread::spawn(move || {
+            let worker = BlockingWorker {
+                started: started_sender,
+                release: Mutex::new(release_receiver),
+            };
+            run_with_worker(&worker_directory, &worker_config, &worker)
+        });
+        started_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("blocking worker did not start");
+
+        let error = crate::work_items::run(&directory, &config_path).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("another mutating operation is already active")
+        );
+        assert_eq!(fs::read(&work_items_path).unwrap(), work_items_before);
+
+        release_sender.send(()).unwrap();
+        assert!(active.join().unwrap().is_err());
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1735,19 +1729,19 @@ mod tests {
     #[test]
     fn duplicated_worker_handle_retains_lease_until_last_close() {
         let (directory, _, _) = ready_session("inherited-lease");
-        let lease = TranscriptionLease::acquire(&directory).unwrap();
+        let lease = SessionOperationLease::acquire(&directory).unwrap();
         let inherited = lease.inherited_handle().unwrap();
         drop(lease);
 
-        let error = TranscriptionLease::acquire(&directory).unwrap_err();
+        let error = SessionOperationLease::acquire(&directory).unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("transcription is already active")
+                .contains("another mutating operation is already active")
         );
 
         drop(inherited);
-        let recovered = TranscriptionLease::acquire(&directory).unwrap();
+        let recovered = SessionOperationLease::acquire(&directory).unwrap();
         drop(recovered);
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1764,7 +1758,7 @@ mod tests {
         }
 
         let (directory, _, _) = ready_session("orphan-child-lease");
-        let lease = TranscriptionLease::acquire(&directory).unwrap();
+        let lease = SessionOperationLease::acquire(&directory).unwrap();
         let mut child = process::Command::new(env::current_exe().unwrap())
             .arg("--exact")
             .arg(TEST_NAME)
@@ -1775,7 +1769,7 @@ mod tests {
             .unwrap();
         drop(lease);
 
-        let conflict = TranscriptionLease::acquire(&directory);
+        let conflict = SessionOperationLease::acquire(&directory);
         let child_status = child.try_wait().unwrap();
         child.kill().unwrap();
         child.wait().unwrap();
@@ -1785,10 +1779,10 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("transcription is already active")
+                .contains("another mutating operation is already active")
         );
 
-        let recovered = TranscriptionLease::acquire(&directory).unwrap();
+        let recovered = SessionOperationLease::acquire(&directory).unwrap();
         drop(recovered);
         fs::remove_dir_all(directory).unwrap();
     }

@@ -23,6 +23,7 @@ use crate::{
     },
     config::SegmentationConfig,
     diagnostics::{SAMPLE_RATE, SAMPLES_PER_TICK},
+    operation_lease::SessionOperationLease,
     participants::{ParticipantContext, ParticipantRole},
     recover,
     routine_recovery::MappingTimeline,
@@ -104,7 +105,31 @@ fn run_with_refiner(
     refiner: &dyn RangeRefiner,
     completed_at_unix_millis: u64,
 ) -> Result<()> {
-    let mut session = SessionStore::load(session_directory).with_context(|| {
+    run_with_refiner_before_lease(
+        session_directory,
+        merge_gap_ms,
+        refiner,
+        completed_at_unix_millis,
+        || {},
+    )
+}
+
+fn run_with_refiner_before_lease(
+    session_directory: &Path,
+    merge_gap_ms: u64,
+    refiner: &dyn RangeRefiner,
+    completed_at_unix_millis: u64,
+    before_lease: impl FnOnce(),
+) -> Result<()> {
+    let session_directory = fs::canonicalize(session_directory).with_context(|| {
+        format!(
+            "failed to resolve session directory {}",
+            session_directory.display()
+        )
+    })?;
+    before_lease();
+    let _lease = SessionOperationLease::acquire(&session_directory)?;
+    let mut session = SessionStore::load(&session_directory).with_context(|| {
         format!(
             "failed to load workflow state from {}",
             session_directory.display()
@@ -133,7 +158,7 @@ fn run_with_refiner(
         )
     })?;
     validate_tracks(
-        session_directory,
+        &session_directory,
         session.record().session_id.as_str(),
         &tracks,
     )?;
@@ -156,7 +181,7 @@ fn run_with_refiner(
     let mut attributed_frames = Vec::new();
     let mut unattributed_ssrcs = HashSet::new();
     let replay = recover::replay_activity_session_files(
-        session_directory,
+        &session_directory,
         &session.record().files,
         |activity| {
             match timeline.user_at(activity.ssrc, activity.elapsed_nanos) {
@@ -201,7 +226,7 @@ fn run_with_refiner(
         &participants,
     )?;
 
-    write_manifest_atomically(session_directory, &items)?;
+    write_manifest_atomically(&session_directory, &items)?;
     session
         .publish_work_manifest(completed_at_unix_millis)
         .context("work manifest was published but session.json could not record it")?;
@@ -571,14 +596,18 @@ mod tests {
         env,
         fs::File,
         process,
+        sync::mpsc,
+        thread,
+        time::Duration,
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use super::*;
     use crate::{
         artifacts::{
-            EVENT_JOURNAL_FILE_NAME, PACKET_JOURNAL_FILE_NAME, PLAYOUT_JOURNAL_FILE_NAME,
-            TRACK_DIRECTORY_NAME, WORK_ITEM_MANIFEST_PATH,
+            EVENT_JOURNAL_FILE_NAME, FINAL_TRANSCRIPT_PATH, PACKET_JOURNAL_FILE_NAME,
+            PLAYOUT_JOURNAL_FILE_NAME, TRACK_DIRECTORY_NAME, TRANSCRIPTION_RESULTS_PATH,
+            WORK_ITEM_MANIFEST_PATH,
         },
         journal,
         playout::{self, PlayoutDecision, PlayoutRecord},
@@ -843,6 +872,60 @@ mod tests {
                 .checkpoints
                 .iter()
                 .all(|checkpoint| checkpoint.stage != "work_manifest_built")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn delayed_builder_reloads_completed_authority_under_operation_lease() {
+        let directory = ready_session_fixture();
+        run_with_refiner(&directory, 750, &NoopRefiner, 4_000).unwrap();
+
+        let (observed_sender, observed_receiver) = mpsc::channel();
+        let (resume_sender, resume_receiver) = mpsc::channel();
+        let delayed_directory = directory.clone();
+        let delayed = thread::spawn(move || {
+            run_with_refiner_before_lease(&delayed_directory, 750, &NoopRefiner, 7_000, || {
+                let stale = SessionStore::load(&delayed_directory).unwrap();
+                assert_eq!(stale.record().state, WorkflowState::ReadyForTranscription);
+                observed_sender.send(()).unwrap();
+                resume_receiver.recv().unwrap();
+            })
+        });
+        observed_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("delayed builder did not observe old authority");
+
+        let lease = SessionOperationLease::acquire(&directory).unwrap();
+        let results_path = directory.join(TRANSCRIPTION_RESULTS_PATH);
+        let results = File::create(&results_path).unwrap();
+        results.sync_all().unwrap();
+        let mut session = SessionStore::load(&directory).unwrap();
+        session.publish_transcription_start(5_000).unwrap();
+        fs::write(directory.join(FINAL_TRANSCRIPT_PATH), b"finished\n").unwrap();
+        session.publish_transcription_complete(6_000).unwrap();
+        let session_before = fs::read(directory.join("session.json")).unwrap();
+        let work_items_before = fs::read(directory.join(WORK_ITEM_MANIFEST_PATH)).unwrap();
+        let results_before = fs::read(&results_path).unwrap();
+        let final_before = fs::read(directory.join(FINAL_TRANSCRIPT_PATH)).unwrap();
+        drop(lease);
+
+        resume_sender.send(()).unwrap();
+        let error = delayed.join().unwrap().unwrap_err();
+
+        assert!(error.to_string().contains("found complete"));
+        assert_eq!(
+            fs::read(directory.join("session.json")).unwrap(),
+            session_before
+        );
+        assert_eq!(
+            fs::read(directory.join(WORK_ITEM_MANIFEST_PATH)).unwrap(),
+            work_items_before
+        );
+        assert_eq!(fs::read(results_path).unwrap(), results_before);
+        assert_eq!(
+            fs::read(directory.join(FINAL_TRANSCRIPT_PATH)).unwrap(),
+            final_before
         );
         fs::remove_dir_all(directory).unwrap();
     }

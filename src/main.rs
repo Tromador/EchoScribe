@@ -14,6 +14,7 @@ mod identity;
 mod inspect;
 mod journal;
 mod live_flac;
+mod operation_lease;
 mod participants;
 mod playout;
 mod recover;

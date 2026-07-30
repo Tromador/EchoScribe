@@ -6,6 +6,7 @@
 
 use std::{
     collections::HashSet,
+    fs,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -13,6 +14,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::{
+    operation_lease::SessionOperationLease,
     participants::ParticipantContext,
     recover,
     routine_recovery::{MappingTimeline, RECOVERY_COMPLETED_PREFIX, RECOVERY_STARTED_PREFIX},
@@ -25,7 +27,14 @@ use crate::{
 };
 
 pub(crate) fn run(session_directory: &Path) -> Result<()> {
-    let mut session = SessionStore::load(session_directory).with_context(|| {
+    let session_directory = fs::canonicalize(session_directory).with_context(|| {
+        format!(
+            "failed to resolve session directory {}",
+            session_directory.display()
+        )
+    })?;
+    let _lease = SessionOperationLease::acquire(&session_directory)?;
+    let mut session = SessionStore::load(&session_directory).with_context(|| {
         format!(
             "failed to load workflow state from {}",
             session_directory.display()
@@ -90,7 +99,7 @@ pub(crate) fn run(session_directory: &Path) -> Result<()> {
     let mut replay_users = HashSet::new();
     let mut unattributed_ssrcs = HashSet::new();
     let replay =
-        recover::replay_session_files(session_directory, &session.record().files, |frame| {
+        recover::replay_session_files(&session_directory, &session.record().files, |frame| {
             match timeline.user_at(frame.ssrc, frame.elapsed_nanos) {
                 Some(user_id) => {
                     replay_users.insert(user_id);
@@ -154,7 +163,7 @@ pub(crate) fn run(session_directory: &Path) -> Result<()> {
     }
 
     validate_historical_failures(session.record().failures.as_slice(), &manifest, &recovery)?;
-    let verified_tracks = verify_tracks::verify_complete_manifest(session_directory, &manifest)?;
+    let verified_tracks = verify_tracks::verify_complete_manifest(&session_directory, &manifest)?;
 
     let now = unix_millis_now()?;
     session.record_checkpoint(now, "recording_continuation_validated")?;
@@ -356,6 +365,33 @@ mod tests {
             SessionStore::load(&directory).unwrap().record().state,
             WorkflowState::AwaitingOperator
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recording_continuation_cannot_publish_while_session_lease_is_owned() {
+        let directory = fixture("operation-lease");
+        let lease = SessionOperationLease::acquire(&directory).unwrap();
+        let session_before = fs::read(directory.join("session.json")).unwrap();
+        let manifest_before =
+            fs::read(directory.join(crate::artifacts::TRACK_MANIFEST_FILE_NAME)).unwrap();
+
+        let error = run(&directory).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("another mutating operation is already active")
+        );
+        assert_eq!(
+            fs::read(directory.join("session.json")).unwrap(),
+            session_before
+        );
+        assert_eq!(
+            fs::read(directory.join(crate::artifacts::TRACK_MANIFEST_FILE_NAME)).unwrap(),
+            manifest_before
+        );
+        drop(lease);
         fs::remove_dir_all(directory).unwrap();
     }
 
