@@ -60,7 +60,9 @@ caller's working directory, and forward all arguments to the application.
 ```
 
 ```sh
+./echoscribe.sh
 ./echoscribe.sh inspect recordings/session-...
+./echoscribe.sh build-work-items recordings/session-... echoscribe.toml
 ./echoscribe.sh transcribe recordings/session-... echoscribe.toml
 ./echoscribe.sh continue recordings/session-...
 ./echoscribe.sh continue recordings/session-... echoscribe.toml
