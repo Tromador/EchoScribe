@@ -728,8 +728,12 @@ The form without configuration is recording recovery only and requires a
 format-3 or format-4 `awaiting_operator` session without a results description.
 The configured form is stage-aware:
 
-- format-3 or format-4 `awaiting_operator` without results runs recording
-  continuation validation but never recovery, then proceeds;
+- format-3 or format-4 `awaiting_operator` without results normally runs
+  recording continuation validation but never recovery, then proceeds;
+- when the latest durable failure instead records `work_manifest_build` or a
+  pre-results `transcription_orchestration` stop from
+  `ready_for_transcription`, it restores that stage boundary directly and does
+  not repeat authoritative recording replay;
 - `ready_for_transcription` reuses a valid published work manifest, or builds
   it when absent, then transcribes;
 - format-5 `transcribing` uses controlled restart without rewind;
@@ -738,7 +742,9 @@ The configured form is stage-aware:
 
 `complete`, `recording`, and incompatible format/state/artefact combinations
 are refused before mutation. Arguments and validated session structure select
-the route; historical failure records alone do not.
+the route. Post-recording resumption requires the matching current format,
+state and artefact descriptions plus the latest durable stage-failure evidence;
+a historical failure record alone does not select it.
 
 For positive rewind, `committed_end` is the final contiguous result's `end_ms`
 and the saturated boundary is `committed_end - resume_rewind_seconds * 1000`.
@@ -792,7 +798,10 @@ Slice 9 transcription-failure route.
 `rebuild-transcript <session>` owns the session lease, requires a complete
 format-5 session, validates the complete work and result authorities, and
 atomically replaces `transcription/transcript.txt`. It does not alter
-`results.jsonl`, launch Python, or change workflow state.
+`results.jsonl`, launch Python, or change workflow state. It renders solely
+from the completed structured transcription authorities and therefore does not
+require packet, playout or event journals, the participant snapshot,
+`tracks.json`, or routine FLACs.
 
 ## 19. Main configuration
 

@@ -679,10 +679,13 @@ Keep explicit commands for at least:
 stage and leaves a healthy session in `ready_for_transcription`.
 
 Configured `continue <session> <config>` is stage-aware. It validates completed
-recording recovery without performing recovery, advances healthy
-`ready_for_transcription` authority by building a missing work manifest or
-reusing a valid published one, uses controlled restart from `transcribing`, and
-uses durable rewind continuation from transcription failure. Incompatible and
+recording recovery without performing recovery. A format-3 or format-4 session
+whose latest durable failure records an accepted work-manifest or pre-results
+transcription-orchestration stop from `ready_for_transcription` resumes directly
+at that boundary rather than repeating recording validation. Healthy
+`ready_for_transcription` authority builds a missing work manifest or reuses a
+valid published one. Format-5 `transcribing` uses controlled restart, and
+transcription failure uses durable rewind continuation. Incompatible and
 complete sessions are refused before mutation. Unconfigured `continue
 <session>` retains recording-recovery validation only.
 
@@ -694,7 +697,9 @@ Internal stage functions accept the already-held lease.
 Add `rebuild-transcript <session>` for a complete format-5 session. It validates
 complete work and result authority and atomically rebuilds only
 `transcription/transcript.txt`, without Python, retranscription, result changes,
-or workflow transition.
+or workflow transition. Rendering depends only on those completed structured
+transcription authorities; recording journals, participant context, the track
+manifest and source FLACs need not remain present.
 
 Accepted-stage manifest or orchestration publication failure may be recorded
 durably with `ready_for_transcription -> awaiting_operator`. CLI/config errors,

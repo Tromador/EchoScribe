@@ -402,13 +402,17 @@ session with no transcription-results description.
 
 `continue <session> <config>` is stage-aware. For format-3 or format-4
 recording failure it performs the same post-recovery validation as the
-unconfigured form, but never performs recovery itself. For a healthy
+unconfigured form, but never performs recovery itself. A format-3 or format-4
+session stopped after an accepted `work_manifest_build` or pre-results
+`transcription_orchestration` failure resumes directly from that durable stage
+boundary instead of repeating recording recovery validation. For a healthy
 `ready_for_transcription` session it reuses a valid published work manifest or
 builds the missing manifest, then transcribes. A format-5 `transcribing`
 session uses controlled restart without rewind. Format-5 `awaiting_operator`
 or `transcription_failed` transcription failures use the durable rewind route.
-The two forms reject mismatched session formats, artefact descriptions, states,
-and arguments before mutation.
+The route combines current format, state and artefact descriptions with the
+latest durable stage-failure evidence. The two forms reject mismatched session
+formats, artefact descriptions, states, and arguments before mutation.
 
 These mutating routes acquire the shared per-session operation lease before
 loading workflow authority. A delayed invocation must therefore reload and
@@ -490,7 +494,9 @@ echoscribe rebuild-transcript <session>
 `rebuild-transcript` requires a complete format-5 session and reconstructs the
 final human-readable transcript atomically from complete contiguous JSONL
 authority. It neither launches Python nor changes result authority or workflow
-state.
+state. Because completed structured transcription authority is sufficient for
+rendering, this command does not require recording journals, participant
+context, the track manifest, or source FLACs to remain present.
 
 Individual stages remain callable for:
 

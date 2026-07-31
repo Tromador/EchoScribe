@@ -219,8 +219,10 @@ fn rebuild_transcript_with_lease(
             .expect("rebuild entry validation requires work_items")
             .path,
     );
-    let tracks = validate_session_artifacts(session_directory, session.record())?;
-    let work_items = read_work_manifest(&manifest_path, session.record(), &tracks)?;
+    // Completed structured authority is sufficient to render display text.
+    // Recording journals, participant context and source audio are deliberately
+    // outside this recovery boundary.
+    let work_items = read_work_manifest_authority(&manifest_path, session.record())?;
     let results_path = session_directory.join(
         &session
             .record()
@@ -929,6 +931,19 @@ fn read_work_manifest(
     record: &SessionRecord,
     tracks: &TrackManifest,
 ) -> Result<Vec<WorkItem>> {
+    let items = read_work_manifest_authority(path, record)?;
+    let tracks_by_user = tracks
+        .tracks
+        .iter()
+        .map(|track| (track.discord_user_id.as_str(), track))
+        .collect::<HashMap<_, _>>();
+    for item in &items {
+        validate_work_item_source(item, &tracks_by_user)?;
+    }
+    Ok(items)
+}
+
+fn read_work_manifest_authority(path: &Path, record: &SessionRecord) -> Result<Vec<WorkItem>> {
     let bytes = fs::read(path)
         .with_context(|| format!("failed to read work manifest {}", path.display()))?;
     if !bytes.is_empty() && !bytes.ends_with(b"\n") {
@@ -937,11 +952,6 @@ fn read_work_manifest(
             path.display()
         );
     }
-    let tracks_by_user = tracks
-        .tracks
-        .iter()
-        .map(|track| (track.discord_user_id.as_str(), track))
-        .collect::<HashMap<_, _>>();
     let mut items = Vec::new();
     let manifest_body = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
     for (index, line) in manifest_body.split(|byte| *byte == b'\n').enumerate() {
@@ -962,7 +972,7 @@ fn read_work_manifest(
                 path.display()
             )
         })?;
-        validate_work_item_for_session(&item, record, &tracks_by_user, items.last())?;
+        validate_work_item_for_session(&item, record, items.last())?;
         items.push(item);
     }
     Ok(items)
@@ -971,7 +981,6 @@ fn read_work_manifest(
 fn validate_work_item_for_session(
     item: &WorkItem,
     record: &SessionRecord,
-    tracks: &HashMap<&str, &crate::track_manifest::TrackDescription>,
     previous: Option<&WorkItem>,
 ) -> Result<()> {
     let expected_sequence = previous.map_or(1, |value| value.sequence + 1);
@@ -983,6 +992,12 @@ fn validate_work_item_for_session(
         || item.source_start_ms >= item.source_end_ms
         || item.speaker.trim().is_empty()
         || !matches!(item.role.as_str(), "player" | "gm")
+        || item
+            .discord_user_id
+            .parse::<u64>()
+            .ok()
+            .is_none_or(|user_id| user_id == 0)
+        || !is_safe_relative_path(&item.source)
     {
         bail!("invalid or out-of-order work item {:?}", item.id);
     }
@@ -1003,6 +1018,13 @@ fn validate_work_item_for_session(
             bail!("work manifest is not in deterministic chronological order");
         }
     }
+    Ok(())
+}
+
+fn validate_work_item_source(
+    item: &WorkItem,
+    tracks: &HashMap<&str, &crate::track_manifest::TrackDescription>,
+) -> Result<()> {
     let track = tracks.get(item.discord_user_id.as_str()).ok_or_else(|| {
         anyhow!(
             "work item {} has no complete routine track for Discord user {}",
@@ -1030,6 +1052,13 @@ fn validate_work_item_for_session(
         );
     }
     Ok(())
+}
+
+fn is_safe_relative_path(value: &str) -> bool {
+    !value.is_empty()
+        && Path::new(value)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 fn prepare_empty_results(session_directory: &Path) -> Result<()> {
@@ -1395,8 +1424,9 @@ mod tests {
     use super::*;
     use crate::{
         artifacts::{
-            EVENT_JOURNAL_FILE_NAME, PACKET_JOURNAL_FILE_NAME, PLAYOUT_JOURNAL_FILE_NAME,
-            TRACK_DIRECTORY_NAME, WORK_ITEM_MANIFEST_PATH,
+            EVENT_JOURNAL_FILE_NAME, PACKET_JOURNAL_FILE_NAME, PARTICIPANT_SNAPSHOT_FILE_NAME,
+            PLAYOUT_JOURNAL_FILE_NAME, TRACK_DIRECTORY_NAME, TRACK_MANIFEST_FILE_NAME,
+            WORK_ITEM_MANIFEST_PATH,
         },
         participants::ParticipantContext,
         session::{NewSession, fail_record_write_after},
@@ -1683,6 +1713,16 @@ mod tests {
         let final_path = directory.join(FINAL_TRANSCRIPT_PATH);
         let results_before = fs::read(&results_path).unwrap();
         let session_before = fs::read(directory.join("session.json")).unwrap();
+        for name in [
+            PACKET_JOURNAL_FILE_NAME,
+            PLAYOUT_JOURNAL_FILE_NAME,
+            EVENT_JOURNAL_FILE_NAME,
+            PARTICIPANT_SNAPSHOT_FILE_NAME,
+            TRACK_MANIFEST_FILE_NAME,
+        ] {
+            fs::remove_file(directory.join(name)).unwrap();
+        }
+        fs::remove_dir_all(directory.join(TRACK_DIRECTORY_NAME)).unwrap();
         fs::write(&final_path, b"stale display text\n").unwrap();
 
         rebuild_transcript(&directory).unwrap();

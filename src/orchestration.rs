@@ -153,6 +153,13 @@ fn continue_with_stages(
         (
             PREVIOUS_SESSION_FORMAT_VERSION | RECORDING_SESSION_FORMAT_VERSION,
             WorkflowState::AwaitingOperator,
+        ) if record.files.results.is_none() && has_post_recording_stage_failure(&record) => {
+            restore_ready_stage_boundary(session_directory)?;
+            run_ready_pipeline(session_directory, lease, stages)
+        }
+        (
+            PREVIOUS_SESSION_FORMAT_VERSION | RECORDING_SESSION_FORMAT_VERSION,
+            WorkflowState::AwaitingOperator,
         ) if record.files.results.is_none() => {
             stages.validate_recording_continuation(session_directory, lease)?;
             run_ready_pipeline(session_directory, lease, stages)
@@ -341,6 +348,44 @@ fn record_accepted_stage_failure(
 
 fn has_transcription_authority(record: &SessionRecord) -> bool {
     record.files.work_items.is_some() && record.files.results.is_some()
+}
+
+fn has_post_recording_stage_failure(record: &SessionRecord) -> bool {
+    let Some(failure) = record.failures.last() else {
+        return false;
+    };
+    if failure.state != WorkflowState::ReadyForTranscription {
+        return false;
+    }
+
+    match failure.kind.as_str() {
+        "work_manifest_build" => true,
+        // Reaching transcription orchestration requires a durably published
+        // manifest. Without it, this evidence does not describe that boundary.
+        "transcription_orchestration" => record.files.work_items.is_some(),
+        _ => false,
+    }
+}
+
+fn restore_ready_stage_boundary(session_directory: &Path) -> Result<()> {
+    let mut session = SessionStore::load(session_directory).with_context(|| {
+        format!(
+            "failed to reload post-recording stage authority from {}",
+            session_directory.display()
+        )
+    })?;
+    if !matches!(
+        session.record().format,
+        PREVIOUS_SESSION_FORMAT_VERSION | RECORDING_SESSION_FORMAT_VERSION
+    ) || session.record().state != WorkflowState::AwaitingOperator
+        || session.record().files.results.is_some()
+        || !has_post_recording_stage_failure(session.record())
+    {
+        bail!("post-recording stage boundary changed before continuation");
+    }
+    session
+        .transition(WorkflowState::ReadyForTranscription, unix_millis_now()?)
+        .context("failed to restore ready_for_transcription stage boundary")
 }
 
 fn load_record(session_directory: &Path) -> Result<SessionRecord> {
@@ -634,10 +679,34 @@ mod tests {
 
         continue_with_stages(&directory, &lease, &resumed).unwrap();
 
+        assert_eq!(resumed.calls(), ["build", "transcribe"]);
         assert_eq!(
-            resumed.calls(),
-            ["validate_recording", "build", "transcribe"]
+            SessionStore::load(&directory).unwrap().record().state,
+            WorkflowState::Complete
         );
+        drop(lease);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn configured_continuation_reuses_manifest_after_pre_results_failure() {
+        let directory = ready_fixture("pre-results-retry");
+        let mut session = SessionStore::load(&directory).unwrap();
+        session.publish_work_manifest(4_000).unwrap();
+        session
+            .publish_orchestration_failure(
+                4_100,
+                "transcription_orchestration",
+                "injected results publication failure",
+            )
+            .unwrap();
+        drop(session);
+        let lease = SessionOperationLease::acquire(&directory).unwrap();
+        let resumed = FakeStages::healthy();
+
+        continue_with_stages(&directory, &lease, &resumed).unwrap();
+
+        assert_eq!(resumed.calls(), ["transcribe"]);
         assert_eq!(
             SessionStore::load(&directory).unwrap().record().state,
             WorkflowState::Complete
