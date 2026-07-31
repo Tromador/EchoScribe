@@ -494,8 +494,10 @@ on Windows or `python3` elsewhere. An explicitly empty override is an error.
 
 The offline transcription configuration loader does not validate Discord
 credentials or IDs and does not read the configured participant file.
-Vocabulary phrases are trimmed non-blank UTF-8 lines. Missing or empty
-vocabulary is warning-only; other I/O failures and invalid UTF-8 are errors.
+Vocabulary phrases are trimmed non-blank UTF-8 lines. Lines whose first
+non-whitespace character is `#` are comments; `#` elsewhere is retained as
+part of the phrase. Missing, empty and comment-only vocabulary is warning-only;
+other I/O failures and invalid UTF-8 are errors.
 
 ### Required tests
 

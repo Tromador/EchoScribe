@@ -315,12 +315,14 @@ fn load_vocabulary(path: &Path) -> Result<(Vec<String>, Option<String>)> {
     let hotwords = text
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty())
+        // Only whole trimmed lines are comments. A '#' within a phrase remains
+        // part of the hotword rather than creating surprising inline syntax.
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(str::to_owned)
         .collect::<Vec<_>>();
     let warning = hotwords.is_empty().then(|| {
         format!(
-            "vocabulary file {} is empty; continuing without hotwords",
+            "vocabulary file {} contains no vocabulary phrases; continuing without hotwords",
             path.display()
         )
     });
@@ -443,8 +445,30 @@ merge_gap_ms = 750
     }
 
     #[test]
-    fn missing_and_empty_vocabulary_are_warning_only() {
-        for (label, contents) in [("missing", None), ("empty", Some(" \n\t\n"))] {
+    fn vocabulary_supports_full_line_comments_but_not_inline_comments() {
+        let directory = test_directory("vocabulary-comments");
+        let config_path = directory.join("echoscribe.toml");
+        fs::write(&config_path, VALID_CONFIG).unwrap();
+        fs::write(
+            directory.join("vocabulary.txt"),
+            "# Campaign-specific terms\n  # Indented comments also work\nBaldur's Gate\nAgent #7\n",
+        )
+        .unwrap();
+
+        let config = OfflineTranscriptionConfig::load(&config_path).unwrap();
+
+        assert_eq!(config.hotwords, ["Baldur's Gate", "Agent #7"]);
+        assert_eq!(config.vocabulary_warning, None);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn missing_and_phrase_free_vocabulary_are_warning_only() {
+        for (label, contents) in [
+            ("missing", None),
+            ("empty", Some(" \n\t\n")),
+            ("comments-only", Some("# No phrases yet\n  # Still empty\n")),
+        ] {
             let directory = test_directory(label);
             let config_path = directory.join("echoscribe.toml");
             fs::write(&config_path, VALID_CONFIG).unwrap();

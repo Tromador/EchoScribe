@@ -848,8 +848,11 @@ read the mutable configured participant file.
 
 The vocabulary path is resolved relative to the named main configuration.
 Missing and empty or whitespace-only files produce a warning and no hotwords.
-A readable UTF-8 file contributes one phrase per trimmed non-blank line, with
-no comment syntax. Other I/O errors and invalid UTF-8 fail clearly.
+A readable UTF-8 file contributes one phrase per trimmed non-blank line. Lines
+whose first non-whitespace character is `#` are comments and are ignored; `#`
+elsewhere remains part of the phrase, so there is no inline-comment syntax. A
+comment-only file produces the same warning as an empty file. Other I/O errors
+and invalid UTF-8 fail clearly.
 
 ## 20. Future live path
 

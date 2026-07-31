@@ -45,6 +45,17 @@ python -m pip install -r requirements.txt
 EchoScribe uses `ECHOSCRIBE_PYTHON` when explicitly set. Otherwise it prefers
 the root `.venv` interpreter and then falls back to the platform Python command.
 
+## Campaign vocabulary
+
+Copy `vocabulary.example.txt` to `vocabulary.txt` and replace the examples with
+campaign-specific names, places and terminology. Use one phrase per line.
+Blank lines and full-line `#` comments are ignored; inline comments are not
+supported because a `#` appearing later in a line belongs to the phrase.
+
+The configured vocabulary path is relative to `echoscribe.toml`. The real
+`vocabulary.txt` remains ignored by Git so each campaign can maintain its own
+terms without changing the repository example.
+
 ## Running EchoScribe
 
 The launchers rebuild the release executable when required, preserve the

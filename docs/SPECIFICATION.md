@@ -498,6 +498,12 @@ state. Because completed structured transcription authority is sufficient for
 rendering, this command does not require recording journals, participant
 context, the track manifest, or source FLACs to remain present.
 
+The configured vocabulary file is UTF-8 text with one hotword phrase per
+trimmed non-blank line. A line whose first non-whitespace character is `#` is a
+comment and is ignored. There is no inline-comment syntax: `#` elsewhere in a
+phrase remains part of that phrase. Missing files and files containing no
+phrases are warning-only.
+
 Individual stages remain callable for:
 
 - diagnostics;
