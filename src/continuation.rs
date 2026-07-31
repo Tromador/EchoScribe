@@ -33,7 +33,14 @@ pub(crate) fn run(session_directory: &Path) -> Result<()> {
             session_directory.display()
         )
     })?;
-    let _lease = SessionOperationLease::acquire(&session_directory)?;
+    let lease = SessionOperationLease::acquire(&session_directory)?;
+    run_with_lease(&session_directory, &lease)
+}
+
+pub(crate) fn run_with_lease(
+    session_directory: &Path,
+    _lease: &SessionOperationLease,
+) -> Result<()> {
     let mut session = SessionStore::load(&session_directory).with_context(|| {
         format!(
             "failed to load workflow state from {}",

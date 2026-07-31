@@ -143,7 +143,8 @@ The initial implementation uses:
 
 The initial implementation may begin transcription after recording has stopped and all required tracks have finalised successfully.
 
-Before one-stop orchestration is introduced, transcription is invoked explicitly:
+Normal use invokes transcription through the one-stop workflow. The explicit
+stage command remains available for controlled reprocessing and diagnosis:
 
 ```text
 echoscribe transcribe <session> <config>
@@ -166,14 +167,17 @@ workflow authority and must not modify `session.json`.
 
 Only one offline operation which mutates session authority or a
 session-declared artefact may own a session at a time. `recover`,
-`continue <session>`, `build-work-items`, `transcribe`, and configured
-transcription `continue` share that exclusive ownership boundary. Ownership is
-acquired before loading `session.json` or resolving any session-declared path
-and is retained through validation, derived-artefact publication, worker
-execution where applicable, and workflow updates. It must remain effective
-while an orphaned worker process is still running and become recoverable after
-every owning process has terminated. Read-only inspection and verification do
-not require exclusive ownership.
+`continue <session>`, `build-work-items`, `transcribe`, `rebuild-transcript`,
+and configured stage-aware `continue` share that exclusive ownership boundary.
+The one-stop coordinator acquires the same ownership after recording and keeps
+it continuously through work-manifest construction, worker execution,
+transcript publication, and completion. Ownership is acquired before loading
+`session.json` or resolving any session-declared path and is retained through
+validation, derived-artefact publication, worker execution where applicable,
+and workflow updates. It must remain effective while an orphaned worker
+process is still running and become recoverable after every owning process has
+terminated. Read-only inspection and verification do not require exclusive
+ownership.
 
 The transcription design must not assume that completed whole-session files are the only possible source of transcription audio.
 
@@ -185,7 +189,8 @@ Nearby activity from the same participant is merged across a configurable silenc
 
 The exact merge threshold is a tuning parameter, not a permanent architectural constant.
 
-Before one-stop orchestration is introduced, the explicit offline command is:
+The explicit offline range-building command remains available for diagnosis
+and deterministic regeneration:
 
 ```text
 echoscribe build-work-items <session> <config>
@@ -395,11 +400,17 @@ echoscribe continue <session> <config>
 `continue <session>` validates recording recovery for a format-3 or format-4
 session with no transcription-results description.
 
-`continue <session> <config>` resumes a format-5 transcription failure from
-`awaiting_operator` or `transcription_failed`. The two forms reject mismatched
-session formats, artefact descriptions, states, and arguments before mutation.
+`continue <session> <config>` is stage-aware. For format-3 or format-4
+recording failure it performs the same post-recovery validation as the
+unconfigured form, but never performs recovery itself. For a healthy
+`ready_for_transcription` session it reuses a valid published work manifest or
+builds the missing manifest, then transcribes. A format-5 `transcribing`
+session uses controlled restart without rewind. Format-5 `awaiting_operator`
+or `transcription_failed` transcription failures use the durable rewind route.
+The two forms reject mismatched session formats, artefact descriptions, states,
+and arguments before mutation.
 
-All three mutating routes acquire the shared per-session operation lease before
+These mutating routes acquire the shared per-session operation lease before
 loading workflow authority. A delayed invocation must therefore reload and
 validate current authority after it obtains ownership rather than publishing a
 stale `SessionStore`.
@@ -465,6 +476,21 @@ remain readable under their defined compatibility rules.
 Normal use is one-stop.
 
 The application coordinates recording, finalisation, transcription, and transcript completion without requiring several terminal windows or manually chained commands.
+
+The CLI contract is:
+
+```text
+echoscribe [config]                    # one-stop normal workflow
+echoscribe record [config]             # recording and finalisation only
+echoscribe continue <session>          # recording-recovery validation only
+echoscribe continue <session> <config> # stage-aware pipeline continuation
+echoscribe rebuild-transcript <session>
+```
+
+`rebuild-transcript` requires a complete format-5 session and reconstructs the
+final human-readable transcript atomically from complete contiguous JSONL
+authority. It neither launches Python nor changes result authority or workflow
+state.
 
 Individual stages remain callable for:
 

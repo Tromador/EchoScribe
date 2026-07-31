@@ -521,6 +521,39 @@ impl SessionStore {
         self.persist(updated)
     }
 
+    /// Stop one-stop orchestration after a post-validation stage failure.
+    /// Failure evidence and the operator boundary are one atomic authority
+    /// replacement, so continuation can retry the same durable stage.
+    pub(crate) fn publish_orchestration_failure(
+        &mut self,
+        recorded_at_unix_millis: u64,
+        kind: impl Into<String>,
+        message: impl Into<String>,
+    ) -> io::Result<()> {
+        if !matches!(
+            self.record.format,
+            PREVIOUS_SESSION_FORMAT_VERSION | RECORDING_SESSION_FORMAT_VERSION
+        ) || self.record.state != WorkflowState::ReadyForTranscription
+            || self.record.files.results.is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "post-recording orchestration failure requires a format-3 or format-4 \
+                 ready_for_transcription session without results",
+            ));
+        }
+
+        let mut updated = self.record.clone();
+        updated.failures.push(FailureRecord {
+            recorded_at_unix_millis,
+            state: WorkflowState::ReadyForTranscription,
+            kind: kind.into(),
+            message: message.into(),
+        });
+        updated.state = WorkflowState::AwaitingOperator;
+        self.persist(updated)
+    }
+
     /// Commit the results authority and workflow transition together. The
     /// caller must synchronise the empty results file before invoking this.
     pub(crate) fn publish_transcription_start(
@@ -721,6 +754,10 @@ fn valid_transition(current: WorkflowState, next: WorkflowState) -> bool {
             )
             | (
                 WorkflowState::RecordedClean,
+                WorkflowState::AwaitingOperator
+            )
+            | (
+                WorkflowState::ReadyForTranscription,
                 WorkflowState::AwaitingOperator
             )
             | (
@@ -1211,6 +1248,34 @@ mod tests {
         let reloaded = SessionStore::load(&directory).unwrap();
         assert_eq!(reloaded.record().state, WorkflowState::AwaitingOperator);
         assert_eq!(reloaded.record().stopped_at_unix_millis, Some(2_000));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn post_recording_stage_failure_and_operator_boundary_are_atomic() {
+        let directory = test_directory("post-recording-stage-failure");
+        let participants = ParticipantContext::empty_for_test();
+        let mut store = create_store(&directory, &participants);
+        store
+            .transition(WorkflowState::RecordedClean, 2_000)
+            .unwrap();
+        store
+            .transition(WorkflowState::ReadyForTranscription, 2_100)
+            .unwrap();
+
+        store
+            .publish_orchestration_failure(
+                2_200,
+                "work_manifest_build",
+                "failed to publish work manifest",
+            )
+            .unwrap();
+
+        let reloaded = SessionStore::load(&directory).unwrap();
+        assert_eq!(reloaded.record().state, WorkflowState::AwaitingOperator);
+        let failure = reloaded.record().failures.last().unwrap();
+        assert_eq!(failure.state, WorkflowState::ReadyForTranscription);
+        assert_eq!(failure.kind, "work_manifest_build");
         fs::remove_dir_all(directory).unwrap();
     }
 

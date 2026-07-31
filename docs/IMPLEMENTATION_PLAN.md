@@ -651,7 +651,7 @@ Provide one normal invocation while preserving separately callable stages.
 
 ### Route
 
-The normal command coordinates:
+The normal command is `echoscribe [config]` and coordinates:
 
 ```text
 record
@@ -675,7 +675,31 @@ Keep explicit commands for at least:
 - transcribe or equivalent reprocessing;
 - transcript rebuild or equivalent.
 
-The exact top-level normal command name is a CLI naming detail. It must be documented and unambiguous.
+`echoscribe record [config]` retains recording and finalisation as an explicit
+stage and leaves a healthy session in `ready_for_transcription`.
+
+Configured `continue <session> <config>` is stage-aware. It validates completed
+recording recovery without performing recovery, advances healthy
+`ready_for_transcription` authority by building a missing work manifest or
+reusing a valid published one, uses controlled restart from `transcribing`, and
+uses durable rewind continuation from transcription failure. Incompatible and
+complete sessions are refused before mutation. Unconfigured `continue
+<session>` retains recording-recovery validation only.
+
+The coordinator acquires the shared session-operation lease after live
+recording and holds it continuously through manifest construction, results
+publication, worker execution, transcript publication, and completion.
+Internal stage functions accept the already-held lease.
+
+Add `rebuild-transcript <session>` for a complete format-5 session. It validates
+complete work and result authority and atomically rebuilds only
+`transcription/transcript.txt`, without Python, retranscription, result changes,
+or workflow transition.
+
+Accepted-stage manifest or orchestration publication failure may be recorded
+durably with `ready_for_transcription -> awaiting_operator`. CLI/config errors,
+lease contention, incompatible state, and pre-acceptance validation refusal do
+not mutate authority.
 
 ### Required tests
 

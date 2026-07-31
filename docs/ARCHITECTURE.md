@@ -376,11 +376,20 @@ recording
 
 recorded_clean
     -> awaiting_operator
+
+ready_for_transcription
+    -> awaiting_operator
 ```
 
 The `recorded_clean -> awaiting_operator` transition is reserved for a failure
 encountered after `recorded_clean` was durably published but before the later
 clean workflow state could be published.
+
+The `ready_for_transcription -> awaiting_operator` transition records a
+post-validation work-manifest or transcription-orchestration publication
+failure. It is not used for malformed CLI input, invalid operator
+configuration, lease contention, incompatible session authority, or ordinary
+pre-acceptance validation refusal.
 
 ```text
 recording
@@ -450,8 +459,7 @@ The initial implementation uses playout activity without VAD.
 
 Tuning values are configuration, not architecture.
 
-Before normal one-stop orchestration is introduced, the range builder is
-invoked explicitly:
+The range builder remains explicitly invocable for diagnosis and regeneration:
 
 ```text
 build-work-items <session> <config>
@@ -525,13 +533,19 @@ to the last validated newline, rebuilds and synchronises
 
 Rust uses one exclusive per-session operation lease for every offline command
 which mutates session authority or a session-declared artefact: `recover`,
-recording `continue`, `build-work-items`, `transcribe`, and configured
-transcription `continue`. Each route acquires the lease before loading
+recording `continue`, `build-work-items`, `transcribe`, `rebuild-transcript`,
+and configured stage-aware `continue`. Each route acquires the lease before loading
 `session.json`; session state and route validation, declared-path resolution,
 derived-artefact publication, and related workflow updates occur while it is
 held. No session-derived data read before ownership may be carried into the
 protected operation. Read-only commands such as `inspect` and `verify` do not
 take exclusive ownership.
+
+After live capture finalises cleanly, the one-stop coordinator acquires this
+lease and retains it without a gap across work-manifest construction, results
+publication, worker execution, transcript publication, and the final workflow
+transition. Internal stage entry points accept the already-held lease rather
+than recursively acquiring it.
 
 The lock remains an operating-system file lock on
 `transcription/worker.lock`; the persistent filename is not evidence of current
@@ -712,10 +726,19 @@ continue <session> <config>
 
 The form without configuration is recording recovery only and requires a
 format-3 or format-4 `awaiting_operator` session without a results description.
-The configured form is transcription continuation only and requires a format-5
-session with work and result descriptions, durable transcription-failure
-evidence, and state `awaiting_operator` or `transcription_failed`. Arguments and
-validated session structure select the route; state alone does not.
+The configured form is stage-aware:
+
+- format-3 or format-4 `awaiting_operator` without results runs recording
+  continuation validation but never recovery, then proceeds;
+- `ready_for_transcription` reuses a valid published work manifest, or builds
+  it when absent, then transcribes;
+- format-5 `transcribing` uses controlled restart without rewind;
+- format-5 `transcription_failed`, or transcription-related format-5
+  `awaiting_operator`, uses the durable rewind protocol.
+
+`complete`, `recording`, and incompatible format/state/artefact combinations
+are refused before mutation. Arguments and validated session structure select
+the route; historical failure records alone do not.
 
 For positive rewind, `committed_end` is the final contiguous result's `end_ms`
 and the saturated boundary is `committed_end - resume_rewind_seconds * 1000`.
@@ -750,6 +773,26 @@ the lease. A transcript left by a failed session update is derived output and
 is safely replaced by a later explicit retry.
 
 No automatic retry occurs.
+
+### 18.4 One-stop orchestration and transcript rebuild
+
+`echoscribe [config]` records, finalises, builds or reuses the work manifest,
+transcribes, and publishes the final transcript. `echoscribe record [config]`
+stops after recording finalisation with a healthy session in
+`ready_for_transcription`.
+
+A genuine failure after the coordinator accepts work-manifest or
+pre-transcription publication records its stage and atomically moves a
+format-3 or format-4 `ready_for_transcription` session to `awaiting_operator`. Invalid CLI
+arguments or configuration, lease contention, incompatible workflow authority,
+and pre-acceptance validation refusals do not mutate session authority. A
+worker launch failure after format 5 and `transcribing` are durable retains the
+Slice 9 transcription-failure route.
+
+`rebuild-transcript <session>` owns the session lease, requires a complete
+format-5 session, validates the complete work and result authorities, and
+atomically replaces `transcription/transcript.txt`. It does not alter
+`results.jsonl`, launch Python, or change workflow state.
 
 ## 19. Main configuration
 

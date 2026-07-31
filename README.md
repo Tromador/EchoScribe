@@ -52,30 +52,42 @@ caller's working directory, and forward all arguments to the application.
 
 ```powershell
 .\echoscribe.ps1
+.\echoscribe.ps1 record
 .\echoscribe.ps1 inspect recordings\session-...
 .\echoscribe.ps1 build-work-items recordings\session-... echoscribe.toml
 .\echoscribe.ps1 transcribe recordings\session-... echoscribe.toml
 .\echoscribe.ps1 continue recordings\session-...
 .\echoscribe.ps1 continue recordings\session-... echoscribe.toml
+.\echoscribe.ps1 rebuild-transcript recordings\session-...
 ```
 
 ```sh
 ./echoscribe.sh
+./echoscribe.sh record
 ./echoscribe.sh inspect recordings/session-...
 ./echoscribe.sh build-work-items recordings/session-... echoscribe.toml
 ./echoscribe.sh transcribe recordings/session-... echoscribe.toml
 ./echoscribe.sh continue recordings/session-...
 ./echoscribe.sh continue recordings/session-... echoscribe.toml
+./echoscribe.sh rebuild-transcript recordings/session-...
 ```
 
-The unconfigured `continue` form validates recording recovery. Supplying the
-configuration resumes a recorded transcription failure using its configured
-rewind interval. Successful transcription publishes
+With no command, EchoScribe records, finalises, builds the work manifest,
+transcribes and publishes the final transcript. The `record` command stops
+after clean recording finalisation.
+
+The unconfigured `continue` form only validates recording recovery. Supplying
+the configuration resumes the one-stop pipeline at the stage established by
+durable session authority. It never performs track recovery automatically.
+`rebuild-transcript` reconstructs only the final human-readable transcript from
+complete structured results. Successful transcription publishes
 `transcription/transcript.txt` inside the session directory.
 
 For development, invoke Cargo directly:
 
 ```sh
+cargo run --
+cargo run -- record
 cargo run -- transcribe recordings/session-... echoscribe.toml
 cargo run --release -- transcribe recordings/session-... echoscribe.toml
 ```

@@ -28,6 +28,7 @@ use crate::{
     recover,
     routine_recovery::MappingTimeline,
     session::{SessionStore, WorkflowState},
+    stage::{StageError, StageResult},
     track_manifest::{TrackDescription, TrackManifest, TrackState},
 };
 
@@ -91,29 +92,185 @@ struct UserAlignment {
 
 pub(crate) fn run(session_directory: &Path, config_path: &Path) -> Result<()> {
     let merge_gap_ms = SegmentationConfig::load_merge_gap_ms(config_path)?;
-    run_with_refiner(
-        session_directory,
-        merge_gap_ms,
-        &NoopRefiner,
-        unix_millis_now()?,
-    )
+    let session_directory = canonical_session_directory(session_directory)?;
+    let lease = SessionOperationLease::acquire(&session_directory)?;
+    run_with_lease(&session_directory, merge_gap_ms, unix_millis_now()?, &lease)
+        .map_err(StageError::into_anyhow)
 }
 
+#[cfg(test)]
 fn run_with_refiner(
     session_directory: &Path,
     merge_gap_ms: u64,
     refiner: &dyn RangeRefiner,
     completed_at_unix_millis: u64,
 ) -> Result<()> {
-    run_with_refiner_before_lease(
-        session_directory,
+    let session_directory = canonical_session_directory(session_directory)?;
+    let lease = SessionOperationLease::acquire(&session_directory)?;
+    run_with_refiner_under_lease(
+        &session_directory,
         merge_gap_ms,
         refiner,
         completed_at_unix_millis,
-        || {},
+        &lease,
+    )
+    .map_err(StageError::into_anyhow)
+}
+
+pub(crate) fn run_with_lease(
+    session_directory: &Path,
+    merge_gap_ms: u64,
+    completed_at_unix_millis: u64,
+    lease: &SessionOperationLease,
+) -> StageResult<()> {
+    run_with_refiner_under_lease(
+        session_directory,
+        merge_gap_ms,
+        &NoopRefiner,
+        completed_at_unix_millis,
+        lease,
     )
 }
 
+fn canonical_session_directory(session_directory: &Path) -> Result<std::path::PathBuf> {
+    fs::canonicalize(session_directory).with_context(|| {
+        format!(
+            "failed to resolve session directory {}",
+            session_directory.display()
+        )
+    })
+}
+
+fn run_with_refiner_under_lease(
+    session_directory: &Path,
+    merge_gap_ms: u64,
+    refiner: &dyn RangeRefiner,
+    completed_at_unix_millis: u64,
+    _lease: &SessionOperationLease,
+) -> StageResult<()> {
+    // Everything before publication is validation or deterministic planning.
+    // Refusal here must not turn an operator mistake or damaged input into a
+    // new workflow failure record.
+    let (mut session, items) = (|| -> Result<_> {
+        let session = SessionStore::load(session_directory).with_context(|| {
+            format!(
+                "failed to load workflow state from {}",
+                session_directory.display()
+            )
+        })?;
+        if session.record().state != WorkflowState::ReadyForTranscription {
+            bail!(
+                "build-work-items requires session state ready_for_transcription; found {}",
+                session.record().state.as_str()
+            );
+        }
+
+        let participants_path = session_directory.join(&session.record().files.participants.path);
+        let participants = ParticipantContext::load(&participants_path).with_context(|| {
+            format!(
+                "failed to validate participant snapshot {}",
+                participants_path.display()
+            )
+        })?;
+
+        let track_manifest_path = session_directory.join(&session.record().files.tracks.path);
+        let tracks = TrackManifest::read(&track_manifest_path).with_context(|| {
+            format!(
+                "failed to read track manifest {}",
+                track_manifest_path.display()
+            )
+        })?;
+        validate_tracks(
+            session_directory,
+            session.record().session_id.as_str(),
+            &tracks,
+        )?;
+
+        let timeline =
+            MappingTimeline::read(&session_directory.join(&session.record().files.events.path))?;
+        if !timeline.unresolved_ssrcs().is_empty() {
+            let mut unresolved = timeline
+                .unresolved_ssrcs()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+            unresolved.sort_unstable();
+            bail!(
+                "cannot build work items while SSRC mapping evidence remains unresolved for {}",
+                comma_join(unresolved)
+            );
+        }
+
+        let mut attributed_frames = Vec::new();
+        let mut unattributed_ssrcs = HashSet::new();
+        let replay = recover::replay_activity_session_files(
+            session_directory,
+            &session.record().files,
+            |activity| {
+                match timeline.user_at(activity.ssrc, activity.elapsed_nanos) {
+                    Some(discord_user_id) => attributed_frames.push(AttributedFrame {
+                        discord_user_id,
+                        tick: activity.tick,
+                        samples: u64::from(activity.decoded_samples),
+                    }),
+                    None => {
+                        unattributed_ssrcs.insert(activity.ssrc);
+                    }
+                }
+                Ok(())
+            },
+        )
+        .context("authoritative packet/playout journal validation failed")?;
+        if replay.truncated_packet_tail || replay.truncated_playout_tail {
+            bail!("cannot build work items with a truncated authoritative journal tail");
+        }
+        if replay.skipped_undecoded > 0 {
+            bail!(
+                "cannot build work items: {} playout decisions lack decoded-sample evidence",
+                replay.skipped_undecoded
+            );
+        }
+        if !unattributed_ssrcs.is_empty() {
+            let mut ssrcs = unattributed_ssrcs.into_iter().collect::<Vec<_>>();
+            ssrcs.sort_unstable();
+            bail!(
+                "cannot build work items: decoded PCM cannot be attributed safely for SSRCs {}",
+                comma_join(ssrcs)
+            );
+        }
+
+        let candidates = build_candidate_ranges(attributed_frames, merge_gap_ms)?;
+        validate_source_alignment(&candidates, &tracks)?;
+        let refined = refiner.refine(candidates)?;
+        let items = materialise_work_items(
+            session.record().session_id.as_str(),
+            refined,
+            &tracks,
+            &participants,
+        )?;
+        Ok((session, items))
+    })()
+    .map_err(StageError::refused)?;
+
+    // At this point the coordinator has accepted the stage. File or authority
+    // publication failures are durable workflow faults when invoked one-stop.
+    (|| -> Result<()> {
+        write_manifest_atomically(session_directory, &items)?;
+        session
+            .publish_work_manifest(completed_at_unix_millis)
+            .context("work manifest was published but session.json could not record it")?;
+
+        println!(
+            "Published {} chronological work item(s) for session {}.",
+            items.len(),
+            session.record().session_id
+        );
+        Ok(())
+    })()
+    .map_err(StageError::accepted)
+}
+
+#[cfg(test)]
 fn run_with_refiner_before_lease(
     session_directory: &Path,
     merge_gap_ms: u64,
@@ -121,122 +278,17 @@ fn run_with_refiner_before_lease(
     completed_at_unix_millis: u64,
     before_lease: impl FnOnce(),
 ) -> Result<()> {
-    let session_directory = fs::canonicalize(session_directory).with_context(|| {
-        format!(
-            "failed to resolve session directory {}",
-            session_directory.display()
-        )
-    })?;
+    let session_directory = canonical_session_directory(session_directory)?;
     before_lease();
-    let _lease = SessionOperationLease::acquire(&session_directory)?;
-    let mut session = SessionStore::load(&session_directory).with_context(|| {
-        format!(
-            "failed to load workflow state from {}",
-            session_directory.display()
-        )
-    })?;
-    if session.record().state != WorkflowState::ReadyForTranscription {
-        bail!(
-            "build-work-items requires session state ready_for_transcription; found {}",
-            session.record().state.as_str()
-        );
-    }
-
-    let participants_path = session_directory.join(&session.record().files.participants.path);
-    let participants = ParticipantContext::load(&participants_path).with_context(|| {
-        format!(
-            "failed to validate participant snapshot {}",
-            participants_path.display()
-        )
-    })?;
-
-    let track_manifest_path = session_directory.join(&session.record().files.tracks.path);
-    let tracks = TrackManifest::read(&track_manifest_path).with_context(|| {
-        format!(
-            "failed to read track manifest {}",
-            track_manifest_path.display()
-        )
-    })?;
-    validate_tracks(
+    let lease = SessionOperationLease::acquire(&session_directory)?;
+    run_with_refiner_under_lease(
         &session_directory,
-        session.record().session_id.as_str(),
-        &tracks,
-    )?;
-
-    let timeline =
-        MappingTimeline::read(&session_directory.join(&session.record().files.events.path))?;
-    if !timeline.unresolved_ssrcs().is_empty() {
-        let mut unresolved = timeline
-            .unresolved_ssrcs()
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
-        unresolved.sort_unstable();
-        bail!(
-            "cannot build work items while SSRC mapping evidence remains unresolved for {}",
-            comma_join(unresolved)
-        );
-    }
-
-    let mut attributed_frames = Vec::new();
-    let mut unattributed_ssrcs = HashSet::new();
-    let replay = recover::replay_activity_session_files(
-        &session_directory,
-        &session.record().files,
-        |activity| {
-            match timeline.user_at(activity.ssrc, activity.elapsed_nanos) {
-                Some(discord_user_id) => attributed_frames.push(AttributedFrame {
-                    discord_user_id,
-                    tick: activity.tick,
-                    samples: u64::from(activity.decoded_samples),
-                }),
-                None => {
-                    unattributed_ssrcs.insert(activity.ssrc);
-                }
-            }
-            Ok(())
-        },
+        merge_gap_ms,
+        refiner,
+        completed_at_unix_millis,
+        &lease,
     )
-    .context("authoritative packet/playout journal validation failed")?;
-    if replay.truncated_packet_tail || replay.truncated_playout_tail {
-        bail!("cannot build work items with a truncated authoritative journal tail");
-    }
-    if replay.skipped_undecoded > 0 {
-        bail!(
-            "cannot build work items: {} playout decisions lack decoded-sample evidence",
-            replay.skipped_undecoded
-        );
-    }
-    if !unattributed_ssrcs.is_empty() {
-        let mut ssrcs = unattributed_ssrcs.into_iter().collect::<Vec<_>>();
-        ssrcs.sort_unstable();
-        bail!(
-            "cannot build work items: decoded PCM cannot be attributed safely for SSRCs {}",
-            comma_join(ssrcs)
-        );
-    }
-
-    let candidates = build_candidate_ranges(attributed_frames, merge_gap_ms)?;
-    validate_source_alignment(&candidates, &tracks)?;
-    let refined = refiner.refine(candidates)?;
-    let items = materialise_work_items(
-        session.record().session_id.as_str(),
-        refined,
-        &tracks,
-        &participants,
-    )?;
-
-    write_manifest_atomically(&session_directory, &items)?;
-    session
-        .publish_work_manifest(completed_at_unix_millis)
-        .context("work manifest was published but session.json could not record it")?;
-
-    println!(
-        "Published {} chronological work item(s) for session {}.",
-        items.len(),
-        session.record().session_id
-    );
-    Ok(())
+    .map_err(StageError::into_anyhow)
 }
 
 fn validate_tracks(

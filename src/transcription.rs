@@ -32,6 +32,7 @@ use crate::{
         RECORDING_SESSION_FORMAT_VERSION, SESSION_FORMAT_VERSION, SessionRecord, SessionStore,
         WorkflowState,
     },
+    stage::{StageError, StageResult},
     track_manifest::{TrackManifest, TrackState},
     work_items::WorkItem,
 };
@@ -39,6 +40,7 @@ use crate::{
 const RESULTS_TEMP_FILE_NAME: &str = ".results.jsonl.tmp";
 const RESULTS_RESUME_TEMP_FILE_NAME: &str = ".results.jsonl.resume.tmp";
 const PARTIAL_TRANSCRIPT_TEMP_FILE_NAME: &str = ".transcript.partial.txt.tmp";
+const FINAL_TRANSCRIPT_TEMP_FILE_NAME: &str = ".transcript.txt.tmp";
 const RESUME_PREPARED_PREFIX: &str = "transcription_resume_prepared_";
 const RESUME_APPLIED_PREFIX: &str = "transcription_resume_applied_";
 
@@ -149,12 +151,109 @@ impl WorkerProcess for SystemWorker {
     }
 }
 
+pub(crate) struct PreparedTranscription {
+    config_path: PathBuf,
+    settings: OfflineTranscriptionConfig,
+}
+
+impl PreparedTranscription {
+    /// Parse all operator-controlled configuration before session ownership is
+    /// acquired, so a bad config refuses cleanly without changing authority.
+    pub(crate) fn load(config_path: &Path) -> Result<Self> {
+        let settings = OfflineTranscriptionConfig::load(config_path)?;
+        if let Some(warning) = &settings.vocabulary_warning {
+            eprintln!("Warning: {warning}.");
+        }
+        let config_path = fs::canonicalize(config_path).with_context(|| {
+            format!(
+                "failed to resolve configuration file {}",
+                config_path.display()
+            )
+        })?;
+        Ok(Self {
+            config_path,
+            settings,
+        })
+    }
+}
+
 pub(crate) fn run(session_directory: &Path, config_path: &Path) -> Result<()> {
     run_with_worker(session_directory, config_path, &SystemWorker)
 }
 
-pub(crate) fn continue_after_failure(session_directory: &Path, config_path: &Path) -> Result<()> {
-    continue_with_worker(session_directory, config_path, &SystemWorker)
+pub(crate) fn rebuild_transcript(session_directory: &Path) -> Result<()> {
+    let session_directory = canonical_session_directory(session_directory)?;
+    let lease = SessionOperationLease::acquire(&session_directory)?;
+    rebuild_transcript_with_lease(&session_directory, &lease)
+}
+
+fn rebuild_transcript_with_lease(
+    session_directory: &Path,
+    _lease: &SessionOperationLease,
+) -> Result<()> {
+    let session = SessionStore::load(session_directory).with_context(|| {
+        format!(
+            "failed to load workflow state from {}",
+            session_directory.display()
+        )
+    })?;
+    if session.record().format != SESSION_FORMAT_VERSION
+        || session.record().state != WorkflowState::Complete
+        || session.record().files.work_items.is_none()
+        || session.record().files.results.is_none()
+    {
+        bail!(
+            "rebuild-transcript requires a complete format-5 session with work and result authority; \
+             found format {} state {}",
+            session.record().format,
+            session.record().state.as_str()
+        );
+    }
+
+    let manifest_path = session_directory.join(
+        &session
+            .record()
+            .files
+            .work_items
+            .as_ref()
+            .expect("rebuild entry validation requires work_items")
+            .path,
+    );
+    let tracks = validate_session_artifacts(session_directory, session.record())?;
+    let work_items = read_work_manifest(&manifest_path, session.record(), &tracks)?;
+    let results_path = session_directory.join(
+        &session
+            .record()
+            .files
+            .results
+            .as_ref()
+            .expect("rebuild entry validation requires results")
+            .path,
+    );
+    let bytes = fs::read(&results_path)
+        .with_context(|| format!("failed to read results {}", results_path.display()))?;
+    if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+        bail!(
+            "cannot rebuild transcript from a truncated final result record in {}",
+            results_path.display()
+        );
+    }
+    let committed = validate_and_repair_result_prefix(&results_path, &work_items)?;
+    if committed.len() != work_items.len() {
+        bail!(
+            "cannot rebuild transcript: committed {} of {} work items",
+            committed.len(),
+            work_items.len()
+        );
+    }
+
+    write_final_transcript_atomically(session_directory, &committed)?;
+    println!(
+        "Rebuilt final transcript for session {} at {}.",
+        session.record().session_id,
+        session_directory.join(FINAL_TRANSCRIPT_PATH).display()
+    );
+    Ok(())
 }
 
 fn run_with_worker(
@@ -171,88 +270,98 @@ fn run_with_worker_before_lease(
     worker: &dyn WorkerProcess,
     before_lease: impl FnOnce(),
 ) -> Result<()> {
-    let settings = OfflineTranscriptionConfig::load(config_path)?;
-    if let Some(warning) = &settings.vocabulary_warning {
-        eprintln!("Warning: {warning}.");
-    }
-
-    let session_directory = fs::canonicalize(session_directory).with_context(|| {
-        format!(
-            "failed to resolve session directory {}",
-            session_directory.display()
-        )
-    })?;
-    let config_path = fs::canonicalize(config_path).with_context(|| {
-        format!(
-            "failed to resolve configuration file {}",
-            config_path.display()
-        )
-    })?;
+    let prepared = PreparedTranscription::load(config_path)?;
+    let session_directory = canonical_session_directory(session_directory)?;
     before_lease();
     // Every session-derived read happens after ownership is exclusive. A
     // caller delayed before this point cannot carry stale authority forward.
     let lease = SessionOperationLease::acquire(&session_directory)?;
-    let mut session = SessionStore::load(&session_directory).with_context(|| {
-        format!(
-            "failed to load workflow state from {}",
-            session_directory.display()
-        )
-    })?;
-    validate_entry_state(session.record())?;
-
-    let manifest_path = session_directory.join(
-        &session
-            .record()
-            .files
-            .work_items
-            .as_ref()
-            .expect("entry validation requires work_items")
-            .path,
-    );
-    let tracks = validate_session_artifacts(&session_directory, session.record())?;
-    let work_items = read_work_manifest(&manifest_path, session.record(), &tracks)?;
-
-    if session.record().state == WorkflowState::ReadyForTranscription {
-        prepare_empty_results(&session_directory)?;
-        session
-            .publish_transcription_start(unix_millis_now()?)
-            .context(
-                "results authority was prepared but session.json could not start transcription",
-            )?;
-    }
-
-    let results_path = session_directory.join(
-        &session
-            .record()
-            .files
-            .results
-            .as_ref()
-            .expect("format-5 transcribing session requires results")
-            .path,
-    );
-    let committed = validate_and_repair_result_prefix(&results_path, &work_items)?;
-    let transcript_path = session_directory.join(PARTIAL_TRANSCRIPT_FILE_NAME);
-    rebuild_partial_transcript(&session_directory, &transcript_path, &committed)?;
-    let next_sequence = u64::try_from(committed.len())
-        .ok()
-        .and_then(|value| value.checked_add(1))
-        .ok_or_else(|| anyhow!("transcription result sequence overflow"))?;
-
-    run_worker_attempt(
-        &mut session,
-        &session_directory,
-        &config_path,
-        &manifest_path,
-        &results_path,
-        &transcript_path,
-        &work_items,
-        next_sequence,
-        &settings,
-        worker,
-        &lease,
-    )
+    run_prepared_with_worker(&session_directory, &prepared, worker, &lease)
+        .map_err(StageError::into_anyhow)
 }
 
+pub(crate) fn run_with_lease(
+    session_directory: &Path,
+    prepared: &PreparedTranscription,
+    lease: &SessionOperationLease,
+) -> StageResult<()> {
+    run_prepared_with_worker(session_directory, prepared, &SystemWorker, lease)
+}
+
+fn run_prepared_with_worker(
+    session_directory: &Path,
+    prepared: &PreparedTranscription,
+    worker: &dyn WorkerProcess,
+    lease: &SessionOperationLease,
+) -> StageResult<()> {
+    let (mut session, manifest_path, work_items) = (|| -> Result<_> {
+        let session = SessionStore::load(session_directory).with_context(|| {
+            format!(
+                "failed to load workflow state from {}",
+                session_directory.display()
+            )
+        })?;
+        validate_entry_state(session.record())?;
+        let manifest_path = session_directory.join(
+            &session
+                .record()
+                .files
+                .work_items
+                .as_ref()
+                .expect("entry validation requires work_items")
+                .path,
+        );
+        let tracks = validate_session_artifacts(session_directory, session.record())?;
+        let work_items = read_work_manifest(&manifest_path, session.record(), &tracks)?;
+        Ok((session, manifest_path, work_items))
+    })()
+    .map_err(StageError::refused)?;
+
+    (|| -> Result<()> {
+        if session.record().state == WorkflowState::ReadyForTranscription {
+            prepare_empty_results(session_directory)?;
+            session
+                .publish_transcription_start(unix_millis_now()?)
+                .context(
+                    "results authority was prepared but session.json could not start transcription",
+                )?;
+        }
+
+        let results_path = session_directory.join(
+            &session
+                .record()
+                .files
+                .results
+                .as_ref()
+                .expect("format-5 transcribing session requires results")
+                .path,
+        );
+        let committed = validate_and_repair_result_prefix(&results_path, &work_items)?;
+        let transcript_path = session_directory.join(PARTIAL_TRANSCRIPT_FILE_NAME);
+        rebuild_partial_transcript(session_directory, &transcript_path, &committed)?;
+        let next_sequence = u64::try_from(committed.len())
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| anyhow!("transcription result sequence overflow"))?;
+
+        run_worker_attempt(
+            &mut session,
+            session_directory,
+            &prepared.config_path,
+            &manifest_path,
+            &results_path,
+            &transcript_path,
+            &work_items,
+            next_sequence,
+            &prepared.settings,
+            worker,
+            lease,
+        )
+    })()
+    .map_err(StageError::accepted)
+}
+
+#[cfg(test)]
 fn continue_with_worker(
     session_directory: &Path,
     config_path: &Path,
@@ -261,110 +370,140 @@ fn continue_with_worker(
     continue_with_worker_before_lease(session_directory, config_path, worker, || {})
 }
 
+#[cfg(test)]
 fn continue_with_worker_before_lease(
     session_directory: &Path,
     config_path: &Path,
     worker: &dyn WorkerProcess,
     before_lease: impl FnOnce(),
 ) -> Result<()> {
-    let settings = OfflineTranscriptionConfig::load(config_path)?;
-    if let Some(warning) = &settings.vocabulary_warning {
-        eprintln!("Warning: {warning}.");
-    }
-
-    let session_directory = fs::canonicalize(session_directory).with_context(|| {
-        format!(
-            "failed to resolve session directory {}",
-            session_directory.display()
-        )
-    })?;
-    let config_path = fs::canonicalize(config_path).with_context(|| {
-        format!(
-            "failed to resolve configuration file {}",
-            config_path.display()
-        )
-    })?;
+    let prepared = PreparedTranscription::load(config_path)?;
+    let session_directory = canonical_session_directory(session_directory)?;
     before_lease();
     // Continuation route selection and every path derived from session.json are
     // protected by the same lease as result repair and worker execution.
     let lease = SessionOperationLease::acquire(&session_directory)?;
-    let mut session = SessionStore::load(&session_directory).with_context(|| {
-        format!(
-            "failed to load workflow state from {}",
-            session_directory.display()
-        )
-    })?;
-    validate_transcription_continuation_entry(session.record())?;
+    continue_prepared_with_worker(&session_directory, &prepared, worker, &lease)
+        .map_err(StageError::into_anyhow)
+}
 
-    let manifest_path = session_directory.join(
-        &session
-            .record()
-            .files
-            .work_items
-            .as_ref()
-            .expect("continuation validation requires work_items")
-            .path,
-    );
-    let tracks = validate_session_artifacts(&session_directory, session.record())?;
-    let work_items = read_work_manifest(&manifest_path, session.record(), &tracks)?;
-    let results_path = session_directory.join(
-        &session
-            .record()
-            .files
-            .results
-            .as_ref()
-            .expect("continuation validation requires results")
-            .path,
-    );
+pub(crate) fn continue_with_lease(
+    session_directory: &Path,
+    prepared: &PreparedTranscription,
+    lease: &SessionOperationLease,
+) -> StageResult<()> {
+    continue_prepared_with_worker(session_directory, prepared, &SystemWorker, lease)
+}
 
-    let committed = validate_and_repair_result_prefix(&results_path, &work_items)?;
+fn continue_prepared_with_worker(
+    session_directory: &Path,
+    prepared: &PreparedTranscription,
+    worker: &dyn WorkerProcess,
+    lease: &SessionOperationLease,
+) -> StageResult<()> {
+    let (mut session, manifest_path, work_items, results_path, committed, plan) =
+        (|| -> Result<_> {
+            let session = SessionStore::load(session_directory).with_context(|| {
+                format!(
+                    "failed to load workflow state from {}",
+                    session_directory.display()
+                )
+            })?;
+            validate_transcription_continuation_entry(session.record())?;
+            let manifest_path = session_directory.join(
+                &session
+                    .record()
+                    .files
+                    .work_items
+                    .as_ref()
+                    .expect("continuation validation requires work_items")
+                    .path,
+            );
+            let tracks = validate_session_artifacts(session_directory, session.record())?;
+            let work_items = read_work_manifest(&manifest_path, session.record(), &tracks)?;
+            let results_path = session_directory.join(
+                &session
+                    .record()
+                    .files
+                    .results
+                    .as_ref()
+                    .expect("continuation validation requires results")
+                    .path,
+            );
+            let committed = validate_and_repair_result_prefix(&results_path, &work_items)?;
+            let plan = select_resume_plan(
+                session.record(),
+                &committed,
+                &work_items,
+                &prepared.settings,
+            )?;
+            Ok((
+                session,
+                manifest_path,
+                work_items,
+                results_path,
+                committed,
+                plan,
+            ))
+        })()
+        .map_err(StageError::refused)?;
 
-    if session.record().state == WorkflowState::TranscriptionFailed {
+    (|| -> Result<()> {
+        if session.record().state == WorkflowState::TranscriptionFailed {
+            session
+                .transition(WorkflowState::AwaitingOperator, unix_millis_now()?)
+                .context("failed to publish awaiting_operator for transcription continuation")?;
+        }
+        if !plan.previously_prepared {
+            session
+                .record_transcription_resume_prepared(unix_millis_now()?, plan.sequence)
+                .with_context(|| {
+                    format!(
+                        "failed to record prepared transcription resume sequence {}",
+                        plan.sequence
+                    )
+                })?;
+        }
+
+        let retained_count = usize::try_from(plan.sequence - 1)
+            .map_err(|_| anyhow!("resume sequence does not fit in memory"))?;
+        replace_results_prefix(&results_path, &committed[..retained_count])?;
+        let retained = committed[..retained_count].to_vec();
+        let transcript_path = session_directory.join(PARTIAL_TRANSCRIPT_FILE_NAME);
+        rebuild_partial_transcript(session_directory, &transcript_path, &retained)?;
         session
-            .transition(WorkflowState::AwaitingOperator, unix_millis_now()?)
-            .context("failed to publish awaiting_operator for transcription continuation")?;
-    }
-
-    let plan = select_resume_plan(session.record(), &committed, &work_items, &settings)?;
-    if !plan.previously_prepared {
-        session
-            .record_transcription_resume_prepared(unix_millis_now()?, plan.sequence)
+            .apply_transcription_resume(unix_millis_now()?, plan.sequence)
             .with_context(|| {
                 format!(
-                    "failed to record prepared transcription resume sequence {}",
+                    "results were rewound to sequence {} but the applied resume state was not published",
                     plan.sequence
                 )
             })?;
-    }
 
-    let retained_count = usize::try_from(plan.sequence - 1)
-        .map_err(|_| anyhow!("resume sequence does not fit in memory"))?;
-    replace_results_prefix(&results_path, &committed[..retained_count])?;
-    let retained = committed[..retained_count].to_vec();
-    let transcript_path = session_directory.join(PARTIAL_TRANSCRIPT_FILE_NAME);
-    rebuild_partial_transcript(&session_directory, &transcript_path, &retained)?;
-    session
-        .apply_transcription_resume(unix_millis_now()?, plan.sequence)
-        .with_context(|| {
-            format!(
-                "results were rewound to sequence {} but the applied resume state was not published",
-                plan.sequence
-            )
-        })?;
+        run_worker_attempt(
+            &mut session,
+            session_directory,
+            &prepared.config_path,
+            &manifest_path,
+            &results_path,
+            &transcript_path,
+            &work_items,
+            plan.sequence,
+            &prepared.settings,
+            worker,
+            lease,
+        )
+    })()
+    .map_err(StageError::accepted)
+}
 
-    run_worker_attempt(
-        &mut session,
-        &session_directory,
-        &config_path,
-        &manifest_path,
-        &results_path,
-        &transcript_path,
-        &work_items,
-        plan.sequence,
-        &settings,
-        worker,
-        &lease,
-    )
+fn canonical_session_directory(session_directory: &Path) -> Result<PathBuf> {
+    fs::canonicalize(session_directory).with_context(|| {
+        format!(
+            "failed to resolve session directory {}",
+            session_directory.display()
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1142,6 +1281,38 @@ fn rebuild_partial_transcript(
     Ok(())
 }
 
+fn write_final_transcript_atomically(
+    session_directory: &Path,
+    results: &[TranscriptionResult],
+) -> Result<()> {
+    let directory = session_directory.join(TRANSCRIPTION_DIRECTORY_NAME);
+    let temporary_path = directory.join(FINAL_TRANSCRIPT_TEMP_FILE_NAME);
+    let final_path = session_directory.join(FINAL_TRANSCRIPT_PATH);
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&temporary_path)
+        .with_context(|| format!("failed to create {}", temporary_path.display()))?;
+    let mut writer = BufWriter::new(file);
+    for result in results {
+        writer.write_all(transcript_line(result).as_bytes())?;
+    }
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    drop(writer);
+    fs::rename(&temporary_path, &final_path).with_context(|| {
+        format!(
+            "failed to publish final transcript {}",
+            final_path.display()
+        )
+    })?;
+    File::open(&directory)?
+        .sync_all()
+        .context("failed to synchronise transcription directory")?;
+    Ok(())
+}
+
 fn transcript_line(result: &TranscriptionResult) -> String {
     let elapsed_seconds = result.start_ms / 1_000;
     let hours = elapsed_seconds / 3_600;
@@ -1501,6 +1672,49 @@ mod tests {
             invocations[0].hotwords,
             ["Emperor Coaltongue", "Dragon Lance"]
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rebuild_transcript_replaces_only_the_complete_display_artefact() {
+        let (directory, config_path, _) = ready_session("rebuild-complete");
+        run_with_worker(&directory, &config_path, &FakeWorker::successful()).unwrap();
+        let results_path = directory.join(crate::artifacts::TRANSCRIPTION_RESULTS_PATH);
+        let final_path = directory.join(FINAL_TRANSCRIPT_PATH);
+        let results_before = fs::read(&results_path).unwrap();
+        let session_before = fs::read(directory.join("session.json")).unwrap();
+        fs::write(&final_path, b"stale display text\n").unwrap();
+
+        rebuild_transcript(&directory).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&final_path).unwrap(),
+            "[00:00:00] Alice: Result 1\n"
+        );
+        assert_eq!(fs::read(&results_path).unwrap(), results_before);
+        assert_eq!(
+            fs::read(directory.join("session.json")).unwrap(),
+            session_before
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rebuild_transcript_refuses_incomplete_or_truncated_authority_without_mutation() {
+        let (directory, config_path, _) = ready_session("rebuild-refusal");
+        run_with_worker(&directory, &config_path, &FakeWorker::successful()).unwrap();
+        let results_path = directory.join(crate::artifacts::TRANSCRIPTION_RESULTS_PATH);
+        let final_path = directory.join(FINAL_TRANSCRIPT_PATH);
+        let mut truncated = fs::read(&results_path).unwrap();
+        truncated.extend_from_slice(b"{\"format\":");
+        fs::write(&results_path, &truncated).unwrap();
+        fs::write(&final_path, b"retain me\n").unwrap();
+
+        let error = rebuild_transcript(&directory).unwrap_err();
+
+        assert!(error.to_string().contains("truncated final result"));
+        assert_eq!(fs::read(&results_path).unwrap(), truncated);
+        assert_eq!(fs::read(&final_path).unwrap(), b"retain me\n");
         fs::remove_dir_all(directory).unwrap();
     }
 

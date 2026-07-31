@@ -15,11 +15,13 @@ mod inspect;
 mod journal;
 mod live_flac;
 mod operation_lease;
+mod orchestration;
 mod participants;
 mod playout;
 mod recover;
 mod routine_recovery;
 mod session;
+mod stage;
 mod telemetry;
 mod track_manifest;
 mod transcription;
@@ -60,9 +62,13 @@ struct Handler {
 }
 
 #[derive(Debug)]
-/// Parsed top-level operation. Only `Record` constructs a Discord client.
+/// Parsed top-level operation. Only normal and recording-only modes construct
+/// a Discord client.
 enum Command {
-    Record {
+    Normal {
+        config_path: PathBuf,
+    },
+    RecordOnly {
         config_path: PathBuf,
     },
     Inspect {
@@ -86,6 +92,9 @@ enum Command {
     Transcribe {
         session_directory: PathBuf,
         config_path: PathBuf,
+    },
+    RebuildTranscript {
+        session_directory: PathBuf,
     },
     Export {
         session_directory: PathBuf,
@@ -255,8 +264,9 @@ async fn build_client(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config_path = match parse_command()? {
-        Command::Record { config_path } => config_path,
+    let (config_path, one_stop) = match parse_command()? {
+        Command::Normal { config_path } => (config_path, true),
+        Command::RecordOnly { config_path } => (config_path, false),
         Command::Inspect { session_directory } => {
             return inspect::run(&session_directory);
         }
@@ -275,7 +285,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             return match config_path {
                 Some(config_path) => {
-                    transcription::continue_after_failure(&session_directory, &config_path)
+                    orchestration::continue_stage_aware(&session_directory, &config_path)
                 }
                 None => continuation::run(&session_directory),
             };
@@ -291,6 +301,9 @@ async fn main() -> anyhow::Result<()> {
             config_path,
         } => {
             return transcription::run(&session_directory, &config_path);
+        }
+        Command::RebuildTranscript { session_directory } => {
+            return transcription::rebuild_transcript(&session_directory);
         }
         Command::Export { session_directory } => {
             return recover::export(&session_directory);
@@ -324,6 +337,7 @@ async fn main() -> anyhow::Result<()> {
         "Capture session: {}.",
         capture_drain.session_directory().display()
     );
+    let session_directory = capture_drain.session_directory().to_path_buf();
     let telemetry = Arc::new(VoiceTelemetry::new(capture_sender));
     let (mut client, voice_manager) = match build_client(&config, Arc::clone(&telemetry)).await {
         Ok(client) => client,
@@ -383,9 +397,23 @@ async fn main() -> anyhow::Result<()> {
     shard_manager.shutdown_all().await;
 
     let recording_outcome = recording_result.context("recording finalisation failed")?;
+    require_clean_recording(recording_outcome)?;
+    gateway_result?;
+
+    if one_stop {
+        orchestration::run_after_recording(&session_directory, &config_path)?;
+    }
+
+    println!("EchoScribe stopped.");
+
+    Ok(())
+}
+
+fn require_clean_recording(recording_outcome: RecordingOutcome) -> Result<()> {
     match recording_outcome {
         RecordingOutcome::ReadyForTranscription => {
             println!("Recording finalised cleanly and is ready for transcription.");
+            Ok(())
         }
         RecordingOutcome::AwaitingOperator { incomplete_users } => {
             if incomplete_users.is_empty() {
@@ -404,11 +432,6 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     }
-    gateway_result?;
-
-    println!("EchoScribe stopped.");
-
-    Ok(())
 }
 
 fn parse_command() -> Result<Command> {
@@ -417,10 +440,18 @@ fn parse_command() -> Result<Command> {
 
 fn parse_command_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<Command> {
     let Some(first) = args.next() else {
-        return Ok(Command::Record {
+        return Ok(Command::Normal {
             config_path: PathBuf::from("echoscribe.toml"),
         });
     };
+
+    if first == "record" {
+        let config_path = args
+            .next()
+            .map_or_else(|| PathBuf::from("echoscribe.toml"), PathBuf::from);
+        require_no_extra_args(&mut args)?;
+        return Ok(Command::RecordOnly { config_path });
+    }
 
     if matches!(
         first.to_str(),
@@ -431,6 +462,7 @@ fn parse_command_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Res
                 | "continue"
                 | "build-work-items"
                 | "transcribe"
+                | "rebuild-transcript"
                 | "export"
                 | "verify"
         )
@@ -501,6 +533,10 @@ fn parse_command_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Res
                     config_path,
                 })
             }
+            Some("rebuild-transcript") => {
+                require_no_extra_args(&mut args)?;
+                Ok(Command::RebuildTranscript { session_directory })
+            }
             Some("export") => {
                 require_no_extra_args(&mut args)?;
                 Ok(Command::Export { session_directory })
@@ -515,7 +551,7 @@ fn parse_command_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Res
         if let Some(extra) = args.next() {
             bail!("unexpected argument {:?}", extra);
         }
-        Ok(Command::Record {
+        Ok(Command::Normal {
             config_path: PathBuf::from(first),
         })
     }
@@ -547,17 +583,46 @@ mod tests {
     #[test]
     fn no_arguments_uses_default_config() {
         let command = parse_command_args(Vec::<OsString>::new().into_iter()).unwrap();
-        let Command::Record { config_path } = command else {
-            panic!("expected record command");
+        let Command::Normal { config_path } = command else {
+            panic!("expected normal command");
         };
         assert_eq!(config_path, Path::new("echoscribe.toml"));
     }
 
     #[test]
-    fn one_path_argument_selects_recording_config() {
+    fn recording_fault_refuses_post_recording_pipeline() {
+        let error = require_clean_recording(RecordingOutcome::AwaitingOperator {
+            incomplete_users: vec![11, 22],
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("awaiting operator action"));
+        assert!(error.to_string().contains("11, 22"));
+    }
+
+    #[test]
+    fn one_path_argument_selects_normal_config() {
         let command = parse_command_args([OsString::from("other.toml")].into_iter()).unwrap();
-        let Command::Record { config_path } = command else {
-            panic!("expected record command");
+        let Command::Normal { config_path } = command else {
+            panic!("expected normal command");
+        };
+        assert_eq!(config_path, Path::new("other.toml"));
+    }
+
+    #[test]
+    fn record_command_is_explicitly_recording_only() {
+        let default = parse_command_args([OsString::from("record")].into_iter()).unwrap();
+        let Command::RecordOnly { config_path } = default else {
+            panic!("expected recording-only command");
+        };
+        assert_eq!(config_path, Path::new("echoscribe.toml"));
+
+        let selected = parse_command_args(
+            [OsString::from("record"), OsString::from("other.toml")].into_iter(),
+        )
+        .unwrap();
+        let Command::RecordOnly { config_path } = selected else {
+            panic!("expected recording-only command");
         };
         assert_eq!(config_path, Path::new("other.toml"));
     }
@@ -808,6 +873,33 @@ mod tests {
                 OsString::from("transcribe"),
                 OsString::from("recordings/session-123"),
                 OsString::from("echoscribe.toml"),
+                OsString::from("extra"),
+            ]
+            .into_iter(),
+        )
+        .unwrap_err();
+        assert!(extra.to_string().contains("unexpected argument"));
+    }
+
+    #[test]
+    fn rebuild_transcript_selects_exactly_one_session() {
+        let command = parse_command_args(
+            [
+                OsString::from("rebuild-transcript"),
+                OsString::from("recordings/session-123"),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        let Command::RebuildTranscript { session_directory } = command else {
+            panic!("expected rebuild-transcript command");
+        };
+        assert_eq!(session_directory, Path::new("recordings/session-123"));
+
+        let extra = parse_command_args(
+            [
+                OsString::from("rebuild-transcript"),
+                OsString::from("recordings/session-123"),
                 OsString::from("extra"),
             ]
             .into_iter(),
