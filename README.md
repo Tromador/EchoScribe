@@ -13,13 +13,26 @@ worker and never modifies `session.json`.
 ```text
 Cargo.toml, src/                  Rust application
 workers/faster-whisper/          Python transcription worker and dependencies
-docs/                            Normative specification and architecture
+docs/                            User, developer, and retained design documents
 archive/legacy-pipeline/         Historical pre-rewrite implementation
 echoscribe.ps1, echoscribe.sh    Convenience launchers
 ```
 
-The archived pipeline is retained for reference and is not executed by the
-current application.
+## Documentation
+
+- [User Guide](docs/USER_GUIDE.md) — installation, configuration, operation,
+  command reference, recovery, and troubleshooting.
+- [Developer Guide](docs/DEVELOPER_GUIDE.md) — architecture, source layout,
+  authority, data flow, failure semantics, and extension guidance.
+
+## Legacy pipeline
+
+The archived pipeline is the previous Discord.js/Python capture,
+transcription, VAD-rescue, and deduplication stack. It is preserved for
+historical reference and is not executed by the current application. See its
+[archival note](archive/legacy-pipeline/ARCHIVE.md),
+[original README](archive/legacy-pipeline/README.md), and
+[detailed pipeline document](archive/legacy-pipeline/discord_transcript_pipeline.md).
 
 ## Python environment
 
