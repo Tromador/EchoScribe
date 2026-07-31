@@ -1,10 +1,5 @@
 # EchoScribe
 
-[![Rust 2024](https://img.shields.io/badge/Rust-2024_edition-000000?logo=rust&logoColor=white)](https://doc.rust-lang.org/edition-guide/rust-2024/index.html)
-[![Discord voice: Songbird](https://img.shields.io/badge/Discord_voice-Songbird-5865F2?logo=discord&logoColor=white)](https://docs.rs/songbird/latest/songbird/)
-[![Transcription: faster-whisper](https://img.shields.io/badge/Transcription-faster--whisper-3776AB?logo=python&logoColor=white)](https://github.com/SYSTRAN/faster-whisper)
-[![License: BSD 3-Clause](https://img.shields.io/badge/License-BSD_3--Clause-3A7D44)](https://spdx.org/licenses/BSD-3-Clause.html)
-
 EchoScribe records Discord tabletop sessions into durable journals and aligned
 per-participant FLAC tracks, then produces chronological structured and
 human-readable transcripts.
@@ -131,3 +126,10 @@ Cargo writes the executable to `target/release/echoscribe` on Linux and
 `target/release/echoscribe.exe` on Windows. Debug builds use the corresponding
 path beneath `target/debug/`; generated executables are not copied into the
 repository root.
+
+---
+
+[![Rust 2024](https://img.shields.io/badge/Rust-2024_edition-000000?logo=rust&logoColor=white)](https://doc.rust-lang.org/edition-guide/rust-2024/index.html)
+[![Discord voice: Songbird](https://img.shields.io/badge/Discord_voice-Songbird-5865F2?logo=discord&logoColor=white)](https://docs.rs/songbird/latest/songbird/)
+[![Transcription: faster-whisper](https://img.shields.io/badge/Transcription-faster--whisper-3776AB?logo=python&logoColor=white)](https://github.com/SYSTRAN/faster-whisper)
+[![License: BSD 3-Clause](https://img.shields.io/badge/License-BSD_3--Clause-3A7D44)](https://spdx.org/licenses/BSD-3-Clause.html)
