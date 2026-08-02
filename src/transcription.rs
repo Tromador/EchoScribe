@@ -1010,19 +1010,12 @@ fn validate_work_item_for_session(
         bail!("invalid or out-of-order work item {:?}", item.id);
     }
     if let Some(previous) = previous {
-        let previous_key = (
-            previous.start_ms,
-            previous.discord_user_id.as_str(),
-            previous.end_ms,
-            previous.source_start_ms,
-        );
-        let item_key = (
-            item.start_ms,
-            item.discord_user_id.as_str(),
-            item.end_ms,
-            item.source_start_ms,
-        );
-        if item_key < previous_key {
+        // The producer sorts sample-accurate ranges before format-1 publication
+        // rounds their positions to milliseconds. Sequence therefore preserves
+        // the deterministic producer order when displayed start times collide;
+        // reconstructing another tie-break from lossy published fields would
+        // falsely reject valid manifests.
+        if item.start_ms < previous.start_ms {
             bail!("work manifest is not in deterministic chronological order");
         }
     }
@@ -1687,6 +1680,170 @@ mod tests {
             vad_worker_arguments(false),
             [OsString::from("--vad-enabled"), OsString::from("false")]
         );
+    }
+
+    #[test]
+    fn work_manifest_accepts_equal_start_with_numeric_id_order() {
+        let (directory, _, mut first) = ready_session("manifest-numeric-id-order");
+        first.discord_user_id = "333965420539150337".to_owned();
+        first.start_ms = 646_300;
+        first.end_ms = 647_000;
+        first.source_start_ms = 646_300;
+        first.source_end_ms = 647_000;
+        let mut second = first.clone();
+        second.sequence = 2;
+        second.id = "session-transcription:000002".to_owned();
+        second.discord_user_id = "1070186824502358139".to_owned();
+
+        let items = read_test_work_manifest_authority(&directory, &[first, second]).unwrap();
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].discord_user_id, "333965420539150337");
+        assert_eq!(items[1].discord_user_id, "1070186824502358139");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn work_manifest_equal_start_uses_sequence_for_either_id_order() {
+        let (directory, _, mut first) = ready_session("manifest-either-id-order");
+        first.start_ms = 500;
+        first.end_ms = 700;
+        first.source_start_ms = 500;
+        first.source_end_ms = 700;
+
+        for (first_id, second_id) in [
+            ("333965420539150337", "1070186824502358139"),
+            ("1070186824502358139", "333965420539150337"),
+        ] {
+            first.discord_user_id = first_id.to_owned();
+            let mut second = first.clone();
+            second.sequence = 2;
+            second.id = "session-transcription:000002".to_owned();
+            second.discord_user_id = second_id.to_owned();
+
+            read_test_work_manifest_authority(&directory, &[first.clone(), second]).unwrap();
+        }
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn work_manifest_accepts_exact_sample_starts_rounded_to_same_millisecond() {
+        const SAMPLES_PER_MILLISECOND: u64 = 48;
+        let exact_first_start = 646_300 * SAMPLES_PER_MILLISECOND + 1;
+        let exact_second_start = exact_first_start + 1;
+        assert_ne!(exact_first_start, exact_second_start);
+        assert_eq!(
+            exact_first_start / SAMPLES_PER_MILLISECOND,
+            exact_second_start / SAMPLES_PER_MILLISECOND
+        );
+
+        let (directory, _, mut first) = ready_session("manifest-rounded-samples");
+        first.discord_user_id = "9".to_owned();
+        first.start_ms = exact_first_start / SAMPLES_PER_MILLISECOND;
+        first.end_ms = first.start_ms + 100;
+        first.source_start_ms = first.start_ms;
+        first.source_end_ms = first.end_ms;
+        let mut second = first.clone();
+        second.sequence = 2;
+        second.id = "session-transcription:000002".to_owned();
+        second.discord_user_id = "10".to_owned();
+        second.start_ms = exact_second_start / SAMPLES_PER_MILLISECOND;
+        second.source_start_ms = second.start_ms;
+
+        read_test_work_manifest_authority(&directory, &[first, second]).unwrap();
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn work_manifest_rejects_decreasing_start_time() {
+        let (directory, _, mut first) = ready_session("manifest-decreasing-time");
+        first.start_ms = 500;
+        first.end_ms = 700;
+        first.source_start_ms = 500;
+        first.source_end_ms = 700;
+        let mut second = test_item(2, 499, 701);
+        second.source_start_ms = second.start_ms;
+        second.source_end_ms = second.end_ms;
+
+        let error = read_test_work_manifest_authority(&directory, &[first, second]).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("not in deterministic chronological order")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn work_manifest_still_rejects_sequence_gap_and_duplicate() {
+        let (directory, _, first) = ready_session("manifest-sequence-errors");
+        for invalid_sequence in [1, 3] {
+            let mut second = test_item(invalid_sequence, first.end_ms, first.end_ms + 100);
+            second.id = format!("session-transcription:{invalid_sequence:06}");
+
+            assert!(
+                read_test_work_manifest_authority(&directory, &[first.clone(), second]).is_err()
+            );
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn work_manifest_still_validates_fields_ranges_session_and_source_path() {
+        let (directory, _, item) = ready_session("manifest-field-validation");
+        let mut invalid_items = Vec::new();
+
+        let mut invalid = item.clone();
+        invalid.format += 1;
+        invalid_items.push(invalid);
+
+        let mut invalid = item.clone();
+        invalid.session_id = "another-session".to_owned();
+        invalid_items.push(invalid);
+
+        let mut invalid = item.clone();
+        invalid.id = "not-canonical".to_owned();
+        invalid_items.push(invalid);
+
+        let mut invalid = item.clone();
+        invalid.end_ms = invalid.start_ms;
+        invalid_items.push(invalid);
+
+        let mut invalid = item.clone();
+        invalid.source_end_ms = invalid.source_start_ms;
+        invalid_items.push(invalid);
+
+        let mut invalid = item.clone();
+        invalid.speaker = "   ".to_owned();
+        invalid_items.push(invalid);
+
+        let mut invalid = item.clone();
+        invalid.role = "spectator".to_owned();
+        invalid_items.push(invalid);
+
+        let mut invalid = item.clone();
+        invalid.discord_user_id = "0".to_owned();
+        invalid_items.push(invalid);
+
+        let mut invalid = item.clone();
+        invalid.discord_user_id = "not-a-discord-id".to_owned();
+        invalid_items.push(invalid);
+
+        let mut invalid = item.clone();
+        invalid.source = "/tmp/user-11.flac".to_owned();
+        invalid_items.push(invalid);
+
+        let mut invalid = item;
+        invalid.source = "tracks/../../user-11.flac".to_owned();
+        invalid_items.push(invalid);
+
+        for invalid in invalid_items {
+            assert!(read_test_work_manifest_authority(&directory, &[invalid]).is_err());
+        }
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -2826,6 +2983,22 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    fn read_test_work_manifest_authority(
+        directory: &Path,
+        items: &[WorkItem],
+    ) -> Result<Vec<WorkItem>> {
+        let body = items
+            .iter()
+            .map(|item| serde_json::to_string(item).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let path = directory.join(WORK_ITEM_MANIFEST_PATH);
+        fs::write(&path, body).unwrap();
+        let session = SessionStore::load(directory).unwrap();
+        read_work_manifest_authority(&path, session.record())
     }
 
     fn ready_session(label: &str) -> (PathBuf, PathBuf, WorkItem) {
