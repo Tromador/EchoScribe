@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 import os
 import sys
 import tempfile
@@ -14,6 +15,18 @@ WORK_ITEM_FORMAT = 1
 RESULT_FORMAT = 1
 SOURCE_SAMPLE_RATE = 48_000
 MAX_END_ROUNDING_FRAMES = 47
+VAD_SAMPLE_RATE = 16_000
+
+# These are provisional acceptance-tuning values inherited from the useful
+# short-utterance rescue in the archived pipeline, not architectural truths.
+BURST_RESCUE_MAX_SECONDS = 2.0
+BURST_RESCUE_MIN_RMS = 0.003
+BURST_RESCUE_MIN_FRAME_RMS_STD = 0.03
+BURST_RESCUE_FRAME_MS = 20
+
+VAD_ACCEPTED = "vad_accepted"
+BURST_RESCUED = "burst_rescued"
+NON_SPEECH_REJECTED = "non_speech_rejected"
 WORK_ITEM_FIELDS = {
     "format",
     "id",
@@ -31,6 +44,14 @@ WORK_ITEM_FIELDS = {
 }
 
 
+def parse_bool(value):
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise argparse.ArgumentTypeError("expected 'true' or 'false'")
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Transcribe one EchoScribe work manifest in chronological order."
@@ -46,6 +67,7 @@ def parse_args(argv=None):
     parser.add_argument("--device", required=True)
     parser.add_argument("--compute-type", required=True)
     parser.add_argument("--beam-size", type=int, required=True)
+    parser.add_argument("--vad-enabled", type=parse_bool, required=True)
     parser.add_argument("--hotword", action="append", default=[])
     return parser.parse_args(argv)
 
@@ -113,6 +135,67 @@ def default_model_factory(args):
         device=args.device,
         compute_type=args.compute_type,
     )
+
+
+def default_vad_analyser(path):
+    """Run faster-whisper's bundled Silero gate over the complete range."""
+    try:
+        from faster_whisper.audio import decode_audio
+        from faster_whisper.vad import VadOptions, get_speech_timestamps
+    except ImportError as error:
+        raise RuntimeError(
+            "faster-whisper VAD support is not installed in the selected "
+            "Python environment"
+        ) from error
+
+    try:
+        audio = decode_audio(str(path), sampling_rate=VAD_SAMPLE_RATE)
+        speech = get_speech_timestamps(
+            audio,
+            VadOptions(),
+            sampling_rate=VAD_SAMPLE_RATE,
+        )
+    except Exception as error:
+        raise RuntimeError(f"Silero VAD failed for {path}: {error}") from error
+    return bool(speech), audio, VAD_SAMPLE_RATE
+
+
+def root_mean_square(samples):
+    if len(samples) == 0:
+        return 0.0
+    return math.sqrt(
+        sum(float(sample) * float(sample) for sample in samples) / len(samples)
+    )
+
+
+def short_burst_rescue(samples, sample_rate):
+    """Recognise a brief, speech-like energy burst after a Silero miss."""
+    if sample_rate <= 0 or len(samples) / sample_rate >= BURST_RESCUE_MAX_SECONDS:
+        return False
+    if root_mean_square(samples) < BURST_RESCUE_MIN_RMS:
+        return False
+
+    frame_size = sample_rate * BURST_RESCUE_FRAME_MS // 1_000
+    if frame_size <= 0:
+        return False
+    frame_rms = [
+        root_mean_square(samples[offset : offset + frame_size])
+        for offset in range(0, len(samples), frame_size)
+    ]
+    mean = sum(frame_rms) / len(frame_rms)
+    standard_deviation = math.sqrt(
+        sum((value - mean) ** 2 for value in frame_rms) / len(frame_rms)
+    )
+    return standard_deviation > BURST_RESCUE_MIN_FRAME_RMS_STD
+
+
+def qualify_range(path, vad_analyser=default_vad_analyser):
+    speech_detected, audio, sample_rate = vad_analyser(path)
+    if speech_detected:
+        return VAD_ACCEPTED
+    if short_burst_rescue(audio, sample_rate):
+        return BURST_RESCUED
+    return NON_SPEECH_REJECTED
 
 
 @contextmanager
@@ -206,6 +289,8 @@ def result_from_item(item, text):
 
 
 def transcript_line(result):
+    if not result["text"].strip():
+        return ""
     elapsed_seconds = result["start_ms"] // 1_000
     hours = elapsed_seconds // 3_600
     minutes = elapsed_seconds % 3_600 // 60
@@ -223,7 +308,12 @@ def append_and_sync(path, data):
         os.fsync(output.fileno())
 
 
-def process(args, model_factory=default_model_factory, range_extractor=extract_audio_range):
+def process(
+    args,
+    model_factory=default_model_factory,
+    range_extractor=extract_audio_range,
+    vad_analyser=default_vad_analyser,
+):
     items = load_manifest(args.manifest)
     if args.start_sequence < 1 or args.start_sequence > len(items) + 1:
         raise ValueError("start sequence is outside the work manifest")
@@ -233,6 +323,11 @@ def process(args, model_factory=default_model_factory, range_extractor=extract_a
     session_directory = args.session.resolve()
     model = model_factory(args)
     hotwords = ", ".join(args.hotword) or None
+    vad_counts = {
+        VAD_ACCEPTED: 0,
+        BURST_RESCUED: 0,
+        NON_SPEECH_REJECTED: 0,
+    }
 
     for item in items[args.start_sequence - 1 :]:
         source_path = (session_directory / item["source"]).resolve()
@@ -246,21 +341,40 @@ def process(args, model_factory=default_model_factory, range_extractor=extract_a
         with range_extractor(
             source_path, item["source_start_ms"], item["source_end_ms"]
         ) as ranged_audio:
-            segments, _ = model.transcribe(
-                str(ranged_audio),
-                beam_size=args.beam_size,
-                language=args.language,
-                condition_on_previous_text=False,
-                hotwords=hotwords,
-            )
-            text = normalise_text(segments)
+            decision = None
+            if args.vad_enabled:
+                decision = qualify_range(ranged_audio, vad_analyser)
+                vad_counts[decision] += 1
+
+            if decision == NON_SPEECH_REJECTED:
+                text = ""
+            else:
+                # VAD qualifies the item only. Whisper receives the original
+                # complete range without trimming, concatenation, or vad_filter.
+                segments, _ = model.transcribe(
+                    str(ranged_audio),
+                    beam_size=args.beam_size,
+                    language=args.language,
+                    condition_on_previous_text=False,
+                    hotwords=hotwords,
+                )
+                text = normalise_text(segments)
 
         result = result_from_item(item, text)
         encoded = (
             json.dumps(result, ensure_ascii=False, separators=(",", ":")) + "\n"
         ).encode("utf-8")
         append_and_sync(args.results, encoded)
-        append_and_sync(args.transcript, transcript_line(result).encode("utf-8"))
+        line = transcript_line(result)
+        if line:
+            append_and_sync(args.transcript, line.encode("utf-8"))
+
+    if args.vad_enabled:
+        print(
+            f"VAD accepted: {vad_counts[VAD_ACCEPTED]}; "
+            f"short-burst rescued: {vad_counts[BURST_RESCUED]}; "
+            f"non-speech rejected: {vad_counts[NON_SPEECH_REJECTED]}"
+        )
 
 
 def main(argv=None):

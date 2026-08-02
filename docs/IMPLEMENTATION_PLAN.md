@@ -735,6 +735,45 @@ Normal operation requires one invocation, and all failure paths remain explicitl
 
 ---
 
+## Accepted correction — post-recording speech-presence gate
+
+### Intended result
+
+Prevent Whisper hallucinations on decoded comfort noise without changing
+published work-item ranges or result-prefix authority.
+
+### Route
+
+- load `segmentation.vad_enabled` through the Discord-independent offline
+  transcription configuration;
+- pass the validated value explicitly from Rust to Python;
+- when disabled, retain the existing transcription path for every work item;
+- when enabled, analyse the complete extracted range with faster-whisper's
+  bundled Silero implementation;
+- send a Silero-positive range to Whisper in full, without VAD trimming;
+- after a Silero miss only, rescue ranges shorter than two seconds with
+  provisional overall-RMS and 20 ms frame-RMS-variation thresholds;
+- otherwise commit a normal complete empty result without invoking Whisper;
+- omit empty results from Python and Rust human-readable transcript rendering
+  while retaining them in the contiguous JSONL authority;
+- emit aggregate VAD decision telemetry at worker completion.
+
+The current `RangeRefiner` remains a no-op. This correction is a worker-side
+speech-presence gate, not range splitting, boundary refinement, live VAD, or a
+new persistent format.
+
+### Required checks
+
+- disabled-path compatibility;
+- Silero-positive full-range and quiet-speech acceptance;
+- comfort-noise rejection;
+- short burst rescue and its duration/variation bounds;
+- complete empty-result commitment and restart behaviour;
+- Rust configuration propagation and empty-result rendering;
+- Discord-independent offline configuration loading.
+
+---
+
 ## Deferred tuning programme
 
 After real recordings exist, tune without changing architecture:
@@ -745,7 +784,8 @@ After real recordings exist, tune without changing architecture:
 - faster-whisper model and decoding settings;
 - vocabulary/hotwords;
 - cross-item conditioning;
-- VAD refinement and short-speech rescue;
+- Silero gate and short-burst rescue acceptance thresholds;
+- possible future VAD range refinement;
 - overlap annotation option.
 
 Tuning evidence must come from representative session recordings.

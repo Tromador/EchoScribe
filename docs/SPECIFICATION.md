@@ -202,14 +202,30 @@ metadata from the immutable session-local snapshot. It atomically replaces the
 retained work manifest without starting transcription or changing workflow
 state.
 
-Range generation must be composable so that VAD can later:
+Range generation remains composable so that a future boundary-refining VAD can:
 
 - refine candidate boundaries;
 - reject non-speech;
 - rescue short speech;
 - supplement playout-derived activity.
 
-VAD is not required in the first implementation, but the architecture must never make it difficult to introduce.
+The current post-recording worker also applies an optional speech-presence gate
+to each complete extracted work-item range. When
+`segmentation.vad_enabled = false`, every item reaches Whisper unchanged. When
+enabled, faster-whisper's bundled Silero implementation analyses the complete
+range. A positive decision sends that same complete range to Whisper without
+VAD trimming or concatenation.
+
+After a Silero miss, a provisional short-burst test may rescue a range shorter
+than two seconds when its overall RMS is at least `0.003` and the standard
+deviation of 20 ms frame RMS is greater than `0.03`. These values are
+acceptance-tuning parameters which require representative recording evidence;
+they are not permanent architectural constants. Silero-positive quiet speech
+is never rejected by the RMS test.
+
+A range rejected as non-speech still commits its matching complete structured
+result with empty text so the global result prefix remains contiguous. It does
+not invoke Whisper.
 
 A transcription worker must not silently shorten a published work-item source
 range. Clamping the requested end to the physical end of a 48 kHz track is
@@ -248,6 +264,10 @@ The result authority is published before the worker starts. Each completed
 result is appended and synchronised before its corresponding human-readable
 line is appended and synchronised.
 
+A completed result may contain an empty text string when the configured
+speech-presence gate rejects its range. It remains a normal completed sequence
+record with unchanged provenance.
+
 Each committed result must include enough information to identify:
 
 - session;
@@ -284,6 +304,10 @@ Requirements:
 - no word-by-word timestamps;
 - no karaoke-style annotation;
 - no relevance filtering.
+
+Completed results whose normalised text is empty are omitted from the
+human-readable transcript. They remain present in authoritative JSONL and do
+not cause a blank `Speaker:` line.
 
 Overlapping speakers are represented as separate lines ordered by start time. The normal text transcript does not add overlap labels. Exact timing and overlap remain available in JSONL.
 

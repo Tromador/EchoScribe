@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 
@@ -74,6 +74,9 @@ class TranscriptionWorkerTests(unittest.TestCase):
             make_args(self),
             model_factory=model_factory,
             range_extractor=range_extractor,
+            vad_analyser=lambda unused: self.fail(
+                "disabled VAD must not analyse a range"
+            ),
         )
 
         self.assertEqual(model_loads, ["test-model"])
@@ -96,6 +99,7 @@ class TranscriptionWorkerTests(unittest.TestCase):
         for _, options in model.calls:
             self.assertFalse(options["condition_on_previous_text"])
             self.assertEqual(options["hotwords"], "Emperor Coaltongue, Dragon Lance")
+            self.assertNotIn("vad_filter", options)
         results = [
             json.loads(line)
             for line in self.results.read_text(encoding="utf-8").splitlines()
@@ -271,6 +275,237 @@ class TranscriptionWorkerTests(unittest.TestCase):
             ],
         )
 
+    def test_start_sequence_advances_past_committed_empty_result(self):
+        items = [
+            make_item(1, 11, "Alice", 0, 500, None),
+            make_item(2, 11, "Alice", 500, 1_000, None),
+        ]
+        write_manifest(self.manifest, items)
+        prior = worker.result_from_item(items[0], "")
+        self.results.write_text(
+            json.dumps(prior, separators=(",", ":")) + "\n", encoding="utf-8"
+        )
+        model = FakeModel([["second only"]])
+
+        @contextmanager
+        def range_extractor(path, start_ms, end_ms):
+            yield self.directory / "range.wav"
+
+        args = make_args(self)
+        args.start_sequence = 2
+        worker.process(
+            args,
+            model_factory=lambda unused: model,
+            range_extractor=range_extractor,
+        )
+
+        results = [
+            json.loads(line)
+            for line in self.results.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual([result["sequence"] for result in results], [1, 2])
+        self.assertEqual(len(model.calls), 1)
+        self.assertEqual(
+            self.transcript.read_text(encoding="utf-8"),
+            "[00:00:00] Alice: second only\n",
+        )
+
+    def test_silero_positive_transcribes_complete_quiet_range(self):
+        model, results = self.run_vad_case(
+            speech_detected=True,
+            samples=[0.0001] * 1_000,
+            sample_rate=1_000,
+            end_ms=1_000,
+        )
+
+        self.assertEqual(len(model.calls), 1)
+        called_path, options = model.calls[0]
+        self.assertEqual(called_path, self.directory / "complete-range.wav")
+        self.assertNotIn("vad_filter", options)
+        self.assertEqual(results[0]["text"], "accepted speech")
+
+    def test_default_vad_analyser_uses_pinned_faster_whisper_api(self):
+        observed = {}
+        expected_audio = [0.1, -0.1]
+
+        audio_module = ModuleType("faster_whisper.audio")
+
+        def decode_audio(path, sampling_rate):
+            observed["decode"] = (path, sampling_rate)
+            return expected_audio
+
+        audio_module.decode_audio = decode_audio
+        vad_module = ModuleType("faster_whisper.vad")
+
+        class FakeVadOptions:
+            pass
+
+        def get_speech_timestamps(audio, options, sampling_rate):
+            observed["speech"] = (audio, options, sampling_rate)
+            return [{"start": 0, "end": 2}]
+
+        vad_module.VadOptions = FakeVadOptions
+        vad_module.get_speech_timestamps = get_speech_timestamps
+        package = ModuleType("faster_whisper")
+        package.__path__ = []
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "faster_whisper": package,
+                "faster_whisper.audio": audio_module,
+                "faster_whisper.vad": vad_module,
+            },
+        ):
+            speech, audio, sample_rate = worker.default_vad_analyser(
+                self.directory / "complete-range.wav"
+            )
+
+        self.assertTrue(speech)
+        self.assertIs(audio, expected_audio)
+        self.assertEqual(sample_rate, 16_000)
+        self.assertEqual(
+            observed["decode"],
+            (str(self.directory / "complete-range.wav"), 16_000),
+        )
+        self.assertIs(observed["speech"][0], expected_audio)
+        self.assertIsInstance(observed["speech"][1], FakeVadOptions)
+        self.assertEqual(observed["speech"][2], 16_000)
+
+    def test_silero_negative_comfort_noise_commits_empty_result_without_text(self):
+        model, results = self.run_vad_case(
+            speech_detected=False,
+            samples=[0.0004] * 1_000,
+            sample_rate=1_000,
+            end_ms=1_000,
+        )
+
+        self.assertEqual(model.calls, [])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "complete")
+        self.assertEqual(results[0]["text"], "")
+        self.assertEqual(self.transcript.read_bytes(), b"")
+
+    def test_silero_negative_short_burst_is_rescued(self):
+        burst = [0.0] * 500 + [0.1] * 500
+        model, results = self.run_vad_case(
+            speech_detected=False,
+            samples=burst,
+            sample_rate=1_000,
+            end_ms=1_000,
+        )
+
+        self.assertEqual(len(model.calls), 1)
+        self.assertEqual(results[0]["text"], "accepted speech")
+
+    def test_silero_negative_short_non_bursty_range_is_rejected(self):
+        model, results = self.run_vad_case(
+            speech_detected=False,
+            samples=[0.01] * 1_000,
+            sample_rate=1_000,
+            end_ms=1_000,
+        )
+
+        self.assertEqual(model.calls, [])
+        self.assertEqual(results[0]["text"], "")
+
+    def test_silero_negative_two_second_burst_is_not_rescued(self):
+        burst = [0.0] * 1_000 + [0.1] * 1_000
+        model, results = self.run_vad_case(
+            speech_detected=False,
+            samples=burst,
+            sample_rate=1_000,
+            end_ms=2_000,
+        )
+
+        self.assertEqual(model.calls, [])
+        self.assertEqual(results[0]["text"], "")
+
+    def test_vad_inference_failure_commits_no_output(self):
+        write_manifest(
+            self.manifest,
+            [make_item(1, 11, "Alice", 0, 1_000, None)],
+        )
+        model = FakeModel([["must not be committed"]])
+
+        @contextmanager
+        def range_extractor(path, start_ms, end_ms):
+            yield self.directory / "complete-range.wav"
+
+        args = make_args(self)
+        args.vad_enabled = True
+
+        def fail_vad(unused):
+            raise RuntimeError("injected VAD failure")
+
+        with self.assertRaisesRegex(RuntimeError, "injected VAD failure"):
+            worker.process(
+                args,
+                model_factory=lambda unused: model,
+                range_extractor=range_extractor,
+                vad_analyser=fail_vad,
+            )
+
+        self.assertEqual(model.calls, [])
+        self.assertEqual(self.results.read_bytes(), b"")
+        self.assertEqual(self.transcript.read_bytes(), b"")
+
+    def run_vad_case(self, speech_detected, samples, sample_rate, end_ms):
+        write_manifest(
+            self.manifest,
+            [make_item(1, 11, "Alice", 0, end_ms, None)],
+        )
+        model = FakeModel([["accepted speech"]])
+
+        @contextmanager
+        def range_extractor(path, start_ms, extracted_end_ms):
+            self.assertEqual((start_ms, extracted_end_ms), (0, end_ms))
+            yield self.directory / "complete-range.wav"
+
+        args = make_args(self)
+        args.vad_enabled = True
+        model_loads = []
+
+        def model_factory(unused):
+            model_loads.append(True)
+            return model
+
+        with mock.patch("builtins.print") as emit:
+            worker.process(
+                args,
+                model_factory=model_factory,
+                range_extractor=range_extractor,
+                vad_analyser=lambda unused: (
+                    speech_detected,
+                    samples,
+                    sample_rate,
+                ),
+            )
+        self.assertEqual(len(model_loads), 1)
+        rescued = not speech_detected and worker.short_burst_rescue(
+            samples, sample_rate
+        )
+        if speech_detected:
+            expected = (
+                "VAD accepted: 1; short-burst rescued: 0; "
+                "non-speech rejected: 0"
+            )
+        elif rescued:
+            expected = (
+                "VAD accepted: 0; short-burst rescued: 1; "
+                "non-speech rejected: 0"
+            )
+        else:
+            expected = (
+                "VAD accepted: 0; short-burst rescued: 0; "
+                "non-speech rejected: 1"
+            )
+        emit.assert_called_once_with(expected)
+        results = [
+            json.loads(line)
+            for line in self.results.read_text(encoding="utf-8").splitlines()
+        ]
+        return model, results
+
     def test_malformed_manifest_and_worker_failure_return_nonzero(self):
         self.manifest.write_text('{"format":1}\n', encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "unexpected schema"):
@@ -317,6 +552,7 @@ def make_args(test):
         device="cpu",
         compute_type="int8",
         beam_size=1,
+        vad_enabled=False,
         hotword=["Emperor Coaltongue", "Dragon Lance"],
     )
 
@@ -346,6 +582,8 @@ def command_line(test):
         args.compute_type,
         "--beam-size",
         str(args.beam_size),
+        "--vad-enabled",
+        "true" if args.vad_enabled else "false",
     ]
 
 

@@ -465,11 +465,11 @@ The builder then:
 7. publishes the file description and `work_manifest_built` checkpoint in one
    `session.json` replacement.
 
-`NoopRefiner` is the current implementation. A future VAD refiner belongs at
-this seam. It may adjust, split, or reject candidates, but it must retain the
-archived pipeline's useful short-utterance rescue principle: a brief candidate
-rejected by VAD should receive a bounded energy/burst check before final
-discard.
+`NoopRefiner` remains the current implementation. The active speech-presence
+gate is deliberately later, over the exact extracted range in the Python
+worker, so it cannot change the published work-item timestamps, IDs, ordering,
+or attribution. A future boundary-refining VAD may still implement this seam
+when range adjustment or splitting is explicitly required.
 
 Repeated work-item generation while still ready replaces rather than appends.
 Stable input and settings produce stable ordering and IDs.
@@ -493,7 +493,8 @@ authority does not know about.
 
 Rust resolves `workers/faster-whisper/transcription_worker.py` from the
 compile-time Cargo root. It passes explicit paths, the next global sequence,
-model settings, and repeated hotword arguments.
+model settings, the validated `vad_enabled` Boolean, and repeated hotword
+arguments. Python does not parse the main TOML.
 
 The worker loads the model once and processes work items sequentially. For each
 item it:
@@ -501,10 +502,26 @@ item it:
 1. verifies the strict manifest record;
 2. resolves the source inside the session directory;
 3. extracts only the requested mono 48 kHz range to a temporary WAV;
-4. transcribes with `condition_on_previous_text=False`;
-5. normalises output to one physical text line;
-6. appends and synchronises the JSONL result;
-7. appends and synchronises the corresponding partial-text line.
+4. when enabled, decodes the complete temporary range to 16 kHz and calls
+   faster-whisper's bundled Silero `get_speech_timestamps` API;
+5. transcribes an accepted range in full with
+   `condition_on_previous_text=False` and without Whisper's `vad_filter`;
+6. normalises output to one physical text line;
+7. appends and synchronises the JSONL result;
+8. appends and synchronises the corresponding partial-text line only when the
+   normalised text is non-empty.
+
+Silero acceptance wins regardless of overall RMS. After a Silero miss only,
+`short_burst_rescue()` accepts a range shorter than two seconds when overall
+RMS is at least `0.003` and 20 ms frame-RMS standard deviation is greater than
+`0.03`. The constants are centralised acceptance-tuning values inherited from
+the archived pipeline's useful rescue design. They are provisional rather than
+architectural.
+
+The default analyser uses the API and `silero_vad_v6.onnx` asset shipped by
+pinned faster-whisper 1.2.1. It introduces no Torch/TorchHub model, download,
+or runtime dependency. Loading or inference errors propagate as worker
+failure. Aggregate decision counts are emitted only at worker completion.
 
 The requested end is rounded from milliseconds to frames. Clamping to physical
 EOF is allowed only for the maximum 47-frame 48 kHz rounding discrepancy. A
@@ -514,6 +531,11 @@ larger source shortfall fails before either output is committed.
 
 Rust requires a contiguous global prefix beginning at sequence 1. Each result
 must exactly match its work item's provenance and have completed status.
+
+A VAD rejection is represented by a matching complete result with `text = ""`.
+That record advances the prefix normally and is not retranscribed on restart.
+Both Python incremental rendering and Rust partial/final rebuilding omit its
+human-readable line.
 
 The validator rejects:
 
@@ -756,19 +778,20 @@ The same field must be considered in:
 
 Do not silently add a field under the same strict format number.
 
-### 18.7 Implement VAD refinement
+### 18.7 Add future VAD boundary refinement
 
-Implement `RangeRefiner` rather than bypassing the playout-derived candidate
-pipeline. Preserve:
+The current worker-side VAD is an accept/reject presence gate and deliberately
+does not alter ranges. If later evidence justifies boundary adjustment or
+splitting, implement `RangeRefiner` rather than bypassing the playout-derived
+candidate pipeline. Preserve:
 
 - per-user aligned sample ranges;
 - global deterministic ordering;
 - source bounds;
 - short-utterance rescue.
 
-The archived `dedupe_audit.py` and `burst_scope.py` document the previous
-energy-based rescue of plausible short bursts rejected by VAD. Adapt the idea
-and test it in the current boundary; do not call archived scripts from the
+Preserve the current short-burst rescue unless representative evidence supports
+an explicitly approved replacement. Do not call archived scripts from the
 application.
 
 ### 18.8 Add future live transcription
@@ -863,7 +886,8 @@ archive.
 
 The following are extension points, not partially hidden features:
 
-- `vad_enabled` is parsed but the current range refiner is a no-op;
+- `vad_enabled` controls a post-extraction speech-presence gate; the current
+  range refiner remains a no-op and published ranges are unchanged;
 - transcription begins after recording, not live;
 - one Python worker handles one session;
 - work items do not condition Whisper on previous item text;

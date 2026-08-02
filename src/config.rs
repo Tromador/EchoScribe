@@ -99,6 +99,7 @@ pub(crate) struct OfflineTranscriptionConfig {
     pub(crate) compute_type: String,
     pub(crate) beam_size: u32,
     pub(crate) resume_rewind_seconds: u64,
+    pub(crate) vad_enabled: bool,
     pub(crate) hotwords: Vec<String>,
     pub(crate) vocabulary_warning: Option<String>,
 }
@@ -140,6 +141,7 @@ impl OfflineTranscriptionConfig {
             compute_type: file.transcription.compute_type,
             beam_size: file.transcription.beam_size,
             resume_rewind_seconds: file.transcription.resume_rewind_seconds,
+            vad_enabled: file.segmentation.vad_enabled,
             hotwords,
             vocabulary_warning,
         })
@@ -426,7 +428,8 @@ merge_gap_ms = 750
         let config_path = directory.join("echoscribe.toml");
         let input = VALID_CONFIG
             .replace(r#"token = "test-token""#, r#"token = """#)
-            .replace(r#"guild_id = "123""#, r#"guild_id = "not-a-number""#);
+            .replace(r#"guild_id = "123""#, r#"guild_id = "not-a-number""#)
+            .replace("vad_enabled = false", "vad_enabled = true");
         fs::write(&config_path, input).unwrap();
         fs::write(
             directory.join("vocabulary.txt"),
@@ -438,6 +441,7 @@ merge_gap_ms = 750
 
         assert_eq!(config.model, "large-v3");
         assert_eq!(config.resume_rewind_seconds, 120);
+        assert!(config.vad_enabled);
         assert_eq!(config.hotwords, ["Emperor Coaltongue", "Dragon Lance"]);
         assert_eq!(config.vocabulary_warning, None);
         assert!(!directory.join("participants.toml").exists());

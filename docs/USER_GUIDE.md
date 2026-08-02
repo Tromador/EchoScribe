@@ -229,7 +229,7 @@ Unknown or misspelt fields are rejected instead of being silently ignored.
 | `transcription.beam_size` | Whisper beam size; must be greater than zero. |
 | `transcription.vocabulary_file` | Campaign-specific hotword phrase file. |
 | `transcription.resume_rewind_seconds` | Amount of committed transcription reconsidered after a known worker failure. `0` disables rewind. |
-| `segmentation.vad_enabled` | Reserved configuration for later VAD refinement. VAD is not active in the current range builder. |
+| `segmentation.vad_enabled` | When true, qualify each complete extracted work-item range with bundled Silero VAD and short-burst rescue before Whisper. When false, send every work item to Whisper. |
 | `segmentation.merge_gap_ms` | Playout gaps no larger than this are merged for the same user. Must be greater than zero. |
 
 `output_directory`, the participant file, and the vocabulary file are resolved
@@ -540,6 +540,24 @@ Runs the explicit transcription stage.
 After a known worker failure which has moved to `awaiting_operator` or
 `transcription_failed`, use configured `continue` so the durable rewind and
 failure protocol is applied.
+
+When `segmentation.vad_enabled = true`, the worker checks each complete
+extracted range with the Silero implementation bundled by the pinned
+faster-whisper package. A detected speech range is transcribed in full: VAD
+does not trim its beginning or end. After a Silero miss, a range shorter than
+two seconds can still be accepted by a provisional speech-like burst test.
+
+Other VAD-negative ranges are not sent to Whisper. They still receive a normal
+complete `results.jsonl` record with empty text so restart ordering remains
+intact, but no blank `Speaker:` line is written to the human transcript. The
+worker prints one aggregate accepted/rescued/rejected summary on successful
+completion. VAD loading or inference failure stops the worker rather than
+silently disabling the gate.
+
+The initial burst-rescue values—overall RMS at least `0.003` and 20 ms
+frame-RMS standard deviation greater than `0.03`—are provisional. They should
+be tuned only from representative recordings. Quiet audio is not rejected by
+RMS when Silero itself detects speech.
 
 ### 10.10 `echoscribe rebuild-transcript <session>`
 

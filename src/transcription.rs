@@ -132,7 +132,8 @@ impl WorkerProcess for SystemWorker {
             .arg("--compute-type")
             .arg(&invocation.settings.compute_type)
             .arg("--beam-size")
-            .arg(invocation.settings.beam_size.to_string());
+            .arg(invocation.settings.beam_size.to_string())
+            .args(vad_worker_arguments(invocation.settings.vad_enabled));
         for hotword in &invocation.settings.hotwords {
             command.arg("--hotword").arg(hotword);
         }
@@ -149,6 +150,13 @@ impl WorkerProcess for SystemWorker {
             code: status.code(),
         })
     }
+}
+
+fn vad_worker_arguments(enabled: bool) -> [OsString; 2] {
+    [
+        OsString::from("--vad-enabled"),
+        OsString::from(enabled.to_string()),
+    ]
 }
 
 pub(crate) struct PreparedTranscription {
@@ -1297,7 +1305,9 @@ fn rebuild_partial_transcript(
         .with_context(|| format!("failed to create {}", temporary_path.display()))?;
     let mut writer = BufWriter::new(file);
     for result in results {
-        writer.write_all(transcript_line(result).as_bytes())?;
+        if !result.text.trim().is_empty() {
+            writer.write_all(transcript_line(result).as_bytes())?;
+        }
     }
     writer.flush()?;
     writer.get_ref().sync_all()?;
@@ -1325,7 +1335,9 @@ fn write_final_transcript_atomically(
         .with_context(|| format!("failed to create {}", temporary_path.display()))?;
     let mut writer = BufWriter::new(file);
     for result in results {
-        writer.write_all(transcript_line(result).as_bytes())?;
+        if !result.text.trim().is_empty() {
+            writer.write_all(transcript_line(result).as_bytes())?;
+        }
     }
     writer.flush()?;
     writer.get_ref().sync_all()?;
@@ -1662,6 +1674,18 @@ mod tests {
                 .join("workers")
                 .join("faster-whisper")
                 .join("transcription_worker.py")
+        );
+    }
+
+    #[test]
+    fn worker_arguments_include_explicit_vad_setting() {
+        assert_eq!(
+            vad_worker_arguments(true),
+            [OsString::from("--vad-enabled"), OsString::from("true")]
+        );
+        assert_eq!(
+            vad_worker_arguments(false),
+            [OsString::from("--vad-enabled"), OsString::from("false")]
         );
     }
 
@@ -2619,6 +2643,31 @@ mod tests {
         assert_eq!(
             String::from_utf8(first).unwrap(),
             "[00:00:00] Alice: First\n[00:01:05] Alice: Second\n"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn partial_and_final_transcripts_omit_empty_results() {
+        let directory = test_directory("empty-result-text");
+        fs::create_dir(directory.join(TRANSCRIPTION_DIRECTORY_NAME)).unwrap();
+        let partial_path = directory.join(PARTIAL_TRANSCRIPT_FILE_NAME);
+        let first_item = test_item(1, 0, 10_000);
+        let second_item = test_item(2, 10_000, 20_000);
+        let results = [
+            complete_result(&first_item, ""),
+            complete_result(&second_item, "Spoken text"),
+        ];
+
+        validate_result_matches_work_item(&results[0], &first_item).unwrap();
+        rebuild_partial_transcript(&directory, &partial_path, &results).unwrap();
+        write_final_transcript_atomically(&directory, &results).unwrap();
+
+        let expected = "[00:00:10] Alice: Spoken text\n";
+        assert_eq!(fs::read_to_string(&partial_path).unwrap(), expected);
+        assert_eq!(
+            fs::read_to_string(directory.join(FINAL_TRANSCRIPT_PATH)).unwrap(),
+            expected
         );
         fs::remove_dir_all(directory).unwrap();
     }

@@ -448,14 +448,17 @@ It emits candidate speech ranges per user, then sorts them globally.
 
 Nearby ranges for the same user are merged across a configurable silence gap.
 
-The range builder is an explicit component with a composable refinement interface. A future VAD implementation may:
+The range builder is an explicit component with a composable refinement interface. A future boundary-refining VAD implementation may:
 
 - adjust boundaries;
 - reject non-speech;
 - split candidates;
 - rescue short speech.
 
-The initial implementation uses playout activity without VAD.
+The range builder continues to use playout activity without VAD and its current
+`RangeRefiner` remains a no-op. Speech qualification is instead applied later,
+after the worker has extracted the exact published work-item range; it does not
+alter work-item authority.
 
 Tuning values are configuration, not architecture.
 
@@ -514,7 +517,8 @@ For post-session transcription, Rust starts one Python worker process and passes
 - session directory;
 - work manifest path;
 - output paths;
-- resume position where applicable.
+- resume position where applicable;
+- the validated `segmentation.vad_enabled` value.
 
 Before the first worker launch, Rust:
 
@@ -577,12 +581,31 @@ explicit value is an error. Otherwise EchoScribe prefers
 from the application root, before falling back to `python` or `python3`
 respectively.
 
+When VAD is enabled, the Python worker decodes each complete extracted range to
+16 kHz and calls the `VadOptions`/`get_speech_timestamps` API supplied by pinned
+faster-whisper. That API uses faster-whisper's bundled Silero ONNX model. No
+Torch, TorchHub, separately downloaded model, or additional runtime dependency
+is part of this boundary.
+
+The decision is a gate only:
+
+1. a Silero-positive range is passed to Whisper in full, regardless of its RMS;
+2. after a Silero miss, a range shorter than two seconds is rescued when
+   overall RMS is at least `0.003` and 20 ms frame-RMS standard deviation is
+   greater than `0.03`;
+3. other ranges are committed as complete empty results without invoking
+   Whisper.
+
+The rescue values are centralised provisional acceptance-tuning values. The
+Whisper call does not enable its trimming/concatenating VAD filter. When VAD is
+disabled, every extracted item follows the pre-gate transcription path.
+
 The Python worker:
 
 1. loads faster-whisper once;
 2. processes manifest items sequentially;
 3. commits one JSONL result per completed item;
-4. writes the corresponding plain-text line;
+4. writes the corresponding plain-text line when normalised text is non-empty;
 5. exits zero only when all required items complete;
 6. exits non-zero on persistent item or worker failure.
 
@@ -626,6 +649,11 @@ Commit ordering:
 2. append and synchronise the human-readable line.
 
 The JSONL result is authoritative if a crash occurs between those writes.
+
+A VAD-rejected item retains the normal format-1 completed record and exact work
+item provenance with `text = ""`. Empty results advance restart and
+continuation prefixes normally. Python incremental rendering and Rust partial,
+final, and repair rendering omit their human-readable lines.
 
 On resume, EchoScribe rebuilds `transcript.partial.txt` from the retained contiguous JSONL prefix before processing new work.
 
@@ -842,9 +870,10 @@ vad_enabled = false
 
 CLI options may override configuration for explicit diagnosis or reprocessing.
 
-The offline transcription loader reads only the transcription settings needed
-by the worker. It does not validate Discord credentials or IDs and does not
-read the mutable configured participant file.
+The offline transcription loader reads only the transcription and segmentation
+settings needed by the worker, including `vad_enabled`. It does not validate
+Discord credentials or IDs and does not read the mutable configured participant
+file. Rust passes the validated Boolean explicitly; Python does not parse TOML.
 
 The vocabulary path is resolved relative to the named main configuration.
 Missing and empty or whitespace-only files produce a warning and no hotwords.

@@ -25,6 +25,7 @@ vocabulary_file = "vocabulary.txt"
 resume_rewind_seconds = 120
 
 [segmentation]
+# Qualify complete work-item ranges with bundled Silero VAD before Whisper.
 vad_enabled = false
 # Provisional until tuned against representative recordings.
 merge_gap_ms = 750
