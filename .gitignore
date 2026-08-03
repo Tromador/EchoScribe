@@ -3,6 +3,7 @@
 /vocabulary.txt
 /recordings/
 /target/
+/diagnostics/
 /docs/SLICE_0_RECONCILIATION.md
 __pycache__/
 *.pyc
