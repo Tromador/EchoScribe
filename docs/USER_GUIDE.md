@@ -205,6 +205,7 @@ compute_type = "float16"
 beam_size = 5
 vocabulary_file = "vocabulary.txt"
 resume_rewind_seconds = 120
+lexical_no_speech_threshold = 0.75
 
 [segmentation]
 vad_enabled = false
@@ -229,6 +230,7 @@ Unknown or misspelt fields are rejected instead of being silently ignored.
 | `transcription.beam_size` | Whisper beam size; must be greater than zero. |
 | `transcription.vocabulary_file` | Campaign-specific hotword phrase file. |
 | `transcription.resume_rewind_seconds` | Amount of committed transcription reconsidered after a known worker failure. `0` disables rewind. |
+| `transcription.lexical_no_speech_threshold` | Threshold for the unprompted lexical-speech qualification pass. Defaults to `0.75`. |
 | `segmentation.vad_enabled` | When true, qualify each complete extracted work-item range with bundled Silero VAD and short-burst rescue before Whisper. When false, send every work item to Whisper. |
 | `segmentation.merge_gap_ms` | Playout gaps no larger than this are merged for the same user. Must be greater than zero. |
 
@@ -238,6 +240,12 @@ to the shell's working directory.
 
 The current `merge_gap_ms = 750` is provisional tuning rather than an
 architectural promise.
+
+`lexical_no_speech_threshold` controls whether an unprompted Whisper segment
+is accepted as lexical speech before configured hotwords are used. Higher
+values are more permissive; lower values are more restrictive. The `0.75`
+default is provisional and based on current diagnostic evidence, rather than
+a universally optimal value.
 
 Offline work-item and transcription commands still require a structurally
 complete main TOML file. They load only the settings needed for their stage and

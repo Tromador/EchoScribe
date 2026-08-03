@@ -27,6 +27,9 @@ BURST_RESCUE_FRAME_MS = 20
 VAD_ACCEPTED = "vad_accepted"
 BURST_RESCUED = "burst_rescued"
 NON_SPEECH_REJECTED = "non_speech_rejected"
+LEXICAL_ACCEPTED = "lexical_accepted"
+LEXICAL_REJECTED_EMPTY = "lexical_rejected_empty"
+LEXICAL_REJECTED_HIGH_NO_SPEECH = "lexical_rejected_high_no_speech"
 WORK_ITEM_FIELDS = {
     "format",
     "id",
@@ -52,9 +55,25 @@ def parse_bool(value):
     raise argparse.ArgumentTypeError("expected 'true' or 'false'")
 
 
+def parse_probability(value):
+    try:
+        probability = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "expected a floating-point value"
+        ) from error
+    if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+        raise argparse.ArgumentTypeError(
+            "expected a finite probability from 0.0 through 1.0"
+        )
+    return probability
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Transcribe one EchoScribe work manifest in chronological order."
+        description=(
+            "Transcribe one EchoScribe work manifest in chronological order."
+        )
     )
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--session", type=Path, required=True)
@@ -68,6 +87,11 @@ def parse_args(argv=None):
     parser.add_argument("--compute-type", required=True)
     parser.add_argument("--beam-size", type=int, required=True)
     parser.add_argument("--vad-enabled", type=parse_bool, required=True)
+    parser.add_argument(
+        "--lexical-no-speech-threshold",
+        type=parse_probability,
+        required=True,
+    )
     parser.add_argument("--hotword", action="append", default=[])
     return parser.parse_args(argv)
 
@@ -82,7 +106,8 @@ def load_manifest(path):
                 item = json.loads(line)
             except (UnicodeDecodeError, json.JSONDecodeError) as error:
                 raise ValueError(
-                    f"malformed work manifest record at line {line_number}: {error}"
+                    "malformed work manifest record at line "
+                    f"{line_number}: {error}"
                 ) from error
             validate_work_item(item, len(items) + 1)
             items.append(item)
@@ -127,7 +152,8 @@ def default_model_factory(args):
         from faster_whisper import WhisperModel
     except ImportError as error:
         raise RuntimeError(
-            "faster-whisper is not installed in the selected Python environment"
+            "faster-whisper is not installed in the selected Python "
+            "environment"
         ) from error
 
     return WhisperModel(
@@ -170,7 +196,10 @@ def root_mean_square(samples):
 
 def short_burst_rescue(samples, sample_rate):
     """Recognise a brief, speech-like energy burst after a Silero miss."""
-    if sample_rate <= 0 or len(samples) / sample_rate >= BURST_RESCUE_MAX_SECONDS:
+    if (
+        sample_rate <= 0
+        or len(samples) / sample_rate >= BURST_RESCUE_MAX_SECONDS
+    ):
         return False
     if root_mean_square(samples) < BURST_RESCUE_MIN_RMS:
         return False
@@ -179,7 +208,7 @@ def short_burst_rescue(samples, sample_rate):
     if frame_size <= 0:
         return False
     frame_rms = [
-        root_mean_square(samples[offset : offset + frame_size])
+        root_mean_square(samples[offset:offset + frame_size])
         for offset in range(0, len(samples), frame_size)
     ]
     mean = sum(frame_rms) / len(frame_rms)
@@ -200,7 +229,7 @@ def qualify_range(path, vad_analyser=default_vad_analyser):
 
 @contextmanager
 def extract_audio_range(source_path, start_ms, end_ms):
-    """Materialise one bounded source range so Whisper never sees other items."""
+    """Materialise a bounded range so Whisper sees no other work items."""
     try:
         import soundfile
     except ImportError as error:
@@ -221,7 +250,8 @@ def extract_audio_range(source_path, start_ms, end_ms):
             end_overrun = max(0, requested_end_frame - len(source))
             if end_overrun > MAX_END_ROUNDING_FRAMES:
                 raise ValueError(
-                    f"source {source_path} is {end_overrun} frames shorter than "
+                    f"source {source_path} is {end_overrun} frames "
+                    "shorter than "
                     f"the requested range ending at {end_ms} ms"
                 )
             # Work-item milliseconds may round the physical final sample
@@ -229,14 +259,17 @@ def extract_audio_range(source_path, start_ms, end_ms):
             end_frame = min(requested_end_frame, len(source))
             if start_frame >= end_frame:
                 raise ValueError(
-                    f"source range {start_ms}..{end_ms} ms is outside {source_path}"
+                    f"source range {start_ms}..{end_ms} ms is outside "
+                    f"{source_path}"
                 )
             source.seek(start_frame)
             audio = source.read(
                 end_frame - start_frame, dtype="float32", always_2d=True
             )
 
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temporary:
+        with tempfile.NamedTemporaryFile(
+            suffix=".wav", delete=False
+        ) as temporary:
             temporary_path = Path(temporary.name)
         soundfile.write(
             temporary_path,
@@ -254,7 +287,9 @@ def extract_audio_range(source_path, start_ms, end_ms):
 def committed_result_count(path):
     data = path.read_bytes()
     if data and not data.endswith(b"\n"):
-        raise ValueError("results authority has an unreconciled truncated record")
+        raise ValueError(
+            "results authority has an unreconciled truncated record"
+        )
     return sum(1 for line in data.splitlines() if line.strip())
 
 
@@ -266,6 +301,26 @@ def normalise_text(segments):
         if text:
             parts.append(text)
     return " ".join(parts)
+
+
+def qualify_lexical_speech(segments, threshold):
+    """Classify materialised unprompted segments and retain reusable text."""
+    parts = []
+    accepted = False
+    for segment in segments:
+        text = " ".join(segment.text.split())
+        if not text:
+            continue
+        parts.append(text)
+        if segment.no_speech_prob < threshold:
+            accepted = True
+
+    text = " ".join(parts)
+    if not parts:
+        return LEXICAL_REJECTED_EMPTY, text
+    if accepted:
+        return LEXICAL_ACCEPTED, text
+    return LEXICAL_REJECTED_HIGH_NO_SPEECH, text
 
 
 def result_from_item(item, text):
@@ -318,7 +373,9 @@ def process(
     if args.start_sequence < 1 or args.start_sequence > len(items) + 1:
         raise ValueError("start sequence is outside the work manifest")
     if committed_result_count(args.results) != args.start_sequence - 1:
-        raise ValueError("results prefix does not match the requested start sequence")
+        raise ValueError(
+            "results prefix does not match the requested start sequence"
+        )
 
     session_directory = args.session.resolve()
     model = model_factory(args)
@@ -328,8 +385,13 @@ def process(
         BURST_RESCUED: 0,
         NON_SPEECH_REJECTED: 0,
     }
+    lexical_counts = {
+        LEXICAL_ACCEPTED: 0,
+        LEXICAL_REJECTED_EMPTY: 0,
+        LEXICAL_REJECTED_HIGH_NO_SPEECH: 0,
+    }
 
-    for item in items[args.start_sequence - 1 :]:
+    for item in items[args.start_sequence - 1:]:
         source_path = (session_directory / item["source"]).resolve()
         try:
             source_path.relative_to(session_directory)
@@ -349,20 +411,42 @@ def process(
             if decision == NON_SPEECH_REJECTED:
                 text = ""
             else:
-                # VAD qualifies the item only. Whisper receives the original
-                # complete range without trimming, concatenation, or vad_filter.
-                segments, _ = model.transcribe(
+                # The acoustic gate and both Whisper passes retain the exact
+                # complete work-item range.
+                unprompted_segments, _ = model.transcribe(
                     str(ranged_audio),
                     beam_size=args.beam_size,
                     language=args.language,
                     condition_on_previous_text=False,
-                    hotwords=hotwords,
+                    hotwords=None,
                 )
-                text = normalise_text(segments)
+                unprompted_segments = list(unprompted_segments)
+                lexical_decision, unprompted_text = qualify_lexical_speech(
+                    unprompted_segments,
+                    args.lexical_no_speech_threshold,
+                )
+                lexical_counts[lexical_decision] += 1
+
+                if lexical_decision != LEXICAL_ACCEPTED:
+                    text = ""
+                elif hotwords is None:
+                    text = unprompted_text
+                else:
+                    prompted_segments, _ = model.transcribe(
+                        str(ranged_audio),
+                        beam_size=args.beam_size,
+                        language=args.language,
+                        condition_on_previous_text=False,
+                        hotwords=hotwords,
+                    )
+                    text = normalise_text(list(prompted_segments))
 
         result = result_from_item(item, text)
         encoded = (
-            json.dumps(result, ensure_ascii=False, separators=(",", ":")) + "\n"
+            json.dumps(
+                result, ensure_ascii=False, separators=(",", ":")
+            )
+            + "\n"
         ).encode("utf-8")
         append_and_sync(args.results, encoded)
         line = transcript_line(result)
@@ -375,14 +459,24 @@ def process(
             f"short-burst rescued: {vad_counts[BURST_RESCUED]}; "
             f"non-speech rejected: {vad_counts[NON_SPEECH_REJECTED]}"
         )
+    print(
+        f"Lexical accepted: {lexical_counts[LEXICAL_ACCEPTED]}; "
+        f"empty rejected: {lexical_counts[LEXICAL_REJECTED_EMPTY]}; "
+        "high-no-speech rejected: "
+        f"{lexical_counts[LEXICAL_REJECTED_HIGH_NO_SPEECH]}"
+    )
 
 
 def main(argv=None):
     args = parse_args(argv)
     try:
         process(args)
-    except Exception as error:  # Worker diagnostics belong on the process boundary.
-        print(f"EchoScribe transcription worker failed: {error}", file=sys.stderr)
+    except Exception as error:
+        # Worker diagnostics belong on the process boundary.
+        print(
+            f"EchoScribe transcription worker failed: {error}",
+            file=sys.stderr,
+        )
         return 1
     return 0
 

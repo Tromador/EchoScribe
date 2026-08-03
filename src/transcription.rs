@@ -133,7 +133,10 @@ impl WorkerProcess for SystemWorker {
             .arg(&invocation.settings.compute_type)
             .arg("--beam-size")
             .arg(invocation.settings.beam_size.to_string())
-            .args(vad_worker_arguments(invocation.settings.vad_enabled));
+            .args(vad_worker_arguments(invocation.settings.vad_enabled))
+            .args(lexical_threshold_worker_arguments(
+                invocation.settings.lexical_no_speech_threshold,
+            ));
         for hotword in &invocation.settings.hotwords {
             command.arg("--hotword").arg(hotword);
         }
@@ -156,6 +159,13 @@ fn vad_worker_arguments(enabled: bool) -> [OsString; 2] {
     [
         OsString::from("--vad-enabled"),
         OsString::from(enabled.to_string()),
+    ]
+}
+
+fn lexical_threshold_worker_arguments(threshold: f64) -> [OsString; 2] {
+    [
+        OsString::from("--lexical-no-speech-threshold"),
+        OsString::from(threshold.to_string()),
     ]
 }
 
@@ -1445,6 +1455,7 @@ mod tests {
         results_path: PathBuf,
         transcript_path: PathBuf,
         hotwords: Vec<String>,
+        lexical_no_speech_threshold: String,
     }
 
     struct FakeWorker {
@@ -1500,6 +1511,10 @@ mod tests {
                 results_path: invocation.results_path.to_owned(),
                 transcript_path: invocation.transcript_path.to_owned(),
                 hotwords: invocation.settings.hotwords.clone(),
+                lexical_no_speech_threshold: invocation
+                    .settings
+                    .lexical_no_speech_threshold
+                    .to_string(),
             });
             if self.commit_all {
                 commit_remaining_results(invocation, usize::MAX)?;
@@ -1537,6 +1552,10 @@ mod tests {
                 results_path: invocation.results_path.to_owned(),
                 transcript_path: invocation.transcript_path.to_owned(),
                 hotwords: invocation.settings.hotwords.clone(),
+                lexical_no_speech_threshold: invocation
+                    .settings
+                    .lexical_no_speech_threshold
+                    .to_string(),
             });
             commit_remaining_results(invocation, self.count)?;
             Ok(WorkerExit {
@@ -1679,6 +1698,17 @@ mod tests {
         assert_eq!(
             vad_worker_arguments(false),
             [OsString::from("--vad-enabled"), OsString::from("false")]
+        );
+    }
+
+    #[test]
+    fn worker_arguments_include_validated_lexical_threshold() {
+        assert_eq!(
+            lexical_threshold_worker_arguments(0.75),
+            [
+                OsString::from("--lexical-no-speech-threshold"),
+                OsString::from("0.75")
+            ]
         );
     }
 
@@ -1883,6 +1913,7 @@ mod tests {
             invocations[0].hotwords,
             ["Emperor Coaltongue", "Dragon Lance"]
         );
+        assert_eq!(invocations[0].lexical_no_speech_threshold, "0.75");
         fs::remove_dir_all(directory).unwrap();
     }
 

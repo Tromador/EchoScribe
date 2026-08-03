@@ -11,14 +11,16 @@ from unittest import mock
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "transcription_worker.py"
-SPEC = importlib.util.spec_from_file_location("transcription_worker", MODULE_PATH)
+SPEC = importlib.util.spec_from_file_location(
+    "transcription_worker", MODULE_PATH
+)
 worker = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(worker)
 
 
 class FakeModel:
-    def __init__(self, texts, fail_on_call=None):
-        self.texts = texts
+    def __init__(self, responses, fail_on_call=None):
+        self.responses = responses
         self.fail_on_call = fail_on_call
         self.calls = []
 
@@ -27,7 +29,18 @@ class FakeModel:
         self.calls.append((Path(path), options))
         if self.fail_on_call == call:
             raise RuntimeError("injected item failure")
-        segments = [SimpleNamespace(text=text) for text in self.texts[call - 1]]
+        segments = []
+        for response in self.responses[call - 1]:
+            if isinstance(response, tuple):
+                text, no_speech_prob = response
+            else:
+                text, no_speech_prob = response, 0.0
+            segments.append(
+                SimpleNamespace(
+                    text=text,
+                    no_speech_prob=no_speech_prob,
+                )
+            )
         return iter(segments), object()
 
 
@@ -36,7 +49,8 @@ class TranscriptionWorkerTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.directory = Path(self.temporary.name)
         (self.directory / "tracks").mkdir()
-        (self.directory / "tracks" / "user-11.flac").write_bytes(b"not decoded")
+        source = self.directory / "tracks" / "user-11.flac"
+        source.write_bytes(b"not decoded")
         self.manifest = self.directory / "work-items.jsonl"
         self.results = self.directory / "results.jsonl"
         self.transcript = self.directory / "transcript.partial.txt"
@@ -98,7 +112,7 @@ class TranscriptionWorkerTests(unittest.TestCase):
         self.assertEqual(len(model.calls), 2)
         for _, options in model.calls:
             self.assertFalse(options["condition_on_previous_text"])
-            self.assertEqual(options["hotwords"], "Emperor Coaltongue, Dragon Lance")
+            self.assertIsNone(options["hotwords"])
             self.assertNotIn("vad_filter", options)
         results = [
             json.loads(line)
@@ -144,7 +158,7 @@ class TranscriptionWorkerTests(unittest.TestCase):
             "[00:00:00] Alice: first\n",
         )
 
-    def test_range_extraction_uses_requested_time_and_clamps_rounded_final_frame(self):
+    def test_range_extraction_clamps_rounded_final_frame(self):
         observed = {}
 
         class FakeSource:
@@ -212,10 +226,14 @@ class TranscriptionWorkerTests(unittest.TestCase):
                 return 900
 
             def seek(self, unused):
-                raise AssertionError("truncated source must fail before seeking")
+                raise AssertionError(
+                    "truncated source must fail before seeking"
+                )
 
             def read(self, unused, **options):
-                raise AssertionError("truncated source must fail before reading")
+                raise AssertionError(
+                    "truncated source must fail before reading"
+                )
 
         fake_soundfile = SimpleNamespace(
             SoundFile=lambda unused: TruncatedSource(),
@@ -371,7 +389,7 @@ class TranscriptionWorkerTests(unittest.TestCase):
         self.assertIsInstance(observed["speech"][1], FakeVadOptions)
         self.assertEqual(observed["speech"][2], 16_000)
 
-    def test_silero_negative_comfort_noise_commits_empty_result_without_text(self):
+    def test_silero_rejection_skips_whisper_and_commits_empty(self):
         model, results = self.run_vad_case(
             speech_detected=False,
             samples=[0.0004] * 1_000,
@@ -449,6 +467,167 @@ class TranscriptionWorkerTests(unittest.TestCase):
         self.assertEqual(self.results.read_bytes(), b"")
         self.assertEqual(self.transcript.read_bytes(), b"")
 
+    def test_empty_unprompted_result_is_rejected(self):
+        model, results, _ = self.run_lexical_case([[]])
+
+        self.assertEqual(len(model.calls), 1)
+        self.assertEqual(results[0]["text"], "")
+        self.assertEqual(self.transcript.read_bytes(), b"")
+
+    def test_plausible_high_no_speech_phrase_is_rejected(self):
+        model, results, _ = self.run_lexical_case(
+            [[("The guards are waiting outside.", 0.9)]]
+        )
+
+        self.assertEqual(len(model.calls), 1)
+        self.assertEqual(results[0]["status"], "complete")
+        self.assertEqual(results[0]["text"], "")
+
+    def test_all_nonempty_segments_at_or_above_threshold_are_rejected(self):
+        segments = [
+            SimpleNamespace(text="at threshold", no_speech_prob=0.75),
+            SimpleNamespace(text="above threshold", no_speech_prob=0.92),
+        ]
+
+        decision, text = worker.qualify_lexical_speech(segments, 0.75)
+
+        self.assertEqual(decision, worker.LEXICAL_REJECTED_HIGH_NO_SPEECH)
+        self.assertEqual(text, "at threshold above threshold")
+
+    def test_one_nonempty_segment_below_threshold_accepts_range(self):
+        segments = [
+            SimpleNamespace(text="doubtful", no_speech_prob=0.8),
+            SimpleNamespace(text="clear speech", no_speech_prob=0.1),
+        ]
+
+        decision, text = worker.qualify_lexical_speech(segments, 0.75)
+
+        self.assertEqual(decision, worker.LEXICAL_ACCEPTED)
+        self.assertEqual(text, "doubtful clear speech")
+
+    def test_empty_text_segments_do_not_qualify_range(self):
+        segments = [
+            SimpleNamespace(text="  \n ", no_speech_prob=0.0),
+            SimpleNamespace(text="", no_speech_prob=0.1),
+        ]
+
+        decision, text = worker.qualify_lexical_speech(segments, 0.75)
+
+        self.assertEqual(decision, worker.LEXICAL_REJECTED_EMPTY)
+        self.assertEqual(text, "")
+
+    def test_failed_qualification_does_not_run_hotword_decode(self):
+        model, results, _ = self.run_lexical_case(
+            [[("plausible but doubtful", 0.8)]],
+            hotwords=["Emperor Coaltongue"],
+        )
+
+        self.assertEqual(len(model.calls), 1)
+        self.assertIsNone(model.calls[0][1]["hotwords"])
+        self.assertEqual(results[0]["text"], "")
+
+    def test_qualified_hotword_pass_uses_same_complete_range(self):
+        model, results, _ = self.run_lexical_case(
+            [
+                [("unprompted words", 0.1)],
+                ["Emperor Coaltongue speaks"],
+            ],
+            hotwords=["Emperor Coaltongue", "Dragon Lance"],
+        )
+
+        self.assertEqual(
+            [path for path, unused in model.calls],
+            [
+                self.directory / "complete-range.wav",
+                self.directory / "complete-range.wav",
+            ],
+        )
+        common_options = {
+            "beam_size": 1,
+            "language": "en",
+            "condition_on_previous_text": False,
+        }
+        self.assertEqual(
+            model.calls[0][1],
+            {**common_options, "hotwords": None},
+        )
+        self.assertEqual(
+            model.calls[1][1],
+            {
+                **common_options,
+                "hotwords": "Emperor Coaltongue, Dragon Lance",
+            },
+        )
+        self.assertEqual(results[0]["text"], "Emperor Coaltongue speaks")
+
+    def test_qualified_unprompted_text_is_reused_without_hotwords(self):
+        model, results, _ = self.run_lexical_case(
+            [[("  genuine   speech ", 0.01)]]
+        )
+
+        self.assertEqual(len(model.calls), 1)
+        self.assertEqual(results[0]["text"], "genuine speech")
+
+    def test_lexical_summary_distinguishes_rejection_reasons(self):
+        model, results, emitted = self.run_lexical_case(
+            [[], [("plausible phrase", 0.8)]],
+            item_count=2,
+        )
+
+        self.assertEqual(len(model.calls), 2)
+        self.assertEqual([result["text"] for result in results], ["", ""])
+        self.assertEqual(
+            emitted,
+            [
+                mock.call(
+                    "Lexical accepted: 0; empty rejected: 1; "
+                    "high-no-speech rejected: 1"
+                )
+            ],
+        )
+
+    def test_invalid_lexical_threshold_arguments_are_rejected(self):
+        for value in ["-0.01", "1.01", "nan", "inf", "-inf"]:
+            with self.subTest(value=value), mock.patch("sys.stderr"):
+                arguments = command_line(self)
+                arguments[-1] = value
+
+                with self.assertRaises(SystemExit):
+                    worker.parse_args(arguments)
+
+    def run_lexical_case(self, responses, hotwords=None, item_count=1):
+        items = [
+            make_item(
+                sequence,
+                11,
+                "Alice",
+                (sequence - 1) * 1_000,
+                sequence * 1_000,
+                None,
+            )
+            for sequence in range(1, item_count + 1)
+        ]
+        write_manifest(self.manifest, items)
+        model = FakeModel(responses)
+
+        @contextmanager
+        def range_extractor(path, start_ms, end_ms):
+            yield self.directory / "complete-range.wav"
+
+        args = make_args(self)
+        args.hotword = hotwords or []
+        with mock.patch("builtins.print") as emit:
+            worker.process(
+                args,
+                model_factory=lambda unused: model,
+                range_extractor=range_extractor,
+            )
+        results = [
+            json.loads(line)
+            for line in self.results.read_text(encoding="utf-8").splitlines()
+        ]
+        return model, results, emit.call_args_list
+
     def run_vad_case(self, speech_detected, samples, sample_rate, end_ms):
         write_manifest(
             self.manifest,
@@ -499,7 +678,20 @@ class TranscriptionWorkerTests(unittest.TestCase):
                 "VAD accepted: 0; short-burst rescued: 0; "
                 "non-speech rejected: 1"
             )
-        emit.assert_called_once_with(expected)
+        if speech_detected or rescued:
+            lexical_expected = (
+                "Lexical accepted: 1; empty rejected: 0; "
+                "high-no-speech rejected: 0"
+            )
+        else:
+            lexical_expected = (
+                "Lexical accepted: 0; empty rejected: 0; "
+                "high-no-speech rejected: 0"
+            )
+        self.assertEqual(
+            emit.call_args_list,
+            [mock.call(expected), mock.call(lexical_expected)],
+        )
         results = [
             json.loads(line)
             for line in self.results.read_text(encoding="utf-8").splitlines()
@@ -511,7 +703,9 @@ class TranscriptionWorkerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unexpected schema"):
             worker.load_manifest(self.manifest)
 
-        with mock.patch.object(worker, "process", side_effect=RuntimeError("boom")):
+        with mock.patch.object(
+            worker, "process", side_effect=RuntimeError("boom")
+        ):
             self.assertEqual(worker.main(command_line(self)), 1)
 
 
@@ -553,7 +747,8 @@ def make_args(test):
         compute_type="int8",
         beam_size=1,
         vad_enabled=False,
-        hotword=["Emperor Coaltongue", "Dragon Lance"],
+        lexical_no_speech_threshold=0.75,
+        hotword=[],
     )
 
 
@@ -584,6 +779,8 @@ def command_line(test):
         str(args.beam_size),
         "--vad-enabled",
         "true" if args.vad_enabled else "false",
+        "--lexical-no-speech-threshold",
+        str(args.lexical_no_speech_threshold),
     ]
 
 

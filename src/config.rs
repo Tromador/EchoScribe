@@ -15,6 +15,7 @@ use serenity::all::{ChannelId, GuildId};
 use crate::participants::ParticipantContext;
 
 const SUPPORTED_CONFIG_VERSION: u32 = 1;
+const DEFAULT_LEXICAL_NO_SPEECH_THRESHOLD: f64 = 0.75;
 
 // These private `File*` types describe the on-disk schema. The public crate
 // types below contain validated and resolved values used by the application.
@@ -61,6 +62,8 @@ struct FileTranscriptionConfig {
     beam_size: u32,
     vocabulary_file: PathBuf,
     resume_rewind_seconds: u64,
+    #[serde(default = "default_lexical_no_speech_threshold")]
+    lexical_no_speech_threshold: f64,
 }
 
 #[derive(Deserialize)]
@@ -87,6 +90,7 @@ pub(crate) struct TranscriptionConfig {
     pub(crate) beam_size: u32,
     pub(crate) vocabulary_file: PathBuf,
     pub(crate) resume_rewind_seconds: u64,
+    pub(crate) lexical_no_speech_threshold: f64,
 }
 
 #[derive(Debug)]
@@ -99,6 +103,7 @@ pub(crate) struct OfflineTranscriptionConfig {
     pub(crate) compute_type: String,
     pub(crate) beam_size: u32,
     pub(crate) resume_rewind_seconds: u64,
+    pub(crate) lexical_no_speech_threshold: f64,
     pub(crate) vad_enabled: bool,
     pub(crate) hotwords: Vec<String>,
     pub(crate) vocabulary_warning: Option<String>,
@@ -131,6 +136,7 @@ impl OfflineTranscriptionConfig {
         if file.transcription.vocabulary_file.as_os_str().is_empty() {
             bail!("transcription.vocabulary_file must not be empty");
         }
+        validate_lexical_no_speech_threshold(file.transcription.lexical_no_speech_threshold)?;
 
         let vocabulary_path = resolve_path(path, file.transcription.vocabulary_file);
         let (hotwords, vocabulary_warning) = load_vocabulary(&vocabulary_path)?;
@@ -141,6 +147,7 @@ impl OfflineTranscriptionConfig {
             compute_type: file.transcription.compute_type,
             beam_size: file.transcription.beam_size,
             resume_rewind_seconds: file.transcription.resume_rewind_seconds,
+            lexical_no_speech_threshold: file.transcription.lexical_no_speech_threshold,
             vad_enabled: file.segmentation.vad_enabled,
             hotwords,
             vocabulary_warning,
@@ -241,6 +248,7 @@ impl Config {
         if file.transcription.vocabulary_file.as_os_str().is_empty() {
             bail!("transcription.vocabulary_file must not be empty");
         }
+        validate_lexical_no_speech_threshold(file.transcription.lexical_no_speech_threshold)?;
         if file.participants.file.as_os_str().is_empty() {
             bail!("participants.file must not be empty");
         }
@@ -271,6 +279,7 @@ impl Config {
                 beam_size: file.transcription.beam_size,
                 vocabulary_file,
                 resume_rewind_seconds: file.transcription.resume_rewind_seconds,
+                lexical_no_speech_threshold: file.transcription.lexical_no_speech_threshold,
             },
             segmentation: SegmentationConfig {
                 vad_enabled: file.segmentation.vad_enabled,
@@ -338,6 +347,19 @@ fn validate_nonempty(field: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn default_lexical_no_speech_threshold() -> f64 {
+    DEFAULT_LEXICAL_NO_SPEECH_THRESHOLD
+}
+
+fn validate_lexical_no_speech_threshold(value: f64) -> Result<()> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        bail!(
+            "transcription.lexical_no_speech_threshold must be a finite value from 0.0 through 1.0"
+        );
+    }
+    Ok(())
+}
+
 fn parse_discord_id(field: &str, value: &str) -> Result<u64> {
     let id = value
         .parse::<u64>()
@@ -400,6 +422,7 @@ merge_gap_ms = 750
         assert_eq!(config.channel_id.get(), 456);
         assert!(!config.recording.diagnostic_wav);
         assert_eq!(config.transcription.resume_rewind_seconds, 120);
+        assert_eq!(config.transcription.lexical_no_speech_threshold, 0.75);
         assert!(!config.segmentation.vad_enabled);
         assert_eq!(config.segmentation.merge_gap_ms, 750);
 
@@ -441,6 +464,7 @@ merge_gap_ms = 750
 
         assert_eq!(config.model, "large-v3");
         assert_eq!(config.resume_rewind_seconds, 120);
+        assert_eq!(config.lexical_no_speech_threshold, 0.75);
         assert!(config.vad_enabled);
         assert_eq!(config.hotwords, ["Emperor Coaltongue", "Dragon Lance"]);
         assert_eq!(config.vocabulary_warning, None);
@@ -568,6 +592,54 @@ merge_gap_ms = 750
     }
 
     #[test]
+    fn loads_explicit_lexical_no_speech_threshold() {
+        let directory = test_directory("lexical-threshold");
+        write_participants(&directory, "version = 1\n");
+        let input = with_lexical_threshold("0.6");
+        let config_path = directory.join("echoscribe.toml");
+        fs::write(&config_path, &input).unwrap();
+
+        let config = Config::from_toml(&input, &config_path).unwrap();
+        let offline = OfflineTranscriptionConfig::load(&config_path).unwrap();
+
+        assert_eq!(config.transcription.lexical_no_speech_threshold, 0.6);
+        assert_eq!(offline.lexical_no_speech_threshold, 0.6);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_lexical_no_speech_threshold_outside_probability_range() {
+        for value in ["-0.01", "1.01"] {
+            let directory = test_directory("lexical-threshold-range");
+            write_participants(&directory, "version = 1\n");
+
+            let error = parse_error(
+                &with_lexical_threshold(value),
+                &directory.join("echoscribe.toml"),
+            );
+
+            assert!(error.contains("must be a finite value from 0.0 through 1.0"));
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_non_finite_lexical_no_speech_threshold() {
+        for value in ["nan", "inf", "-inf"] {
+            let directory = test_directory("lexical-threshold-finite");
+            write_participants(&directory, "version = 1\n");
+
+            let error = parse_error(
+                &with_lexical_threshold(value),
+                &directory.join("echoscribe.toml"),
+            );
+
+            assert!(error.contains("must be a finite value from 0.0 through 1.0"));
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
     fn diagnostic_wav_defaults_to_false() {
         let directory = test_directory("wav-default");
         write_participants(&directory, "version = 1\n");
@@ -582,6 +654,13 @@ merge_gap_ms = 750
             Ok(_) => panic!("configuration unexpectedly parsed successfully"),
             Err(error) => format!("{error:#}"),
         }
+    }
+
+    fn with_lexical_threshold(value: &str) -> String {
+        VALID_CONFIG.replace(
+            "resume_rewind_seconds = 120",
+            &format!("resume_rewind_seconds = 120\nlexical_no_speech_threshold = {value}"),
+        )
     }
 
     fn test_directory(label: &str) -> PathBuf {
