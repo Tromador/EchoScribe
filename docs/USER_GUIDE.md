@@ -39,6 +39,9 @@ The current application provides:
 - deterministic track recovery from the journals;
 - chronological faster-whisper transcription;
 - resumable transcription with durable progress;
+- complete, atomic retranscription of a finished session;
+- per-participant transcription exclusion without suppressing recording;
+- offline replay of selected transcription ranges for diagnosis;
 - JSONL structured results and a readable text transcript.
 
 It does not currently provide live transcription, relevance filtering,
@@ -92,7 +95,8 @@ python -m pip install -r requirements.txt
 
 The installed runtime includes faster-whisper, CTranslate2, and SoundFile.
 SoundFile extracts each bounded FLAC range supplied to Whisper; it is not an
-alternative recorder.
+alternative recorder. The same environment runs the optional diagnostic replay
+helper described in section 10.15.
 
 With `device = "cuda"`, CTranslate2 also needs a compatible local NVIDIA/CUDA
 runtime. CPU operation can instead use settings such as `device = "cpu"` and a
@@ -564,11 +568,11 @@ failure protocol is applied.
 
 When `segmentation.vad_enabled = true`, the worker checks each complete
 extracted range with the Silero implementation bundled by the pinned
-faster-whisper package. A detected speech range is transcribed in full: VAD
-does not trim its beginning or end. A Silero-negative range is not sent to
-Whisper. It still receives a normal complete `results.jsonl` record with empty
-text so restart ordering remains intact, but no blank `Speaker:` line is
-written to the human transcript.
+faster-whisper package. A detected speech range is admitted in full to lexical
+qualification: VAD does not trim its beginning or end. A Silero-negative range
+is not sent to Whisper. It still receives a normal complete `results.jsonl`
+record with empty text so restart ordering remains intact, but no blank
+`Speaker:` line is written to the human transcript.
 
 A Silero-positive range next receives the unprompted lexical qualification
 described by `lexical_no_speech_threshold`. Configured hotwords are used only
@@ -613,8 +617,9 @@ future sessions only.
 
 Explicitly migrates only a completed session snapshot's transcription policy.
 It does not rebuild work items or start transcription; run `retranscribe`
-afterwards. This exceptional command is the supported route for historical
-snapshots, which otherwise remain immutable.
+afterwards. If the user has no snapshot entry, EchoScribe adds one with normal
+player defaults and the requested policy. This exceptional command is the
+supported route for historical snapshots, which otherwise remain immutable.
 
 ### 10.12 `echoscribe rebuild-transcript <session>`
 
@@ -640,6 +645,53 @@ SSRC-keyed, fully decode-verified FLAC files and writes its export manifest.
 It is not the routine recovery command and is not suitable for writing over a
 current session's existing `tracks/` directory. Use `recover` for current
 Discord-user-keyed routine tracks.
+
+### 10.15 Python-only diagnostic replay
+
+`workers/faster-whisper/diagnose_ranges.py` replays selected existing work
+items without changing workflow state, transcript authority, or published
+session artefacts. It is a diagnostic helper rather than an `echoscribe`
+subcommand.
+
+Use the same Python environment as the production worker. Repeat `--sequence`
+to inspect several items in one model load:
+
+```sh
+./.venv/bin/python workers/faster-whisper/diagnose_ranges.py \
+  --config echoscribe.toml \
+  --session recordings/session-... \
+  --sequence 17 \
+  --sequence 42 \
+  --output diagnostics/session-ranges.jsonl
+```
+
+PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe workers\faster-whisper\diagnose_ranges.py `
+  --config echoscribe.toml `
+  --session recordings\session-... `
+  --sequence 17 `
+  --sequence 42 `
+  --output diagnostics\session-ranges.jsonl
+```
+
+For each range, the helper prints acoustic measurements, padded and unpadded
+Silero results, and four decode comparisons: the current prompted decode
+settings, a no-hotword control, a Craig-like internal-VAD comparison, and a
+decode of concatenated unpadded Silero speech spans. The Craig-like comparison
+tests selected behaviour from
+[CraigChat/runpod-worker-faster_whisper](https://github.com/CraigChat/runpod-worker-faster_whisper)
+only; it does not reproduce that worker exactly. Likewise, the result labelled
+`current_echoscribe` is the current prompted decode stage, not a replay of the
+complete Silero and lexical admission pipeline.
+
+`--output` is optional. When supplied, it is overwritten with one JSON object
+per requested work item. The repository-root `diagnostics/` directory is
+ignored by Git and is a suitable destination; create it first if it does not
+exist. Diagnostic JSONL is evidence for investigation, not session or
+transcript authority. The helper loads the model once, performs one untimed
+warm-up, and cleans its temporary bounded WAV files.
 
 ## 11. Recovery playbooks
 
@@ -809,12 +861,23 @@ the relevant disposition; recover the track before continuation.
 JSONL is authoritative. Controlled restart reconstructs partial text. For a
 complete session, use `rebuild-transcript`.
 
+### Expected speech is absent from the transcript
+
+An empty structured result may have been rejected by Silero or by the
+unprompted lexical qualification pass. Identify the corresponding sequence in
+the session-declared work manifest and use the diagnostic replay helper in
+section 10.15. Do not edit the result or transcript files to force acceptance.
+
 ## 15. Data handling and backups
 
 The main configuration contains a Discord bot token and should remain private.
 Participant snapshots and event journals contain Discord user IDs and display
 identity evidence. Transcripts contain everything captured, including social
 conversation which may be unrelated to the game.
+
+Diagnostic replay JSONL can contain the same participant identity, source
+paths, decoded text, confidence evidence, and timing information. Handle it as
+session data even when it is written outside the session directory.
 
 For a recoverable backup, preserve the entire session directory. In particular,
 retain `session.json`, all three journals, the participant snapshot, and event

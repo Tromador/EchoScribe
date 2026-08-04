@@ -61,9 +61,12 @@ EchoScribe/
 ├── src/
 ├── workers/
 │   └── faster-whisper/
+│       ├── diagnose_ranges.py
 │       ├── transcription_worker.py
 │       ├── requirements.txt
 │       └── tests/
+│           ├── test_diagnose_ranges.py
+│           └── test_transcription_worker.py
 ├── docs/
 ├── archive/
 │   └── legacy-pipeline/
@@ -120,9 +123,15 @@ The Python worker owns only:
 
 - strict work-manifest parsing;
 - bounded source-range extraction with SoundFile;
+- optional bundled-Silero acoustic admission;
+- unprompted lexical qualification and prompted faster-whisper decoding;
 - one faster-whisper model instance;
 - sequential inference;
 - synchronised append of one result and one text line per item.
+
+`diagnose_ranges.py` is a separate, operator-invoked replay helper. It may
+import side-effect-free worker functions, but it is not launched by Rust and
+has no workflow or transcript authority.
 
 ## 5. System data flow
 
@@ -171,7 +180,7 @@ authoritative journals + events + tracks.json + participant snapshot
                               v
                     chronological range builder
                               |
-                    transcription/work-items.jsonl
+               published or staged work manifest
                               |
                               v
                    Rust transcription orchestrator
@@ -180,11 +189,14 @@ authoritative journals + events + tracks.json + participant snapshot
                               |
                  +------------+-------------+
                  v                          v
-        transcription/results.jsonl  session-root transcript.partial.txt
+       published or staged results    temporary partial text
                  |                          |
                  +------------+-------------+
                               v
-                  transcription/transcript.txt
+                  validated readable transcript
+                              |
+                              v
+            session.json names authoritative paths
 ```
 
 Normal one-stop orchestration acquires one session operation lease after live
@@ -481,6 +493,12 @@ when range adjustment or splitting is explicitly required.
 Repeated work-item generation while still ready replaces rather than appends.
 Stable input and settings produce stable ordering and IDs.
 
+The producer orders exact sample-domain starts before converting format-1
+records to milliseconds. Distinct starts can therefore collapse to the same
+published `start_ms`. Sequence retains the producer's deterministic order in
+that case: manifest validation rejects decreasing millisecond starts, but does
+not invent a new tie-break from other lossy published fields.
+
 ## 13. Transcription process boundary
 
 ### 13.1 Before launch
@@ -514,8 +532,8 @@ item it:
    faster-whisper's bundled Silero `get_speech_timestamps` API;
 5. rejects a Silero-negative range without invoking Whisper;
 6. decodes an admitted range in full without hotwords and accepts lexical
-   speech when at least one non-empty segment has `no_speech_prob` below the
-   validated threshold;
+   speech when at least one non-empty segment has `no_speech_prob` strictly
+   below the validated threshold;
 7. after lexical acceptance, decodes again with configured hotwords or reuses
    the unprompted text when no hotwords are configured;
 8. normalises output to one physical text line;
@@ -531,7 +549,9 @@ qualification over the same complete temporary audio.
 The default analyser uses the API and `silero_vad_v6.onnx` asset shipped by
 pinned faster-whisper 1.2.1. It introduces no Torch/TorchHub model, download,
 or runtime dependency. Loading or inference errors propagate as worker
-failure. Aggregate decision counts are emitted only at worker completion.
+failure. Aggregate VAD accepted/rejected counts and lexical accepted,
+empty-rejected, and high-no-speech-rejected counts are emitted only at worker
+completion.
 
 The requested end is rounded from milliseconds to frames. Clamping to physical
 EOF is allowed only for the maximum 47-frame 48 kHz rounding discrepancy. A
@@ -558,6 +578,39 @@ The validator rejects:
 
 Only an incomplete final byte tail may be truncated to the last validated
 newline.
+
+### 13.4 Diagnostic replay harness
+
+`diagnose_ranges.py` reads the work-manifest path declared by `session.json`
+and selects exactly the repeatable `--sequence` arguments supplied by the
+operator. It applies the production source-containment and bounded mono 48 kHz
+range extraction semantics, but neither takes the session operation lease nor
+changes session authority. An optional `--output` path is the operator's only
+requested diagnostic output and contains non-authoritative JSONL. Normal model
+cache behaviour still applies when faster-whisper resolves the configured
+model.
+
+The helper loads the configured model once and performs an untimed warm-up. It
+records range acoustics, bundled Silero timestamps with production-default and
+zero-padding options, and four decode paths:
+
+1. the hotword-assisted production decode settings;
+2. the same decode without hotwords;
+3. selected Craig-like internal-VAD behaviour with word timestamps;
+4. an explicit decode of concatenated unpadded Silero spans.
+
+The third path samples behaviour from
+[CraigChat/runpod-worker-faster_whisper](https://github.com/CraigChat/runpod-worker-faster_whisper)
+and is not an exact reproduction of that worker. The `current_echoscribe` label
+denotes the prompted production decode settings, not the complete current
+two-stage admission path. The harness deliberately retains richer segment
+evidence than durable results, including timing, temperature, average log
+probability, compression ratio, no-speech probability, optional word timing,
+input duration, and timestamp overrun.
+
+Diagnostic tests inject model, VAD, clock, audio, and range collaborators. They
+must stay deterministic, offline, and responsible for proving temporary-file
+cleanup.
 
 ## 14. Transcription failure, restart, and completion
 
@@ -852,8 +905,11 @@ cargo test identity::tests
 cargo test capture::tests
 cargo test transcription::tests
 cargo test orchestration::tests
+cargo test retranscription::tests
+cargo test participant_policy::tests
 cargo check
 cargo fmt --all --check
+git diff --check
 ```
 
 Run Python worker tests without loading a real model:
@@ -871,8 +927,20 @@ Windows PowerShell:
 ```
 
 The worker tests use fake models/range extractors and deliberately small local
-audio. Unit tests must not install dependencies, contact Discord, download a
-model, invoke CUDA, or mutate real recordings.
+audio. The same discovery command includes the diagnostic replay tests, which
+substitute model, VAD, audio, and range collaborators. Unit tests must not
+install dependencies, contact Discord, download a model, invoke CUDA, or mutate
+real recordings.
+
+When Flake8 is installed in the development environment, check the complete
+worker surface with:
+
+```sh
+./.venv/bin/python -m flake8 \
+  workers/faster-whisper/transcription_worker.py \
+  workers/faster-whisper/diagnose_ranges.py \
+  workers/faster-whisper/tests
+```
 
 Live Discord and GPU acceptance are separate operator-run checks. Useful live
 evidence includes queue drops/high-water, SSRC mapping timing, track growth,
@@ -906,10 +974,10 @@ When reviewing a change, ask:
 including its detailed pipeline document. It is not imported, executed, or
 installed by the current application.
 
-The archive remains valuable as historical evidence and as a source for the
-short-utterance burst-rescue policy. Current code must reimplement useful ideas
-through present interfaces rather than creating runtime dependencies on the
-archive.
+The archive remains valuable as historical evidence. Historical filtering and
+rescue behaviour is not part of the active transcription pipeline; current
+code must implement approved behaviour through present interfaces rather than
+creating runtime dependencies on the archive.
 
 ## 22. Deliberate current boundaries
 
