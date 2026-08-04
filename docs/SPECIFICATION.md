@@ -211,17 +211,18 @@ Range generation remains composable so that a future boundary-refining VAD can:
 
 The current post-recording worker also applies an optional speech-presence gate
 to each complete extracted work-item range. When
-`segmentation.vad_enabled = false`, every item reaches Whisper unchanged. When
-enabled, faster-whisper's bundled Silero implementation analyses the complete
-range. A positive decision sends that same complete range to Whisper without
-VAD trimming or concatenation.
+`segmentation.vad_enabled = false`, every item proceeds to lexical
+qualification. When enabled, faster-whisper's bundled Silero implementation
+analyses the complete range. A positive decision sends that same complete
+range to lexical qualification without VAD trimming or concatenation. A
+negative decision is final and does not invoke Whisper.
 
-After a Silero miss, a provisional short-burst test may rescue a range shorter
-than two seconds when its overall RMS is at least `0.003` and the standard
-deviation of 20 ms frame RMS is greater than `0.03`. These values are
-acceptance-tuning parameters which require representative recording evidence;
-they are not permanent architectural constants. Silero-positive quiet speech
-is never rejected by the RMS test.
+Lexical qualification decodes the complete range without hotwords. The range
+qualifies when at least one non-empty normalised segment has
+`no_speech_prob` below the configured threshold. A range with no non-empty
+segments, or only segments at or above the threshold, is rejected. After
+qualification, configured hotwords are used for the production decode. When
+no hotwords are configured, the accepted unprompted text is reused.
 
 A range rejected as non-speech still commits its matching complete structured
 result with empty text so the global result prefix remains contiguous. It does

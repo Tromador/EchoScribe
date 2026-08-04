@@ -589,16 +589,18 @@ is part of this boundary.
 
 The decision is a gate only:
 
-1. a Silero-positive range is passed to Whisper in full, regardless of its RMS;
-2. after a Silero miss, a range shorter than two seconds is rescued when
-   overall RMS is at least `0.003` and 20 ms frame-RMS standard deviation is
-   greater than `0.03`;
-3. other ranges are committed as complete empty results without invoking
-   Whisper.
+1. a Silero-positive range proceeds to lexical qualification in full;
+2. a Silero-negative range is committed as a complete empty result without
+   invoking Whisper.
 
-The rescue values are centralised provisional acceptance-tuning values. The
-Whisper call does not enable its trimming/concatenating VAD filter. When VAD is
-disabled, every extracted item follows the pre-gate transcription path.
+Lexical qualification first decodes the complete range without hotwords and
+accepts it when at least one non-empty normalised segment has
+`no_speech_prob` below the validated threshold. Rejected ranges commit empty
+results without a prompted decode. Accepted ranges are decoded again with
+configured hotwords, or reuse the unprompted text when no hotwords are
+configured. Neither Whisper call enables its trimming/concatenating VAD
+filter. When VAD is disabled, every extracted item proceeds directly to the
+same lexical qualification stage.
 
 The Python worker:
 

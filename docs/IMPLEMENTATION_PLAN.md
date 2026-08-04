@@ -750,10 +750,14 @@ published work-item ranges or result-prefix authority.
 - when disabled, retain the existing transcription path for every work item;
 - when enabled, analyse the complete extracted range with faster-whisper's
   bundled Silero implementation;
-- send a Silero-positive range to Whisper in full, without VAD trimming;
-- after a Silero miss only, rescue ranges shorter than two seconds with
-  provisional overall-RMS and 20 ms frame-RMS-variation thresholds;
-- otherwise commit a normal complete empty result without invoking Whisper;
+- send a Silero-positive range to unprompted lexical qualification in full,
+  without VAD trimming;
+- treat a Silero miss as final and commit a normal complete empty result
+  without invoking Whisper;
+- qualify lexical speech when at least one non-empty unprompted segment has
+  `no_speech_prob` below the validated threshold;
+- run the configured hotword-assisted decode only after lexical acceptance,
+  or reuse accepted unprompted text when no hotwords are configured;
 - omit empty results from Python and Rust human-readable transcript rendering
   while retaining them in the contiguous JSONL authority;
 - emit aggregate VAD decision telemetry at worker completion.
@@ -767,7 +771,9 @@ new persistent format.
 - disabled-path compatibility;
 - Silero-positive full-range and quiet-speech acceptance;
 - comfort-noise rejection;
-- short burst rescue and its duration/variation bounds;
+- Silero-negative rejection without Whisper invocation;
+- empty and high-no-speech lexical rejection;
+- prompted decoding only after lexical acceptance;
 - complete empty-result commitment and restart behaviour;
 - Rust configuration propagation and empty-result rendering;
 - Discord-independent offline configuration loading.
@@ -784,7 +790,7 @@ After real recordings exist, tune without changing architecture:
 - faster-whisper model and decoding settings;
 - vocabulary/hotwords;
 - cross-item conditioning;
-- Silero gate and short-burst rescue acceptance thresholds;
+- Silero acoustic gating and lexical qualification threshold;
 - possible future VAD range refinement;
 - overlap annotation option.
 

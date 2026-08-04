@@ -255,18 +255,24 @@ def amplitude_dbfs(amplitude):
     return 20.0 * math.log10(amplitude)
 
 
+def root_mean_square(samples):
+    if len(samples) == 0:
+        return 0.0
+    return math.sqrt(
+        sum(float(sample) * float(sample) for sample in samples) / len(samples)
+    )
+
+
 def acoustic_measurements(samples, sample_rate):
     if sample_rate <= 0:
         raise ValueError("audio sample rate must be greater than zero")
     sample_count = len(samples)
     peak = max((abs(float(sample)) for sample in samples), default=0.0)
-    rms = production_worker.root_mean_square(samples)
+    rms = root_mean_square(samples)
 
     frame_size = sample_rate * FRAME_RMS_MILLISECONDS // 1_000
     frame_values = [
-        production_worker.root_mean_square(
-            samples[offset:offset + frame_size]
-        )
+        root_mean_square(samples[offset:offset + frame_size])
         for offset in range(0, sample_count, frame_size)
     ]
     if frame_values:

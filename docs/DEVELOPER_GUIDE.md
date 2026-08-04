@@ -493,8 +493,9 @@ authority does not know about.
 
 Rust resolves `workers/faster-whisper/transcription_worker.py` from the
 compile-time Cargo root. It passes explicit paths, the next global sequence,
-model settings, the validated `vad_enabled` Boolean, and repeated hotword
-arguments. Python does not parse the main TOML.
+model settings, the validated `vad_enabled` Boolean, the validated lexical
+no-speech threshold, and repeated hotword arguments. Python does not parse the
+main TOML.
 
 The worker loads the model once and processes work items sequentially. For each
 item it:
@@ -504,19 +505,21 @@ item it:
 3. extracts only the requested mono 48 kHz range to a temporary WAV;
 4. when enabled, decodes the complete temporary range to 16 kHz and calls
    faster-whisper's bundled Silero `get_speech_timestamps` API;
-5. transcribes an accepted range in full with
-   `condition_on_previous_text=False` and without Whisper's `vad_filter`;
-6. normalises output to one physical text line;
-7. appends and synchronises the JSONL result;
-8. appends and synchronises the corresponding partial-text line only when the
+5. rejects a Silero-negative range without invoking Whisper;
+6. decodes an admitted range in full without hotwords and accepts lexical
+   speech when at least one non-empty segment has `no_speech_prob` below the
+   validated threshold;
+7. after lexical acceptance, decodes again with configured hotwords or reuses
+   the unprompted text when no hotwords are configured;
+8. normalises output to one physical text line;
+9. appends and synchronises the JSONL result;
+10. appends and synchronises the corresponding partial-text line only when the
    normalised text is non-empty.
 
-Silero acceptance wins regardless of overall RMS. After a Silero miss only,
-`short_burst_rescue()` accepts a range shorter than two seconds when overall
-RMS is at least `0.003` and 20 ms frame-RMS standard deviation is greater than
-`0.03`. The constants are centralised acceptance-tuning values inherited from
-the archived pipeline's useful rescue design. They are provisional rather than
-architectural.
+Silero rejection is final. It commits the normal complete result with empty
+text, skips both Whisper passes, and emits no human-readable transcript line.
+Silero acceptance changes no range boundary and proceeds to lexical
+qualification over the same complete temporary audio.
 
 The default analyser uses the API and `silero_vad_v6.onnx` asset shipped by
 pinned faster-whisper 1.2.1. It introduces no Torch/TorchHub model, download,
@@ -787,12 +790,9 @@ candidate pipeline. Preserve:
 
 - per-user aligned sample ranges;
 - global deterministic ordering;
-- source bounds;
-- short-utterance rescue.
+- source bounds.
 
-Preserve the current short-burst rescue unless representative evidence supports
-an explicitly approved replacement. Do not call archived scripts from the
-application.
+Do not call archived scripts from the application.
 
 ### 18.8 Add future live transcription
 

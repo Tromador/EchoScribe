@@ -17,15 +17,7 @@ SOURCE_SAMPLE_RATE = 48_000
 MAX_END_ROUNDING_FRAMES = 47
 VAD_SAMPLE_RATE = 16_000
 
-# These are provisional acceptance-tuning values inherited from the useful
-# short-utterance rescue in the archived pipeline, not architectural truths.
-BURST_RESCUE_MAX_SECONDS = 2.0
-BURST_RESCUE_MIN_RMS = 0.003
-BURST_RESCUE_MIN_FRAME_RMS_STD = 0.03
-BURST_RESCUE_FRAME_MS = 20
-
 VAD_ACCEPTED = "vad_accepted"
-BURST_RESCUED = "burst_rescued"
 NON_SPEECH_REJECTED = "non_speech_rejected"
 LEXICAL_ACCEPTED = "lexical_accepted"
 LEXICAL_REJECTED_EMPTY = "lexical_rejected_empty"
@@ -183,48 +175,13 @@ def default_vad_analyser(path):
         )
     except Exception as error:
         raise RuntimeError(f"Silero VAD failed for {path}: {error}") from error
-    return bool(speech), audio, VAD_SAMPLE_RATE
-
-
-def root_mean_square(samples):
-    if len(samples) == 0:
-        return 0.0
-    return math.sqrt(
-        sum(float(sample) * float(sample) for sample in samples) / len(samples)
-    )
-
-
-def short_burst_rescue(samples, sample_rate):
-    """Recognise a brief, speech-like energy burst after a Silero miss."""
-    if (
-        sample_rate <= 0
-        or len(samples) / sample_rate >= BURST_RESCUE_MAX_SECONDS
-    ):
-        return False
-    if root_mean_square(samples) < BURST_RESCUE_MIN_RMS:
-        return False
-
-    frame_size = sample_rate * BURST_RESCUE_FRAME_MS // 1_000
-    if frame_size <= 0:
-        return False
-    frame_rms = [
-        root_mean_square(samples[offset:offset + frame_size])
-        for offset in range(0, len(samples), frame_size)
-    ]
-    mean = sum(frame_rms) / len(frame_rms)
-    standard_deviation = math.sqrt(
-        sum((value - mean) ** 2 for value in frame_rms) / len(frame_rms)
-    )
-    return standard_deviation > BURST_RESCUE_MIN_FRAME_RMS_STD
+    return bool(speech)
 
 
 def qualify_range(path, vad_analyser=default_vad_analyser):
-    speech_detected, audio, sample_rate = vad_analyser(path)
-    if speech_detected:
-        return VAD_ACCEPTED
-    if short_burst_rescue(audio, sample_rate):
-        return BURST_RESCUED
-    return NON_SPEECH_REJECTED
+    if not vad_analyser(path):
+        return NON_SPEECH_REJECTED
+    return VAD_ACCEPTED
 
 
 @contextmanager
@@ -382,7 +339,6 @@ def process(
     hotwords = ", ".join(args.hotword) or None
     vad_counts = {
         VAD_ACCEPTED: 0,
-        BURST_RESCUED: 0,
         NON_SPEECH_REJECTED: 0,
     }
     lexical_counts = {
@@ -456,7 +412,6 @@ def process(
     if args.vad_enabled:
         print(
             f"VAD accepted: {vad_counts[VAD_ACCEPTED]}; "
-            f"short-burst rescued: {vad_counts[BURST_RESCUED]}; "
             f"non-speech rejected: {vad_counts[NON_SPEECH_REJECTED]}"
         )
     print(

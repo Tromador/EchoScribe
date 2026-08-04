@@ -331,8 +331,6 @@ class TranscriptionWorkerTests(unittest.TestCase):
     def test_silero_positive_transcribes_complete_quiet_range(self):
         model, results = self.run_vad_case(
             speech_detected=True,
-            samples=[0.0001] * 1_000,
-            sample_rate=1_000,
             end_ms=1_000,
         )
 
@@ -374,13 +372,11 @@ class TranscriptionWorkerTests(unittest.TestCase):
                 "faster_whisper.vad": vad_module,
             },
         ):
-            speech, audio, sample_rate = worker.default_vad_analyser(
+            speech = worker.default_vad_analyser(
                 self.directory / "complete-range.wav"
             )
 
         self.assertTrue(speech)
-        self.assertIs(audio, expected_audio)
-        self.assertEqual(sample_rate, 16_000)
         self.assertEqual(
             observed["decode"],
             (str(self.directory / "complete-range.wav"), 16_000),
@@ -392,8 +388,6 @@ class TranscriptionWorkerTests(unittest.TestCase):
     def test_silero_rejection_skips_whisper_and_commits_empty(self):
         model, results = self.run_vad_case(
             speech_detected=False,
-            samples=[0.0004] * 1_000,
-            sample_rate=1_000,
             end_ms=1_000,
         )
 
@@ -403,40 +397,16 @@ class TranscriptionWorkerTests(unittest.TestCase):
         self.assertEqual(results[0]["text"], "")
         self.assertEqual(self.transcript.read_bytes(), b"")
 
-    def test_silero_negative_short_burst_is_rescued(self):
-        burst = [0.0] * 500 + [0.1] * 500
+    def test_silero_negative_short_loud_burst_is_rejected(self):
         model, results = self.run_vad_case(
             speech_detected=False,
-            samples=burst,
-            sample_rate=1_000,
-            end_ms=1_000,
-        )
-
-        self.assertEqual(len(model.calls), 1)
-        self.assertEqual(results[0]["text"], "accepted speech")
-
-    def test_silero_negative_short_non_bursty_range_is_rejected(self):
-        model, results = self.run_vad_case(
-            speech_detected=False,
-            samples=[0.01] * 1_000,
-            sample_rate=1_000,
             end_ms=1_000,
         )
 
         self.assertEqual(model.calls, [])
+        self.assertEqual(results[0]["status"], "complete")
         self.assertEqual(results[0]["text"], "")
-
-    def test_silero_negative_two_second_burst_is_not_rescued(self):
-        burst = [0.0] * 1_000 + [0.1] * 1_000
-        model, results = self.run_vad_case(
-            speech_detected=False,
-            samples=burst,
-            sample_rate=1_000,
-            end_ms=2_000,
-        )
-
-        self.assertEqual(model.calls, [])
-        self.assertEqual(results[0]["text"], "")
+        self.assertEqual(self.transcript.read_bytes(), b"")
 
     def test_vad_inference_failure_commits_no_output(self):
         write_manifest(
@@ -628,7 +598,7 @@ class TranscriptionWorkerTests(unittest.TestCase):
         ]
         return model, results, emit.call_args_list
 
-    def run_vad_case(self, speech_detected, samples, sample_rate, end_ms):
+    def run_vad_case(self, speech_detected, end_ms):
         write_manifest(
             self.manifest,
             [make_item(1, 11, "Alice", 0, end_ms, None)],
@@ -653,32 +623,14 @@ class TranscriptionWorkerTests(unittest.TestCase):
                 args,
                 model_factory=model_factory,
                 range_extractor=range_extractor,
-                vad_analyser=lambda unused: (
-                    speech_detected,
-                    samples,
-                    sample_rate,
-                ),
+                vad_analyser=lambda unused: speech_detected,
             )
         self.assertEqual(len(model_loads), 1)
-        rescued = not speech_detected and worker.short_burst_rescue(
-            samples, sample_rate
-        )
         if speech_detected:
-            expected = (
-                "VAD accepted: 1; short-burst rescued: 0; "
-                "non-speech rejected: 0"
-            )
-        elif rescued:
-            expected = (
-                "VAD accepted: 0; short-burst rescued: 1; "
-                "non-speech rejected: 0"
-            )
+            expected = "VAD accepted: 1; non-speech rejected: 0"
         else:
-            expected = (
-                "VAD accepted: 0; short-burst rescued: 0; "
-                "non-speech rejected: 1"
-            )
-        if speech_detected or rescued:
+            expected = "VAD accepted: 0; non-speech rejected: 1"
+        if speech_detected:
             lexical_expected = (
                 "Lexical accepted: 1; empty rejected: 0; "
                 "high-no-speech rejected: 0"
