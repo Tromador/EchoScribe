@@ -1913,7 +1913,7 @@ mod tests {
             invocations[0].hotwords,
             ["Emperor Coaltongue", "Dragon Lance"]
         );
-        assert_eq!(invocations[0].lexical_no_speech_threshold, "0.75");
+        assert_eq!(invocations[0].lexical_no_speech_threshold, "0.6");
         fs::remove_dir_all(directory).unwrap();
     }
 

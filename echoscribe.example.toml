@@ -23,8 +23,8 @@ compute_type = "float16"
 beam_size = 5
 vocabulary_file = "vocabulary.txt"
 resume_rewind_seconds = 120
-# Provisional threshold for the unprompted lexical-speech qualification pass.
-lexical_no_speech_threshold = 0.75
+# Tuned to retain useful short speech while rejecting speech-like noise.
+lexical_no_speech_threshold = 0.60
 
 [segmentation]
 # Qualify complete work-item ranges with bundled Silero VAD before Whisper.

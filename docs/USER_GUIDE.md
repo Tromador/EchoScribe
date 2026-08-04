@@ -205,7 +205,7 @@ compute_type = "float16"
 beam_size = 5
 vocabulary_file = "vocabulary.txt"
 resume_rewind_seconds = 120
-lexical_no_speech_threshold = 0.75
+lexical_no_speech_threshold = 0.60
 
 [segmentation]
 vad_enabled = false
@@ -230,7 +230,7 @@ Unknown or misspelt fields are rejected instead of being silently ignored.
 | `transcription.beam_size` | Whisper beam size; must be greater than zero. |
 | `transcription.vocabulary_file` | Campaign-specific hotword phrase file. |
 | `transcription.resume_rewind_seconds` | Amount of committed transcription reconsidered after a known worker failure. `0` disables rewind. |
-| `transcription.lexical_no_speech_threshold` | Threshold for the unprompted lexical-speech qualification pass. Defaults to `0.75`. |
+| `transcription.lexical_no_speech_threshold` | Threshold for the unprompted lexical-speech qualification pass. Defaults to `0.60`. |
 | `segmentation.vad_enabled` | When true, admit complete work-item ranges through bundled Silero VAD before lexical qualification. When false, send every work item directly to lexical qualification. |
 | `segmentation.merge_gap_ms` | Playout gaps no larger than this are merged for the same user. Must be greater than zero. |
 
@@ -243,9 +243,11 @@ architectural promise.
 
 `lexical_no_speech_threshold` controls whether an unprompted Whisper segment
 is accepted as lexical speech before configured hotwords are used. Higher
-values are more permissive; lower values are more restrictive. The `0.75`
-default is provisional and based on current diagnostic evidence, rather than
-a universally optimal value.
+values are more permissive; lower values are more restrictive. The `0.60`
+default is tuned for EchoScribe's after-action-report use case: it retains
+useful short responses such as “okay” while deliberately allowing low-value
+acknowledgements, abandoned utterances, and speech-like non-verbal sounds to
+be rejected.
 
 Offline work-item and transcription commands still require a structurally
 complete main TOML file. They load only the settings needed for their stage and

@@ -15,7 +15,7 @@ use serenity::all::{ChannelId, GuildId};
 use crate::participants::ParticipantContext;
 
 const SUPPORTED_CONFIG_VERSION: u32 = 1;
-const DEFAULT_LEXICAL_NO_SPEECH_THRESHOLD: f64 = 0.75;
+const DEFAULT_LEXICAL_NO_SPEECH_THRESHOLD: f64 = 0.60;
 
 // These private `File*` types describe the on-disk schema. The public crate
 // types below contain validated and resolved values used by the application.
@@ -422,7 +422,7 @@ merge_gap_ms = 750
         assert_eq!(config.channel_id.get(), 456);
         assert!(!config.recording.diagnostic_wav);
         assert_eq!(config.transcription.resume_rewind_seconds, 120);
-        assert_eq!(config.transcription.lexical_no_speech_threshold, 0.75);
+        assert_eq!(config.transcription.lexical_no_speech_threshold, 0.60);
         assert!(!config.segmentation.vad_enabled);
         assert_eq!(config.segmentation.merge_gap_ms, 750);
 
@@ -464,7 +464,7 @@ merge_gap_ms = 750
 
         assert_eq!(config.model, "large-v3");
         assert_eq!(config.resume_rewind_seconds, 120);
-        assert_eq!(config.lexical_no_speech_threshold, 0.75);
+        assert_eq!(config.lexical_no_speech_threshold, 0.60);
         assert!(config.vad_enabled);
         assert_eq!(config.hotwords, ["Emperor Coaltongue", "Dragon Lance"]);
         assert_eq!(config.vocabulary_warning, None);

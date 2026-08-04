@@ -699,7 +699,7 @@ def make_args(test):
         compute_type="int8",
         beam_size=1,
         vad_enabled=False,
-        lexical_no_speech_threshold=0.75,
+        lexical_no_speech_threshold=0.60,
         hotword=[],
     )
 
