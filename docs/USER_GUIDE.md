@@ -267,6 +267,7 @@ role = "player"
 
 [participants."123456789012345678"]
 role = "gm"
+transcribe = false
 ```
 
 The Discord handle is not configured here. EchoScribe obtains the server
@@ -274,18 +275,22 @@ display name, global display name, and username from Discord and uses that
 evidence for transcript attribution. The participant file supplies only:
 
 - optional `character` context;
-- optional `role`, defaulting to `player`.
+- optional `role`, defaulting to `player`;
+- optional `transcribe`, defaulting to `true`.
 
 Roles are `player` or `gm`, accepted without regard to letter case and written
 canonically in lowercase. Multiple GMs are allowed. Empty character names and
 invalid or zero Discord IDs are rejected.
 
-A participant who is absent from this file is still recorded and transcribed.
-EchoScribe warns once and uses default player context.
+A participant with `transcribe = false` remains fully recorded in journals,
+identity evidence and the routine FLAC track, but is omitted from transcription
+work-item generation. This is an operator policy, not a role. A participant who
+is absent from the file is recorded and transcribed with default player context.
 
 At session creation, EchoScribe writes a canonical `participants.toml` snapshot
 inside the session directory. Later edits to the configured participant file do
-not rewrite old sessions.
+not rewrite old sessions. Canonical snapshots always write the resolved Boolean;
+older snapshots without it load as `transcribe = true`.
 
 ### 5.3 Campaign vocabulary
 
@@ -382,6 +387,11 @@ recordings/session-.../
     └── transcript.txt
 ```
 
+After supported retranscription, `session.json` instead references one complete
+generation under `transcription/retranscriptions/<generation>/`. The manifest,
+results and readable transcript in that directory become authoritative together;
+the previous complete files are not overwritten during staging.
+
 Optional or failure-related output can include:
 
 ```text
@@ -427,7 +437,8 @@ Lines are ordered by session-relative start time. Overlapping speakers remain
 separate lines. The text view omits SSRCs, confidence scores, word-level timing,
 and relevance judgements.
 
-`transcription/results.jsonl` is the durable transcript authority. Each result
+The `results.jsonl` path declared by `session.json` is the durable transcript
+authority. Each result
 retains work-item identity, sequence, Discord user, speaker metadata, timing,
 source range, text, and completion status. If text and JSONL disagree after a
 crash, EchoScribe rebuilds the text from the validated JSONL prefix.
@@ -566,23 +577,63 @@ accepted/rejected and lexical decision summaries on successful completion.
 VAD loading or inference failure stops the worker rather than silently
 disabling the gate.
 
-### 10.10 `echoscribe rebuild-transcript <session>`
+### 10.10 `echoscribe retranscribe <session> <config>`
 
-Reconstructs `transcription/transcript.txt` atomically for a complete format-5
-session. It validates the complete work and result authorities, does not start
-Python, does not change `results.jsonl`, and does not change workflow state.
+Runs a complete replacement transcription of a healthy `complete` session.
+It validates the existing complete transcript and recording evidence, rebuilds
+work items with the current `merge_gap_ms` and immutable session participant
+snapshot, and starts the normal production worker at sequence 1 with the current
+transcription settings.
+
+The new manifest, results and readable transcript are staged in a separate
+generation. One atomic `session.json` replacement publishes all three paths
+together only after every result and the final transcript validate. A worker,
+validation or publication failure leaves the old complete set authoritative and
+the workflow state remains `complete`; retranscription is not continuation or
+failure recovery.
+
+For the existing representative session, Astra can be excluded through the
+explicit historical-policy migration and then retranscribed:
+
+```sh
+echoscribe set-transcription-policy \
+  recordings/session-1785683509050 \
+  854446496798736405 false
+echoscribe retranscribe \
+  recordings/session-1785683509050 \
+  echoscribe.toml
+```
+
+Do not edit the session-local `participants.toml` by hand. The policy command
+acquires the session lease and changes only that participant's materialised
+`transcribe` value. Editing the operator's source participant file affects
+future sessions only.
+
+### 10.11 `echoscribe set-transcription-policy <session> <user-id> <true|false>`
+
+Explicitly migrates only a completed session snapshot's transcription policy.
+It does not rebuild work items or start transcription; run `retranscribe`
+afterwards. This exceptional command is the supported route for historical
+snapshots, which otherwise remain immutable.
+
+### 10.12 `echoscribe rebuild-transcript <session>`
+
+Reconstructs the session-declared readable transcript atomically for a complete
+format-5 or format-6 session. It validates the complete work and result
+authorities, does not start Python, does not change structured results, and does
+not change workflow state.
 
 Because structured transcript authority is sufficient for rendering, old
 journals, participant snapshots, track manifests, and FLACs are not required by
 this command.
 
-### 10.11 `echoscribe recover-wav <session>`
+### 10.13 `echoscribe recover-wav <session>`
 
 Replays packet and playout journals into SSRC-keyed diagnostic WAV files under
 `recovered/`. This is diagnostic reconstruction, not routine user-track
 recovery. The output directory must not already exist.
 
-### 10.12 `echoscribe export <session>`
+### 10.14 `echoscribe export <session>`
 
 Runs the older diagnostic/migration path which replays journals into
 SSRC-keyed, fully decode-verified FLAC files and writes its export manifest.
@@ -668,8 +719,9 @@ No audio is decoded or retranscribed.
 ## 12. Concurrency and `worker.lock`
 
 Only one mutating offline operation may own a session at a time. Recovery,
-continuation, work-item generation, transcription, and transcript rebuilding
-share an operating-system file lock at `transcription/worker.lock`.
+continuation, work-item generation, transcription, retranscription, participant
+policy migration, and transcript rebuilding share an operating-system file lock
+at `transcription/worker.lock`.
 
 If EchoScribe reports that another mutating operation owns the session:
 

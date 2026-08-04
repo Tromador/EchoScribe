@@ -74,8 +74,8 @@ entry points around `cargo run --release` and introduce no workflow authority.
 | `tracks/user-<id>.flac` | clean finalisation | derived routine product | yes | yes |
 | diagnostic WAV | live when enabled | derived diagnostic | no | yes |
 | `tracks.json` | live/finalisation | derived track manifest | yes | yes from evidence plus session context |
-| `transcription/work-items.jsonl` | post-recording | derived processing plan | yes | yes |
-| `transcription/results.jsonl` | transcription | structured transcript authority | yes | by retranscription |
+| session-declared `work-items.jsonl` | post-recording | derived processing plan | yes | yes |
+| session-declared `results.jsonl` | transcription | structured transcript authority | yes | by retranscription |
 | `transcript.partial.txt` | transcription | human view, incomplete | temporary | yes |
 | `transcription/transcript.txt` | successful completion | human product | yes | yes |
 
@@ -176,11 +176,17 @@ role = "player"
 
 [participants."123456789012345678"]
 role = "gm"
+transcribe = false
 ```
 
 `character` is optional.
 
 `role` is optional and defaults to `player`.
+
+`transcribe` is optional and defaults to `true`. A false value is an operator
+admission policy, not a role; it excludes the participant before work-item IDs
+and global sequences are assigned while leaving recording evidence and audio
+unchanged.
 
 More than one participant may be `gm`.
 
@@ -192,7 +198,7 @@ At session creation, EchoScribe writes a resolved canonical `participants.toml`
 snapshot inside the session directory. The snapshot:
 
 - retains the Discord-user-ID keyed mapping;
-- materialises defaults, including `role = "player"`;
+- materialises defaults, including `role = "player"` and `transcribe = true`;
 - contains the participant context resolved from the configured source file;
 - is immutable session context and is not regenerated from the configured source.
 
@@ -201,6 +207,11 @@ not embed participant entries.
 
 Later stages read the session-local snapshot rather than the mutable configured
 source file.
+
+The only supported historical change is the explicit, leased
+`set-transcription-policy` migration. It changes one snapshot Boolean without
+rereading mutable character or role data. Older snapshots which omit the field
+load as `true`.
 
 ## 8. Live FLAC stage
 
@@ -319,7 +330,8 @@ Diagnostic failure must not affect authoritative capture or routine FLAC.
 `session.json` is a versioned durable workflow record. New recording sessions
 begin in format 4. Format 3 remains readable for sessions created before the
 work-item artefact reference was introduced. Format 5 is introduced when the
-authoritative transcription-results artefact is published.
+authoritative transcription-results artefact is published. Format 6 publishes
+a completed retranscription generation.
 
 It contains:
 
@@ -332,6 +344,7 @@ It contains:
 - track manifest path and format;
 - optional transcription work-manifest path and format;
 - optional transcription results path and format according to session version;
+- optional readable transcript path and format for format 6;
 - current workflow state;
 - failure records;
 - completed stage checkpoints.
@@ -349,6 +362,12 @@ Format 4 must not contain a results description. Format 5 requires both the
 work-items description and a results description. The results description uses
 the fixed relative path `transcription/results.jsonl` and independently
 versioned result-record format 1.
+
+Format 6 requires work-item, result and readable-transcript descriptions which
+share one directory below `transcription/retranscriptions/`. It is valid only
+in `complete`. Its three artefacts are made authoritative by one atomic
+`session.json` replacement after the generation is fully written, synchronised
+and validated.
 
 Minimum states:
 
@@ -448,6 +467,11 @@ It emits candidate speech ranges per user, then sorts them globally.
 
 Nearby ranges for the same user are merged across a configurable silence gap.
 
+After complete recording/source validation and range refinement, participants
+whose immutable snapshot entry has `transcribe = false` are removed before
+global sorting, sequence allocation and work-item ID construction. Missing
+snapshot entries remain included with normal player defaults.
+
 The range builder is an explicit component with a composable refinement interface. A future boundary-refining VAD implementation may:
 
 - adjust boundaries;
@@ -537,8 +561,9 @@ to the last validated newline, rebuilds and synchronises
 
 Rust uses one exclusive per-session operation lease for every offline command
 which mutates session authority or a session-declared artefact: `recover`,
-recording `continue`, `build-work-items`, `transcribe`, `rebuild-transcript`,
-and configured stage-aware `continue`. Each route acquires the lease before loading
+recording `continue`, `build-work-items`, `transcribe`, `retranscribe`,
+`set-transcription-policy`, `rebuild-transcript`, and configured stage-aware
+`continue`. Each route acquires the lease before loading
 `session.json`; session state and route validation, declared-path resolution,
 derived-artefact publication, and related workflow updates occur while it is
 held. No session-derived data read before ownership may be carried into the
@@ -826,12 +851,30 @@ worker launch failure after format 5 and `transcribing` are durable retains the
 Slice 9 transcription-failure route.
 
 `rebuild-transcript <session>` owns the session lease, requires a complete
-format-5 session, validates the complete work and result authorities, and
-atomically replaces `transcription/transcript.txt`. It does not alter
+format-5 or format-6 session, validates the complete work and result authorities,
+and atomically replaces the session-declared readable transcript. It does not alter
 `results.jsonl`, launch Python, or change workflow state. It renders solely
 from the completed structured transcription authorities and therefore does not
 require packet, playout or event journals, the participant snapshot,
 `tracks.json`, or routine FLACs.
+
+### 18.5 Completed-session retranscription
+
+`retranscribe <session> <config>` acquires the same operation lease before
+loading session authority. It requires a healthy `complete` format-5 or
+format-6 session, validates the existing complete transcription, then reuses
+the normal journal, mapping, participant-snapshot, track and range-building
+validation to create a fresh manifest under an unreferenced generation
+directory.
+
+The production worker receives that staged manifest, staged results and staged
+partial text paths, always from sequence 1. On zero exit Rust requires one exact
+result per new work item and deterministically writes the staged final text.
+Only then does one atomic format-6 `session.json` replacement publish all three
+new paths. Until that update succeeds, the previous complete generation remains
+authority and workflow state remains `complete`. Orphaned failed staging
+directories are non-authoritative and a later attempt selects a fresh
+generation.
 
 ## 19. Main configuration
 

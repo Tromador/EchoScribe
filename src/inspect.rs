@@ -20,8 +20,9 @@ use crate::{
     playout::{self, PlayoutDecision, ReadRecord as ReadPlayoutRecord},
     session::{
         EVENT_FORMAT_VERSION, LEGACY_EVENT_FORMAT_VERSION, LEGACY_SESSION_FORMAT_VERSION,
-        PREVIOUS_SESSION_FORMAT_VERSION, RECORDING_SESSION_FORMAT_VERSION, SESSION_FORMAT_VERSION,
-        SessionEvent, WorkflowState,
+        PREVIOUS_SESSION_FORMAT_VERSION, RECORDING_SESSION_FORMAT_VERSION,
+        RETRANSCRIPTION_SESSION_FORMAT_VERSION, SESSION_FORMAT_VERSION, SessionEvent,
+        WorkflowState,
     },
 };
 
@@ -259,7 +260,8 @@ fn read_manifest(session_directory: &Path) -> Result<SessionManifest> {
         Some(
             PREVIOUS_SESSION_FORMAT_VERSION
             | RECORDING_SESSION_FORMAT_VERSION
-            | SESSION_FORMAT_VERSION,
+            | SESSION_FORMAT_VERSION
+            | RETRANSCRIPTION_SESSION_FORMAT_VERSION,
         ) => {
             let current = crate::session::read_record(&path)
                 .with_context(|| format!("failed to parse session manifest {}", path.display()))?;
@@ -288,11 +290,12 @@ fn read_manifest(session_directory: &Path) -> Result<SessionManifest> {
             })
         }
         _ => bail!(
-            "unsupported session manifest format {format}; expected {}, {}, {}, or {}",
+            "unsupported session manifest format {format}; expected {}, {}, {}, {}, or {}",
             LEGACY_SESSION_FORMAT_VERSION,
             PREVIOUS_SESSION_FORMAT_VERSION,
             RECORDING_SESSION_FORMAT_VERSION,
-            SESSION_FORMAT_VERSION
+            SESSION_FORMAT_VERSION,
+            RETRANSCRIPTION_SESSION_FORMAT_VERSION
         ),
     }
 }
@@ -304,14 +307,16 @@ fn validate_manifest(manifest: &SessionManifest) -> Result<()> {
             | PREVIOUS_SESSION_FORMAT_VERSION
             | RECORDING_SESSION_FORMAT_VERSION
             | SESSION_FORMAT_VERSION
+            | RETRANSCRIPTION_SESSION_FORMAT_VERSION
     ) {
         bail!(
-            "unsupported session manifest format {}; expected {}, {}, {}, or {}",
+            "unsupported session manifest format {}; expected {}, {}, {}, {}, or {}",
             manifest.format,
             LEGACY_SESSION_FORMAT_VERSION,
             PREVIOUS_SESSION_FORMAT_VERSION,
             RECORDING_SESSION_FORMAT_VERSION,
-            SESSION_FORMAT_VERSION
+            SESSION_FORMAT_VERSION,
+            RETRANSCRIPTION_SESSION_FORMAT_VERSION
         );
     }
 

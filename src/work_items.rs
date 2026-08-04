@@ -27,7 +27,7 @@ use crate::{
     participants::{ParticipantContext, ParticipantRole},
     recover,
     routine_recovery::MappingTimeline,
-    session::{SessionStore, WorkflowState},
+    session::{SessionRecord, SessionStore, WorkflowState},
     stage::{StageError, StageResult},
     track_manifest::{TrackDescription, TrackManifest, TrackState},
 };
@@ -165,89 +165,8 @@ fn run_with_refiner_under_lease(
             );
         }
 
-        let participants_path = session_directory.join(&session.record().files.participants.path);
-        let participants = ParticipantContext::load(&participants_path).with_context(|| {
-            format!(
-                "failed to validate participant snapshot {}",
-                participants_path.display()
-            )
-        })?;
-
-        let track_manifest_path = session_directory.join(&session.record().files.tracks.path);
-        let tracks = TrackManifest::read(&track_manifest_path).with_context(|| {
-            format!(
-                "failed to read track manifest {}",
-                track_manifest_path.display()
-            )
-        })?;
-        validate_tracks(
-            session_directory,
-            session.record().session_id.as_str(),
-            &tracks,
-        )?;
-
-        let timeline =
-            MappingTimeline::read(&session_directory.join(&session.record().files.events.path))?;
-        if !timeline.unresolved_ssrcs().is_empty() {
-            let mut unresolved = timeline
-                .unresolved_ssrcs()
-                .iter()
-                .copied()
-                .collect::<Vec<_>>();
-            unresolved.sort_unstable();
-            bail!(
-                "cannot build work items while SSRC mapping evidence remains unresolved for {}",
-                comma_join(unresolved)
-            );
-        }
-
-        let mut attributed_frames = Vec::new();
-        let mut unattributed_ssrcs = HashSet::new();
-        let replay = recover::replay_activity_session_files(
-            session_directory,
-            &session.record().files,
-            |activity| {
-                match timeline.user_at(activity.ssrc, activity.elapsed_nanos) {
-                    Some(discord_user_id) => attributed_frames.push(AttributedFrame {
-                        discord_user_id,
-                        tick: activity.tick,
-                        samples: u64::from(activity.decoded_samples),
-                    }),
-                    None => {
-                        unattributed_ssrcs.insert(activity.ssrc);
-                    }
-                }
-                Ok(())
-            },
-        )
-        .context("authoritative packet/playout journal validation failed")?;
-        if replay.truncated_packet_tail || replay.truncated_playout_tail {
-            bail!("cannot build work items with a truncated authoritative journal tail");
-        }
-        if replay.skipped_undecoded > 0 {
-            bail!(
-                "cannot build work items: {} playout decisions lack decoded-sample evidence",
-                replay.skipped_undecoded
-            );
-        }
-        if !unattributed_ssrcs.is_empty() {
-            let mut ssrcs = unattributed_ssrcs.into_iter().collect::<Vec<_>>();
-            ssrcs.sort_unstable();
-            bail!(
-                "cannot build work items: decoded PCM cannot be attributed safely for SSRCs {}",
-                comma_join(ssrcs)
-            );
-        }
-
-        let candidates = build_candidate_ranges(attributed_frames, merge_gap_ms)?;
-        validate_source_alignment(&candidates, &tracks)?;
-        let refined = refiner.refine(candidates)?;
-        let items = materialise_work_items(
-            session.record().session_id.as_str(),
-            refined,
-            &tracks,
-            &participants,
-        )?;
+        let items =
+            build_items_from_authority(session_directory, session.record(), merge_gap_ms, refiner)?;
         Ok((session, items))
     })()
     .map_err(StageError::refused)?;
@@ -268,6 +187,92 @@ fn run_with_refiner_under_lease(
         Ok(())
     })()
     .map_err(StageError::accepted)
+}
+
+pub(crate) fn build_retranscription_items(
+    session_directory: &Path,
+    record: &SessionRecord,
+    merge_gap_ms: u64,
+) -> Result<Vec<WorkItem>> {
+    build_items_from_authority(session_directory, record, merge_gap_ms, &NoopRefiner)
+}
+
+fn build_items_from_authority(
+    session_directory: &Path,
+    record: &SessionRecord,
+    merge_gap_ms: u64,
+    refiner: &dyn RangeRefiner,
+) -> Result<Vec<WorkItem>> {
+    let participants_path = session_directory.join(&record.files.participants.path);
+    let participants = ParticipantContext::load(&participants_path).with_context(|| {
+        format!(
+            "failed to validate participant snapshot {}",
+            participants_path.display()
+        )
+    })?;
+
+    let track_manifest_path = session_directory.join(&record.files.tracks.path);
+    let tracks = TrackManifest::read(&track_manifest_path).with_context(|| {
+        format!(
+            "failed to read track manifest {}",
+            track_manifest_path.display()
+        )
+    })?;
+    validate_tracks(session_directory, record.session_id.as_str(), &tracks)?;
+
+    let timeline = MappingTimeline::read(&session_directory.join(&record.files.events.path))?;
+    if !timeline.unresolved_ssrcs().is_empty() {
+        let mut unresolved = timeline
+            .unresolved_ssrcs()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        unresolved.sort_unstable();
+        bail!(
+            "cannot build work items while SSRC mapping evidence remains unresolved for {}",
+            comma_join(unresolved)
+        );
+    }
+
+    let mut attributed_frames = Vec::new();
+    let mut unattributed_ssrcs = HashSet::new();
+    let replay =
+        recover::replay_activity_session_files(session_directory, &record.files, |activity| {
+            match timeline.user_at(activity.ssrc, activity.elapsed_nanos) {
+                Some(discord_user_id) => attributed_frames.push(AttributedFrame {
+                    discord_user_id,
+                    tick: activity.tick,
+                    samples: u64::from(activity.decoded_samples),
+                }),
+                None => {
+                    unattributed_ssrcs.insert(activity.ssrc);
+                }
+            }
+            Ok(())
+        })
+        .context("authoritative packet/playout journal validation failed")?;
+    if replay.truncated_packet_tail || replay.truncated_playout_tail {
+        bail!("cannot build work items with a truncated authoritative journal tail");
+    }
+    if replay.skipped_undecoded > 0 {
+        bail!(
+            "cannot build work items: {} playout decisions lack decoded-sample evidence",
+            replay.skipped_undecoded
+        );
+    }
+    if !unattributed_ssrcs.is_empty() {
+        let mut ssrcs = unattributed_ssrcs.into_iter().collect::<Vec<_>>();
+        ssrcs.sort_unstable();
+        bail!(
+            "cannot build work items: decoded PCM cannot be attributed safely for SSRCs {}",
+            comma_join(ssrcs)
+        );
+    }
+
+    let candidates = build_candidate_ranges(attributed_frames, merge_gap_ms)?;
+    validate_source_alignment(&candidates, &tracks)?;
+    let refined = refiner.refine(candidates)?;
+    materialise_work_items(record.session_id.as_str(), refined, &tracks, &participants)
 }
 
 #[cfg(test)]
@@ -493,6 +498,11 @@ fn materialise_work_items(
 
     ranges
         .into_iter()
+        .filter(|range| {
+            participants
+                .get(range.discord_user_id)
+                .is_none_or(|participant| participant.transcribe)
+        })
         .enumerate()
         .map(|(index, range)| {
             let track = tracks.get(&range.discord_user_id).ok_or_else(|| {
@@ -588,13 +598,40 @@ fn write_manifest_atomically(session_directory: &Path, items: &[WorkItem]) -> Re
         .sync_all()
         .context("failed to synchronise session directory")?;
 
+    write_manifest_file_atomically(
+        &directory.join(WORK_ITEM_TEMP_FILE_NAME),
+        &directory.join(WORK_ITEM_MANIFEST_FILE_NAME),
+        items,
+    )
+}
+
+pub(crate) fn write_retranscription_manifest(path: &Path, items: &[WorkItem]) -> Result<()> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| anyhow!("retranscription work manifest path has no parent"))?;
+    fs::create_dir_all(directory).with_context(|| {
+        format!(
+            "failed to create retranscription staging directory {}",
+            directory.display()
+        )
+    })?;
     let temporary_path = directory.join(WORK_ITEM_TEMP_FILE_NAME);
-    let final_path = directory.join(WORK_ITEM_MANIFEST_FILE_NAME);
+    write_manifest_file_atomically(&temporary_path, path, items)
+}
+
+fn write_manifest_file_atomically(
+    temporary_path: &Path,
+    final_path: &Path,
+    items: &[WorkItem],
+) -> Result<()> {
+    let directory = final_path
+        .parent()
+        .ok_or_else(|| anyhow!("work manifest path has no parent"))?;
     let file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .open(&temporary_path)
+        .open(temporary_path)
         .with_context(|| format!("failed to create {}", temporary_path.display()))?;
     let mut writer = BufWriter::new(file);
     for item in items {
@@ -605,7 +642,7 @@ fn write_manifest_atomically(session_directory: &Path, items: &[WorkItem]) -> Re
     writer.get_ref().sync_all()?;
     drop(writer);
 
-    fs::rename(&temporary_path, &final_path)
+    fs::rename(temporary_path, final_path)
         .with_context(|| format!("failed to publish work manifest {}", final_path.display()))?;
     File::open(&directory)?
         .sync_all()
@@ -792,6 +829,86 @@ mod tests {
 
         assert_eq!(refined.len(), 2);
         assert_eq!(refined[0].end_sample, refined[1].start_sample);
+    }
+
+    #[test]
+    fn excluded_participants_are_removed_before_global_sequencing() {
+        let participants = ParticipantContext::from_toml(
+            concat!(
+                "version = 1\n",
+                "[participants.\"11\"]\n",
+                "character = \"Included\"\n",
+                "role = \"gm\"\n",
+                "[participants.\"22\"]\n",
+                "transcribe = false\n",
+            ),
+            Path::new("session/participants.toml"),
+        )
+        .unwrap();
+        let tracks = TrackManifest::new(
+            "session-exclusion".to_owned(),
+            vec![
+                TrackDescription::new(
+                    11,
+                    "Alice".to_owned(),
+                    "player".to_owned(),
+                    None,
+                    "tracks/user-11.flac".to_owned(),
+                    TrackState::Complete,
+                    5 * SAMPLES_PER_TICK,
+                    vec![100],
+                    None,
+                ),
+                TrackDescription::new(
+                    22,
+                    "Astra".to_owned(),
+                    "player".to_owned(),
+                    None,
+                    "tracks/user-22.flac".to_owned(),
+                    TrackState::Complete,
+                    5 * SAMPLES_PER_TICK,
+                    vec![200],
+                    None,
+                ),
+            ],
+        );
+        let ranges = vec![
+            CandidateRange {
+                discord_user_id: 11,
+                start_sample: SAMPLES_PER_TICK,
+                end_sample: 2 * SAMPLES_PER_TICK,
+                source_start_sample: SAMPLES_PER_TICK,
+                source_end_sample: 2 * SAMPLES_PER_TICK,
+            },
+            CandidateRange {
+                discord_user_id: 22,
+                start_sample: 2 * SAMPLES_PER_TICK,
+                end_sample: 3 * SAMPLES_PER_TICK,
+                source_start_sample: 2 * SAMPLES_PER_TICK,
+                source_end_sample: 3 * SAMPLES_PER_TICK,
+            },
+            CandidateRange {
+                discord_user_id: 11,
+                start_sample: 4 * SAMPLES_PER_TICK,
+                end_sample: 5 * SAMPLES_PER_TICK,
+                source_start_sample: 4 * SAMPLES_PER_TICK,
+                source_end_sample: 5 * SAMPLES_PER_TICK,
+            },
+        ];
+
+        let items =
+            materialise_work_items("session-exclusion", ranges, &tracks, &participants).unwrap();
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].sequence, 1);
+        assert_eq!(items[1].sequence, 2);
+        assert_eq!(items[0].id, "session-exclusion:000001");
+        assert_eq!(items[1].id, "session-exclusion:000002");
+        assert!(items.iter().all(|item| item.discord_user_id == "11"));
+        assert_eq!(items[0].speaker, "Alice");
+        assert_eq!(items[0].role, "gm");
+        assert_eq!(items[0].character.as_deref(), Some("Included"));
+        assert_eq!(items[0].source, "tracks/user-11.flac");
     }
 
     #[test]

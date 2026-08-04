@@ -30,6 +30,12 @@ struct FileParticipant {
     character: Option<String>,
     #[serde(default)]
     role: ParticipantRole,
+    #[serde(default = "default_transcribe")]
+    transcribe: bool,
+}
+
+const fn default_transcribe() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
@@ -74,6 +80,7 @@ pub(crate) struct Participant {
     pub(crate) discord_user_id: u64,
     pub(crate) character: Option<String>,
     pub(crate) role: ParticipantRole,
+    pub(crate) transcribe: bool,
 }
 
 #[allow(dead_code)]
@@ -92,7 +99,7 @@ impl ParticipantContext {
         Self::from_toml(&text, path)
     }
 
-    fn from_toml(text: &str, path: &Path) -> Result<Self> {
+    pub(crate) fn from_toml(text: &str, path: &Path) -> Result<Self> {
         let file: ParticipantFile = toml::from_str(text).with_context(|| {
             format!(
                 "failed to parse participant context file {}",
@@ -127,6 +134,7 @@ impl ParticipantContext {
                     discord_user_id,
                     character,
                     role: participant.role,
+                    transcribe: participant.transcribe,
                 },
             );
         }
@@ -146,6 +154,19 @@ impl ParticipantContext {
         self.participants.keys().copied()
     }
 
+    /// Apply an explicit operator policy migration to a session snapshot.
+    pub(crate) fn set_transcribe(&mut self, discord_user_id: u64, transcribe: bool) {
+        self.participants
+            .entry(discord_user_id)
+            .and_modify(|participant| participant.transcribe = transcribe)
+            .or_insert(Participant {
+                discord_user_id,
+                character: None,
+                role: ParticipantRole::Player,
+                transcribe,
+            });
+    }
+
     pub(crate) fn canonical_toml(&self) -> Result<String> {
         // Numeric ordering makes snapshots deterministic even though runtime
         // lookup uses a HashMap.
@@ -163,6 +184,7 @@ impl ParticipantContext {
                 text.push_str(&format!("character = {character}\n"));
             }
             text.push_str(&format!("role = \"{}\"\n", participant.role.as_str()));
+            text.push_str(&format!("transcribe = {}\n", participant.transcribe));
         }
         Ok(text)
     }
@@ -209,6 +231,7 @@ mod tests {
 
         let participant = context.get(881203221593464864).unwrap();
         assert_eq!(participant.role, ParticipantRole::Player);
+        assert!(participant.transcribe);
         assert_eq!(participant.character.as_deref(), Some("Example Character"));
         assert!(context.get(123456789012345678).is_none());
     }
@@ -273,15 +296,52 @@ mod tests {
             snapshot.find("[participants.\"11\"]").unwrap()
                 < snapshot.find("[participants.\"222\"]").unwrap()
         );
-        assert!(snapshot.contains("[participants.\"11\"]\nrole = \"gm\""));
-        assert!(
-            snapshot.contains("[participants.\"222\"]\ncharacter = \"Second\"\nrole = \"player\"")
-        );
+        assert!(snapshot.contains("[participants.\"11\"]\nrole = \"gm\"\ntranscribe = true"));
+        assert!(snapshot.contains(
+            "[participants.\"222\"]\ncharacter = \"Second\"\nrole = \"player\"\ntranscribe = true"
+        ));
 
         let reloaded =
             ParticipantContext::from_toml(&snapshot, Path::new("session/participants.toml"))
                 .unwrap();
         assert_eq!(reloaded.get(222).unwrap().role, ParticipantRole::Player);
+        assert!(reloaded.get(222).unwrap().transcribe);
+    }
+
+    #[test]
+    fn explicit_transcription_exclusion_is_parsed_and_materialised() {
+        let context = ParticipantContext::from_toml(
+            concat!(
+                "version = 1\n",
+                "[participants.\"111\"]\n",
+                "transcribe = false\n",
+            ),
+            Path::new("participants.toml"),
+        )
+        .unwrap();
+
+        assert!(!context.get(111).unwrap().transcribe);
+        assert!(
+            context
+                .canonical_toml()
+                .unwrap()
+                .contains("[participants.\"111\"]\nrole = \"player\"\ntranscribe = false")
+        );
+    }
+
+    #[test]
+    fn older_snapshot_without_transcribe_remains_compatible() {
+        let context = ParticipantContext::from_toml(
+            concat!(
+                "version = 1\n",
+                "[participants.\"111\"]\n",
+                "role = \"gm\"\n",
+            ),
+            Path::new("session/participants.toml"),
+        )
+        .unwrap();
+
+        assert!(context.get(111).unwrap().transcribe);
     }
 
     #[test]

@@ -3,6 +3,8 @@ version = 1
 [participants."881203221593464864"]
 character = "Example Character"
 role = "player"
+# transcribe defaults to true when omitted.
 
 [participants."123456789012345678"]
 role = "gm"
+transcribe = false

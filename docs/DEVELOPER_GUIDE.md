@@ -111,6 +111,8 @@ cargo run --release --manifest-path <root>/Cargo.toml -- <arguments>
 | `stage.rs` | Distinguishes pre-acceptance refusal from failure after a pipeline stage has begun publication. |
 | `transcription.rs` | Rust worker orchestration, result-prefix validation, failure publication, rewind continuation, and transcript rendering. |
 | `orchestration.rs` | One-stop post-recording coordinator and stage-aware configured continuation. |
+| `retranscription.rs` | Completed-session replacement staging and atomic generation publication. |
+| `participant_policy.rs` | Explicit leased migration of one historical snapshot's transcription Boolean. |
 | `inspect.rs` | Read-only current/legacy session and authoritative-journal inspection. |
 | `verify_tracks.rs` | Explicit full-decode verification of complete routine FLAC tracks. |
 
@@ -213,20 +215,23 @@ contradictory JSONL authority.
 
 ### 7.1 Session formats
 
-Current `session.json` readers accept formats 3, 4, and 5:
+Current `session.json` readers accept formats 3, 4, 5, and 6:
 
 - format 3 predates the work-manifest description;
 - format 4 is the format used when a new recording session starts and may
   optionally describe `work-items.jsonl`;
 - format 5 requires both work-item and result descriptions and belongs to the
-  transcription workflow.
+  transcription workflow;
+- format 6 is complete-only and explicitly references a work manifest, results
+  and readable transcript in one published retranscription generation.
 
 Format 2 remains available only through the read-only inspector.
 
 The `files` object is an internal manifest for authoritative or cross-stage
-artefacts. Paths are fixed, relative to the session directory, and independently
-versioned. Readers reject absolute paths, parent traversal, and unexpected
-paths/formats.
+artefacts. Format-3 to format-5 paths are fixed. Format-6 transcription paths
+must share one directory below `transcription/retranscriptions/`. All paths are
+relative and independently versioned; readers reject absolute paths, parent
+traversal, and unexpected paths/formats.
 
 Adding a field to a `deny_unknown_fields` structure without a format bump breaks
 older readers even if the new field is optional. Treat persistent schema
@@ -458,11 +463,13 @@ The builder then:
 
 1. validates track/session alignment;
 2. passes candidates through the `RangeRefiner` interface;
-3. materialises participant role/character from the session snapshot;
-4. sorts globally by start time with stable tie-breakers;
-5. assigns `session-id:000001` style IDs;
-6. atomically replaces `transcription/work-items.jsonl`;
-7. publishes the file description and `work_manifest_built` checkpoint in one
+3. materialises participant role, character and transcription policy from the
+   session snapshot;
+4. removes `transcribe = false` participants;
+5. sorts globally by start time with stable tie-breakers;
+6. assigns `session-id:000001` style IDs only after exclusion;
+7. atomically replaces `transcription/work-items.jsonl`;
+8. publishes the file description and `work_manifest_built` checkpoint in one
    `session.json` replacement.
 
 `NoopRefiner` remains the current implementation. The active speech-presence
@@ -608,6 +615,26 @@ to `complete` while retaining the lease.
 deliberately does not return to recording journals, participant snapshots,
 track manifests, or audio.
 
+### 14.5 Complete replacement retranscription
+
+`retranscribe` validates an existing complete format-5 or format-6 transcript,
+then calls the normal work-item builder over authoritative recording evidence
+with the current merge setting and immutable session snapshot. The production
+worker receives unreferenced generation paths and always starts at sequence 1.
+
+After exact result validation, Rust renders the final text into the same staged
+generation. `SessionStore::publish_retranscription_complete` then performs the
+only authority mutation: one atomic format-6 `session.json` replacement names
+all three files. A worker, validation, crash or metadata-publication failure
+therefore leaves the old complete paths and `complete` state intact. Failed
+generation directories are non-authoritative.
+
+Historical snapshots are not refreshed from configured participant data.
+`set-transcription-policy` is the narrow exception: under the same lease it
+atomically changes only one materialised `transcribe` Boolean. Missing entries
+are inserted with the normal player defaults. The operator must invoke
+`retranscribe` separately to publish a replacement transcript.
+
 ## 15. Exclusive offline ownership
 
 Every offline command which mutates session authority or a declared artefact
@@ -617,6 +644,8 @@ uses `SessionOperationLease`:
 - recording continuation;
 - work-item generation;
 - transcription and transcription continuation;
+- complete replacement retranscription;
+- completed-session transcription-policy migration;
 - stage-aware configured continuation;
 - final transcript rebuilding.
 

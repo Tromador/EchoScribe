@@ -118,6 +118,7 @@ A separate human-readable TOML file supplies optional downstream context:
 - Discord user ID;
 - current character name;
 - role such as `player` or `gm`.
+- transcription admission policy.
 
 The main EchoScribe TOML file references this participant file.
 
@@ -125,7 +126,12 @@ The participant file is not a campaign database, lore store, or historical state
 
 Multiple participants may have the `gm` role.
 
-A participant missing from the mapping file is recorded and transcribed normally. Missing character or role context is a warning, not a recording or transcription failure. An unspecified role defaults to `player`.
+A participant missing from the mapping file is recorded and transcribed normally. Missing character or role context is a warning, not a recording or transcription failure. An unspecified role defaults to `player`. The optional `transcribe` Boolean defaults to `true`.
+
+`transcribe = false` excludes that participant before work-item sequencing. It
+does not change recording: journals, playout and identity evidence, and routine
+FLAC tracks remain complete. Canonical session snapshots materialise the
+Boolean, while older snapshots without it remain compatible as `true`.
 
 ## 8. Transcription
 
@@ -150,6 +156,24 @@ stage command remains available for controlled reprocessing and diagnosis:
 echoscribe transcribe <session> <config>
 ```
 
+A separate replacement operation is available only for a healthy completed
+session:
+
+```text
+echoscribe retranscribe <session> <config>
+```
+
+Retranscription rebuilds work items from authoritative playout evidence using
+the current segmentation setting and the immutable session participant
+snapshot, then runs the normal production worker from sequence 1 with current
+transcription settings. It is neither continuation nor recovery.
+
+The replacement work manifest, structured results and readable transcript are
+staged as one generation. They become authoritative together only after every
+work item has committed and the complete set validates. Failure or process
+termination before the final atomic session-authority switch preserves the
+previous complete set and leaves workflow state `complete`.
+
 The first invocation requires `ready_for_transcription`. An explicit controlled
 restart may enter from `transcribing`, validates and retains only the globally
 contiguous committed result prefix, rebuilds the partial text transcript from
@@ -167,8 +191,9 @@ workflow authority and must not modify `session.json`.
 
 Only one offline operation which mutates session authority or a
 session-declared artefact may own a session at a time. `recover`,
-`continue <session>`, `build-work-items`, `transcribe`, `rebuild-transcript`,
-and configured stage-aware `continue` share that exclusive ownership boundary.
+`continue <session>`, `build-work-items`, `transcribe`, `retranscribe`,
+`set-transcription-policy`, `rebuild-transcript`, and configured stage-aware
+`continue` share that exclusive ownership boundary.
 The one-stop coordinator acquires the same ownership after recording and keeps
 it continuously through work-manifest construction, worker execution,
 transcript publication, and completion. Ownership is acquired before loading
@@ -500,6 +525,12 @@ authoritative transcription-results reference and is published atomically with
 the first transition to `transcribing`. Existing format-3 and format-4 sessions
 remain readable under their defined compatibility rules.
 
+Session format 6 represents a successfully published retranscription. It
+explicitly references the replacement work manifest, results and readable
+transcript within one generation directory. The single atomic `session.json`
+replacement is the publication point for that complete set; format-5 completed
+sessions remain readable and retranscribable.
+
 ## 16. Normal orchestration
 
 Normal use is one-stop.
@@ -513,15 +544,22 @@ echoscribe [config]                    # one-stop normal workflow
 echoscribe record [config]             # recording and finalisation only
 echoscribe continue <session>          # recording-recovery validation only
 echoscribe continue <session> <config> # stage-aware pipeline continuation
+echoscribe retranscribe <session> <config>
+echoscribe set-transcription-policy <session> <user-id> <true|false>
 echoscribe rebuild-transcript <session>
 ```
 
-`rebuild-transcript` requires a complete format-5 session and reconstructs the
+`rebuild-transcript` requires a complete format-5 or format-6 session and reconstructs the
 final human-readable transcript atomically from complete contiguous JSONL
 authority. It neither launches Python nor changes result authority or workflow
 state. Because completed structured transcription authority is sufficient for
 rendering, this command does not require recording journals, participant
 context, the track manifest, or source FLACs to remain present.
+
+The explicit `set-transcription-policy` command is the supported migration for
+changing only the materialised `transcribe` Boolean in a completed historical
+session snapshot. Routine processing never rereads mutable participant names,
+roles or characters from the configured source file.
 
 The configured vocabulary file is UTF-8 text with one hotword phrase per
 trimmed non-blank line. A line whose first non-whitespace character is `#` is a

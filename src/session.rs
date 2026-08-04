@@ -22,13 +22,15 @@ use crate::{
     artifacts::{
         EVENT_JOURNAL_FILE_NAME, PACKET_JOURNAL_FILE_NAME, PARTICIPANT_SNAPSHOT_FILE_NAME,
         PARTICIPANT_SNAPSHOT_FORMAT_VERSION, PLAYOUT_JOURNAL_FILE_NAME, TRACK_MANIFEST_FILE_NAME,
-        TRACK_MANIFEST_FORMAT_VERSION, TRANSCRIPTION_RESULT_FORMAT_VERSION,
-        TRANSCRIPTION_RESULTS_PATH, WORK_ITEM_MANIFEST_FORMAT_VERSION, WORK_ITEM_MANIFEST_PATH,
+        TRACK_MANIFEST_FORMAT_VERSION, TRANSCRIPT_FORMAT_VERSION,
+        TRANSCRIPTION_RESULT_FORMAT_VERSION, TRANSCRIPTION_RESULTS_PATH,
+        WORK_ITEM_MANIFEST_FORMAT_VERSION, WORK_ITEM_MANIFEST_PATH,
     },
     participants::ParticipantContext,
 };
 
 pub(crate) const SESSION_FORMAT_VERSION: u16 = 5;
+pub(crate) const RETRANSCRIPTION_SESSION_FORMAT_VERSION: u16 = 6;
 pub(crate) const RECORDING_SESSION_FORMAT_VERSION: u16 = 4;
 pub(crate) const PREVIOUS_SESSION_FORMAT_VERSION: u16 = 3;
 pub(crate) const LEGACY_SESSION_FORMAT_VERSION: u16 = 2;
@@ -104,6 +106,8 @@ pub(crate) struct SessionFiles {
     pub(crate) work_items: Option<FileDescription>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) results: Option<FileDescription>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) transcript: Option<FileDescription>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -186,6 +190,7 @@ impl SessionRecord {
                 },
                 work_items: None,
                 results: None,
+                transcript: None,
             },
             failures: Vec::new(),
             checkpoints: Vec::new(),
@@ -200,13 +205,15 @@ impl SessionRecord {
             PREVIOUS_SESSION_FORMAT_VERSION
                 | RECORDING_SESSION_FORMAT_VERSION
                 | SESSION_FORMAT_VERSION
+                | RETRANSCRIPTION_SESSION_FORMAT_VERSION
         ) {
             return Err(invalid_data(format!(
-                "unsupported session format {}; expected {}, {}, or {}",
+                "unsupported session format {}; expected {}, {}, {}, or {}",
                 self.format,
                 PREVIOUS_SESSION_FORMAT_VERSION,
                 RECORDING_SESSION_FORMAT_VERSION,
-                SESSION_FORMAT_VERSION
+                SESSION_FORMAT_VERSION,
+                RETRANSCRIPTION_SESSION_FORMAT_VERSION
             )));
         }
         if self.session_id.trim().is_empty() {
@@ -302,7 +309,8 @@ impl SessionRecord {
         }
         if let Some(description) = &self.files.work_items {
             validate_relative_artifact_path("work_items", &description.path)?;
-            if description.path != WORK_ITEM_MANIFEST_PATH
+            if (self.format < RETRANSCRIPTION_SESSION_FORMAT_VERSION
+                && description.path != WORK_ITEM_MANIFEST_PATH)
                 || description.format != WORK_ITEM_MANIFEST_FORMAT_VERSION
             {
                 return Err(invalid_data(format!(
@@ -337,15 +345,48 @@ impl SessionRecord {
                 )));
             }
         }
+        if self.format < RETRANSCRIPTION_SESSION_FORMAT_VERSION && self.files.transcript.is_some() {
+            return Err(invalid_data(
+                "session formats 3, 4, and 5 must not contain a transcript description",
+            ));
+        }
+        if self.format == RETRANSCRIPTION_SESSION_FORMAT_VERSION {
+            let (Some(work_items), Some(results), Some(transcript)) = (
+                self.files.work_items.as_ref(),
+                self.files.results.as_ref(),
+                self.files.transcript.as_ref(),
+            ) else {
+                return Err(invalid_data(
+                    "session format 6 requires work_items, results, and transcript descriptions",
+                ));
+            };
+            if work_items.format != WORK_ITEM_MANIFEST_FORMAT_VERSION
+                || results.format != TRANSCRIPTION_RESULT_FORMAT_VERSION
+                || transcript.format != TRANSCRIPT_FORMAT_VERSION
+            {
+                return Err(invalid_data(
+                    "session format 6 contains an unsupported transcription artefact format",
+                ));
+            }
+            validate_retranscription_paths(&work_items.path, &results.path, &transcript.path)?;
+        }
         if matches!(
             self.state,
-            WorkflowState::Transcribing
-                | WorkflowState::TranscriptionFailed
-                | WorkflowState::Complete
+            WorkflowState::Transcribing | WorkflowState::TranscriptionFailed
         ) && self.format != SESSION_FORMAT_VERSION
         {
             return Err(invalid_data(
-                "transcription workflow states require session format 5",
+                "incomplete transcription workflow states require session format 5",
+            ));
+        }
+        if self.state == WorkflowState::Complete
+            && !matches!(
+                self.format,
+                SESSION_FORMAT_VERSION | RETRANSCRIPTION_SESSION_FORMAT_VERSION
+            )
+        {
+            return Err(invalid_data(
+                "complete transcription workflow requires session format 5 or 6",
             ));
         }
         if self.format == SESSION_FORMAT_VERSION
@@ -359,6 +400,13 @@ impl SessionRecord {
         {
             return Err(invalid_data(
                 "session format 5 requires a transcription workflow state",
+            ));
+        }
+        if self.format == RETRANSCRIPTION_SESSION_FORMAT_VERSION
+            && self.state != WorkflowState::Complete
+        {
+            return Err(invalid_data(
+                "session format 6 requires complete workflow state",
             ));
         }
 
@@ -695,6 +743,49 @@ impl SessionStore {
         self.persist(updated)
     }
 
+    /// Atomically switch completed transcription authority to one fully
+    /// staged replacement generation. The prior complete paths remain
+    /// authoritative unless this single session-record replacement succeeds.
+    pub(crate) fn publish_retranscription_complete(
+        &mut self,
+        completed_at_unix_millis: u64,
+        work_items_path: String,
+        results_path: String,
+        transcript_path: String,
+    ) -> io::Result<()> {
+        if !matches!(
+            self.record.format,
+            SESSION_FORMAT_VERSION | RETRANSCRIPTION_SESSION_FORMAT_VERSION
+        ) || self.record.state != WorkflowState::Complete
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "retranscription publication requires a complete session",
+            ));
+        }
+        validate_retranscription_paths(&work_items_path, &results_path, &transcript_path)?;
+
+        let mut updated = self.record.clone();
+        updated.format = RETRANSCRIPTION_SESSION_FORMAT_VERSION;
+        updated.files.work_items = Some(FileDescription {
+            path: work_items_path,
+            format: WORK_ITEM_MANIFEST_FORMAT_VERSION,
+        });
+        updated.files.results = Some(FileDescription {
+            path: results_path,
+            format: TRANSCRIPTION_RESULT_FORMAT_VERSION,
+        });
+        updated.files.transcript = Some(FileDescription {
+            path: transcript_path,
+            format: TRANSCRIPT_FORMAT_VERSION,
+        });
+        updated.checkpoints.push(CheckpointRecord {
+            completed_at_unix_millis,
+            stage: "retranscription_completed".to_owned(),
+        });
+        self.persist(updated)
+    }
+
     fn persist(&mut self, updated: SessionRecord) -> io::Result<()> {
         // Do not mutate the in-memory authority until the replacement is
         // validated and durably published.
@@ -738,9 +829,38 @@ pub(crate) fn read_record(path: &Path) -> io::Result<SessionRecord> {
             "session formats 3 and 4 must not contain a results field",
         ));
     }
+    if value
+        .get("format")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|format| format < u64::from(RETRANSCRIPTION_SESSION_FORMAT_VERSION))
+        && value
+            .get("files")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|files| files.contains_key("transcript"))
+    {
+        return Err(invalid_data(
+            "session formats 3, 4, and 5 must not contain a transcript field",
+        ));
+    }
     let record: SessionRecord = serde_json::from_value(value).map_err(io::Error::other)?;
     record.validate()?;
     Ok(record)
+}
+
+/// Crash-safe replacement used only by the explicit completed-session policy
+/// migration command. Ordinary processing continues to treat the snapshot as
+/// immutable.
+pub(crate) fn replace_participant_snapshot(
+    session_directory: &Path,
+    participants: &ParticipantContext,
+) -> io::Result<()> {
+    let bytes = participants.canonical_toml().map_err(io::Error::other)?;
+    write_replacing_file_atomically(
+        session_directory,
+        PARTICIPANT_TEMP_FILE_NAME,
+        PARTICIPANT_SNAPSHOT_FILE_NAME,
+        bytes.as_bytes(),
+    )
 }
 
 fn valid_transition(current: WorkflowState, next: WorkflowState) -> bool {
@@ -887,6 +1007,50 @@ fn validate_relative_artifact_path(name: &str, value: &str) -> io::Result<()> {
         return Err(invalid_data(format!(
             "session file {name} path must not escape the session directory"
         )));
+    }
+    Ok(())
+}
+
+fn validate_retranscription_paths(
+    work_items: &str,
+    results: &str,
+    transcript: &str,
+) -> io::Result<()> {
+    for (name, path) in [
+        ("work_items", work_items),
+        ("results", results),
+        ("transcript", transcript),
+    ] {
+        validate_relative_artifact_path(name, path)?;
+    }
+
+    let work_items = Path::new(work_items);
+    let results = Path::new(results);
+    let transcript = Path::new(transcript);
+    let parent = work_items.parent();
+    if parent.is_none()
+        || results.parent() != parent
+        || transcript.parent() != parent
+        || work_items.file_name().and_then(|name| name.to_str()) != Some("work-items.jsonl")
+        || results.file_name().and_then(|name| name.to_str()) != Some("results.jsonl")
+        || transcript.file_name().and_then(|name| name.to_str()) != Some("transcript.txt")
+    {
+        return Err(invalid_data(
+            "retranscription artefacts must share one generation directory",
+        ));
+    }
+    let components = parent
+        .expect("generation parent checked above")
+        .components()
+        .collect::<Vec<_>>();
+    if components.len() != 3
+        || components[0] != Component::Normal("transcription".as_ref())
+        || components[1] != Component::Normal("retranscriptions".as_ref())
+        || !matches!(components[2], Component::Normal(_))
+    {
+        return Err(invalid_data(
+            "retranscription generation must be under transcription/retranscriptions",
+        ));
     }
     Ok(())
 }

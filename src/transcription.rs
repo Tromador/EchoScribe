@@ -29,8 +29,8 @@ use crate::{
     operation_lease::SessionOperationLease,
     participants::ParticipantContext,
     session::{
-        RECORDING_SESSION_FORMAT_VERSION, SESSION_FORMAT_VERSION, SessionRecord, SessionStore,
-        WorkflowState,
+        RECORDING_SESSION_FORMAT_VERSION, RETRANSCRIPTION_SESSION_FORMAT_VERSION,
+        SESSION_FORMAT_VERSION, SessionRecord, SessionStore, WorkflowState,
     },
     stage::{StageError, StageResult},
     track_manifest::{TrackManifest, TrackState},
@@ -199,6 +199,152 @@ pub(crate) fn run(session_directory: &Path, config_path: &Path) -> Result<()> {
     run_with_worker(session_directory, config_path, &SystemWorker)
 }
 
+pub(crate) fn validate_complete_transcription_authority(
+    session_directory: &Path,
+    record: &SessionRecord,
+) -> Result<()> {
+    if !matches!(
+        record.format,
+        SESSION_FORMAT_VERSION | RETRANSCRIPTION_SESSION_FORMAT_VERSION
+    ) || record.state != WorkflowState::Complete
+    {
+        bail!(
+            "retranscription requires a complete session; found format {} state {}",
+            record.format,
+            record.state.as_str()
+        );
+    }
+    let manifest_path = session_directory.join(
+        &record
+            .files
+            .work_items
+            .as_ref()
+            .expect("complete transcription format requires work items")
+            .path,
+    );
+    let work_items = read_work_manifest_authority(&manifest_path, record)?;
+    let results_path = session_directory.join(
+        &record
+            .files
+            .results
+            .as_ref()
+            .expect("complete transcription format requires results")
+            .path,
+    );
+    let result_bytes = fs::read(&results_path)
+        .with_context(|| format!("failed to read results {}", results_path.display()))?;
+    if !result_bytes.is_empty() && !result_bytes.ends_with(b"\n") {
+        bail!(
+            "completed results {} have a truncated final record",
+            results_path.display()
+        );
+    }
+    let results = validate_and_repair_result_prefix(&results_path, &work_items)?;
+    if results.len() != work_items.len() {
+        bail!(
+            "completed transcription has {} results for {} work items",
+            results.len(),
+            work_items.len()
+        );
+    }
+
+    let transcript_path = completed_transcript_path(session_directory, record);
+    let actual = fs::read(&transcript_path).with_context(|| {
+        format!(
+            "failed to read completed transcript {}",
+            transcript_path.display()
+        )
+    })?;
+    if actual != transcript_bytes(&results) {
+        bail!(
+            "completed transcript {} does not match structured result authority",
+            transcript_path.display()
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn run_replacement_worker(
+    session_directory: &Path,
+    prepared: &PreparedTranscription,
+    manifest_path: &Path,
+    results_path: &Path,
+    partial_transcript_path: &Path,
+    work_items: &[WorkItem],
+    lease: &SessionOperationLease,
+) -> Result<Vec<TranscriptionResult>> {
+    run_replacement_worker_with_process(
+        session_directory,
+        prepared,
+        manifest_path,
+        results_path,
+        partial_transcript_path,
+        work_items,
+        lease,
+        &SystemWorker,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_replacement_worker_with_process(
+    session_directory: &Path,
+    prepared: &PreparedTranscription,
+    manifest_path: &Path,
+    results_path: &Path,
+    partial_transcript_path: &Path,
+    work_items: &[WorkItem],
+    lease: &SessionOperationLease,
+    worker: &dyn WorkerProcess,
+) -> Result<Vec<TranscriptionResult>> {
+    prepare_empty_file(results_path)?;
+    prepare_empty_file(partial_transcript_path)?;
+    let invocation = WorkerInvocation {
+        config_path: &prepared.config_path,
+        session_directory,
+        manifest_path,
+        results_path,
+        transcript_path: partial_transcript_path,
+        next_sequence: 1,
+        settings: &prepared.settings,
+    };
+    let exit = worker.run(&invocation, lease)?;
+    if !exit.success {
+        match exit.code {
+            Some(code) => bail!("retranscription worker exited with status {code}"),
+            None => bail!("retranscription worker terminated without an exit status"),
+        }
+    }
+
+    let bytes = fs::read(results_path)
+        .with_context(|| format!("failed to read staged results {}", results_path.display()))?;
+    if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+        bail!("staged results have a truncated final record");
+    }
+    let results = validate_and_repair_result_prefix(results_path, work_items)?;
+    if results.len() != work_items.len() {
+        bail!(
+            "retranscription worker committed {} of {} work items",
+            results.len(),
+            work_items.len()
+        );
+    }
+    Ok(results)
+}
+
+pub(crate) fn write_replacement_transcript(
+    path: &Path,
+    results: &[TranscriptionResult],
+) -> Result<()> {
+    write_transcript_file_atomically(path, results)
+}
+
+fn completed_transcript_path(session_directory: &Path, record: &SessionRecord) -> PathBuf {
+    match record.files.transcript.as_ref() {
+        Some(description) => session_directory.join(&description.path),
+        None => session_directory.join(FINAL_TRANSCRIPT_PATH),
+    }
+}
+
 pub(crate) fn rebuild_transcript(session_directory: &Path) -> Result<()> {
     let session_directory = canonical_session_directory(session_directory)?;
     let lease = SessionOperationLease::acquire(&session_directory)?;
@@ -215,13 +361,15 @@ fn rebuild_transcript_with_lease(
             session_directory.display()
         )
     })?;
-    if session.record().format != SESSION_FORMAT_VERSION
-        || session.record().state != WorkflowState::Complete
+    if !matches!(
+        session.record().format,
+        SESSION_FORMAT_VERSION | RETRANSCRIPTION_SESSION_FORMAT_VERSION
+    ) || session.record().state != WorkflowState::Complete
         || session.record().files.work_items.is_none()
         || session.record().files.results.is_none()
     {
         bail!(
-            "rebuild-transcript requires a complete format-5 session with work and result authority; \
+            "rebuild-transcript requires a complete transcription session with work and result authority; \
              found format {} state {}",
             session.record().format,
             session.record().state.as_str()
@@ -267,11 +415,12 @@ fn rebuild_transcript_with_lease(
         );
     }
 
-    write_final_transcript_atomically(session_directory, &committed)?;
+    let final_path = completed_transcript_path(session_directory, session.record());
+    write_transcript_file_atomically(&final_path, &committed)?;
     println!(
         "Rebuilt final transcript for session {} at {}.",
         session.record().session_id,
-        session_directory.join(FINAL_TRANSCRIPT_PATH).display()
+        final_path.display()
     );
     Ok(())
 }
@@ -1106,6 +1255,36 @@ fn prepare_empty_results(session_directory: &Path) -> Result<()> {
     Ok(())
 }
 
+fn prepare_empty_file(path: &Path) -> Result<()> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| anyhow!("staged transcription path has no parent"))?;
+    fs::create_dir_all(directory).with_context(|| {
+        format!(
+            "failed to create transcription staging directory {}",
+            directory.display()
+        )
+    })?;
+    let temporary_path = directory.join(format!(
+        ".{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("staged transcription filename is not valid UTF-8"))?
+    ));
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&temporary_path)
+        .with_context(|| format!("failed to create {}", temporary_path.display()))?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&temporary_path, path)
+        .with_context(|| format!("failed to publish staged file {}", path.display()))?;
+    File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
 #[derive(Debug)]
 struct ResultAuthorityFailure {
     message: String,
@@ -1323,13 +1502,17 @@ fn rebuild_partial_transcript(
     Ok(())
 }
 
-fn write_final_transcript_atomically(
-    session_directory: &Path,
-    results: &[TranscriptionResult],
-) -> Result<()> {
-    let directory = session_directory.join(TRANSCRIPTION_DIRECTORY_NAME);
+fn write_transcript_file_atomically(path: &Path, results: &[TranscriptionResult]) -> Result<()> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| anyhow!("transcript path has no parent"))?;
+    fs::create_dir_all(directory).with_context(|| {
+        format!(
+            "failed to create transcript directory {}",
+            directory.display()
+        )
+    })?;
     let temporary_path = directory.join(FINAL_TRANSCRIPT_TEMP_FILE_NAME);
-    let final_path = session_directory.join(FINAL_TRANSCRIPT_PATH);
     let file = OpenOptions::new()
         .write(true)
         .create(true)
@@ -1337,24 +1520,22 @@ fn write_final_transcript_atomically(
         .open(&temporary_path)
         .with_context(|| format!("failed to create {}", temporary_path.display()))?;
     let mut writer = BufWriter::new(file);
-    for result in results {
-        if !result.text.trim().is_empty() {
-            writer.write_all(transcript_line(result).as_bytes())?;
-        }
-    }
+    writer.write_all(&transcript_bytes(results))?;
     writer.flush()?;
     writer.get_ref().sync_all()?;
     drop(writer);
-    fs::rename(&temporary_path, &final_path).with_context(|| {
-        format!(
-            "failed to publish final transcript {}",
-            final_path.display()
-        )
-    })?;
-    File::open(&directory)?
-        .sync_all()
-        .context("failed to synchronise transcription directory")?;
+    fs::rename(&temporary_path, path)
+        .with_context(|| format!("failed to publish transcript {}", path.display()))?;
+    File::open(directory)?.sync_all()?;
     Ok(())
+}
+
+fn transcript_bytes(results: &[TranscriptionResult]) -> Vec<u8> {
+    results
+        .iter()
+        .filter(|result| !result.text.trim().is_empty())
+        .flat_map(|result| transcript_line(result).into_bytes())
+        .collect()
 }
 
 fn transcript_line(result: &TranscriptionResult) -> String {
@@ -1582,6 +1763,26 @@ mod tests {
             Ok(WorkerExit {
                 success: false,
                 code: Some(31),
+            })
+        }
+    }
+
+    struct MalformedThenZeroWorker;
+
+    impl WorkerProcess for MalformedThenZeroWorker {
+        fn run(
+            &self,
+            invocation: &WorkerInvocation<'_>,
+            _lease: &SessionOperationLease,
+        ) -> Result<WorkerExit> {
+            let mut results = OpenOptions::new()
+                .append(true)
+                .open(invocation.results_path)?;
+            results.write_all(b"{malformed complete record}\n")?;
+            results.sync_all()?;
+            Ok(WorkerExit {
+                success: true,
+                code: Some(0),
             })
         }
     }
@@ -2849,7 +3050,7 @@ mod tests {
 
         validate_result_matches_work_item(&results[0], &first_item).unwrap();
         rebuild_partial_transcript(&directory, &partial_path, &results).unwrap();
-        write_final_transcript_atomically(&directory, &results).unwrap();
+        write_transcript_file_atomically(&directory.join(FINAL_TRANSCRIPT_PATH), &results).unwrap();
 
         let expected = "[00:00:10] Alice: Spoken text\n";
         assert_eq!(fs::read_to_string(&partial_path).unwrap(), expected);
@@ -2889,6 +3090,56 @@ mod tests {
             .len(),
             1
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn replacement_worker_starts_at_one_and_rejects_malformed_staged_results() {
+        let (directory, config_path, item) = ready_session("replacement-worker");
+        let prepared = PreparedTranscription::load(&config_path).unwrap();
+        let lease = SessionOperationLease::acquire(&directory).unwrap();
+        let staging = directory.join("transcription/retranscriptions/000001");
+        fs::create_dir_all(&staging).unwrap();
+        let manifest = directory.join(WORK_ITEM_MANIFEST_PATH);
+        let results = staging.join("results.jsonl");
+        let partial = staging.join("transcript.partial.txt");
+        let worker = FakeWorker::successful();
+
+        let committed = run_replacement_worker_with_process(
+            &directory,
+            &prepared,
+            &manifest,
+            &results,
+            &partial,
+            std::slice::from_ref(&item),
+            &lease,
+            &worker,
+        )
+        .unwrap();
+
+        assert_eq!(committed.len(), 1);
+        let invocation = worker.invocations.lock().unwrap()[0].clone();
+        assert_eq!(invocation.next_sequence, 1);
+        assert_eq!(invocation.manifest_path, manifest);
+        assert_eq!(invocation.results_path, results);
+        assert_eq!(invocation.transcript_path, partial);
+
+        let malformed_results = staging.join("malformed-results.jsonl");
+        let malformed_partial = staging.join("malformed-partial.txt");
+        let error = run_replacement_worker_with_process(
+            &directory,
+            &prepared,
+            &directory.join(WORK_ITEM_MANIFEST_PATH),
+            &malformed_results,
+            &malformed_partial,
+            &[item],
+            &lease,
+            &MalformedThenZeroWorker,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("malformed interior transcription result"));
+
+        drop(lease);
         fs::remove_dir_all(directory).unwrap();
     }
 

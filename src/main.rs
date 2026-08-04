@@ -16,9 +16,11 @@ mod journal;
 mod live_flac;
 mod operation_lease;
 mod orchestration;
+mod participant_policy;
 mod participants;
 mod playout;
 mod recover;
+mod retranscription;
 mod routine_recovery;
 mod session;
 mod stage;
@@ -92,6 +94,15 @@ enum Command {
     Transcribe {
         session_directory: PathBuf,
         config_path: PathBuf,
+    },
+    Retranscribe {
+        session_directory: PathBuf,
+        config_path: PathBuf,
+    },
+    SetTranscriptionPolicy {
+        session_directory: PathBuf,
+        discord_user_id: u64,
+        transcribe: bool,
     },
     RebuildTranscript {
         session_directory: PathBuf,
@@ -302,6 +313,19 @@ async fn main() -> anyhow::Result<()> {
         } => {
             return transcription::run(&session_directory, &config_path);
         }
+        Command::Retranscribe {
+            session_directory,
+            config_path,
+        } => {
+            return retranscription::run(&session_directory, &config_path);
+        }
+        Command::SetTranscriptionPolicy {
+            session_directory,
+            discord_user_id,
+            transcribe,
+        } => {
+            return participant_policy::run(&session_directory, discord_user_id, transcribe);
+        }
         Command::RebuildTranscript { session_directory } => {
             return transcription::rebuild_transcript(&session_directory);
         }
@@ -462,6 +486,8 @@ fn parse_command_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Res
                 | "continue"
                 | "build-work-items"
                 | "transcribe"
+                | "retranscribe"
+                | "set-transcription-policy"
                 | "rebuild-transcript"
                 | "export"
                 | "verify"
@@ -531,6 +557,46 @@ fn parse_command_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Res
                 Ok(Command::Transcribe {
                     session_directory,
                     config_path,
+                })
+            }
+            Some("retranscribe") => {
+                let config_path = args
+                    .next()
+                    .map(PathBuf::from)
+                    .ok_or_else(|| anyhow::anyhow!("retranscribe requires a config path"))?;
+                require_no_extra_args(&mut args)?;
+                Ok(Command::Retranscribe {
+                    session_directory,
+                    config_path,
+                })
+            }
+            Some("set-transcription-policy") => {
+                let user_id = args.next().ok_or_else(|| {
+                    anyhow::anyhow!("set-transcription-policy requires a Discord user ID")
+                })?;
+                let user_id_display = user_id.to_string_lossy();
+                let discord_user_id = user_id_display
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|value| *value != 0)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "set-transcription-policy Discord user ID {user_id_display:?} must be non-zero"
+                        )
+                    })?;
+                let value = args.next().ok_or_else(|| {
+                    anyhow::anyhow!("set-transcription-policy requires true or false")
+                })?;
+                let transcribe = match value.to_str() {
+                    Some("true") => true,
+                    Some("false") => false,
+                    _ => bail!("set-transcription-policy value must be true or false"),
+                };
+                require_no_extra_args(&mut args)?;
+                Ok(Command::SetTranscriptionPolicy {
+                    session_directory,
+                    discord_user_id,
+                    transcribe,
                 })
             }
             Some("rebuild-transcript") => {
@@ -879,6 +945,99 @@ mod tests {
         )
         .unwrap_err();
         assert!(extra.to_string().contains("unexpected argument"));
+    }
+
+    #[test]
+    fn retranscribe_selects_session_and_config_paths() {
+        let command = parse_command_args(
+            [
+                OsString::from("retranscribe"),
+                OsString::from("recordings/session-123"),
+                OsString::from("echoscribe.toml"),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        let Command::Retranscribe {
+            session_directory,
+            config_path,
+        } = command
+        else {
+            panic!("expected retranscribe command");
+        };
+        assert_eq!(session_directory, Path::new("recordings/session-123"));
+        assert_eq!(config_path, Path::new("echoscribe.toml"));
+    }
+
+    #[test]
+    fn retranscribe_requires_exactly_two_paths() {
+        let missing_session =
+            parse_command_args([OsString::from("retranscribe")].into_iter()).unwrap_err();
+        assert!(
+            missing_session
+                .to_string()
+                .contains("requires a session directory")
+        );
+        let missing_config = parse_command_args(
+            [
+                OsString::from("retranscribe"),
+                OsString::from("recordings/session-123"),
+            ]
+            .into_iter(),
+        )
+        .unwrap_err();
+        assert!(
+            missing_config
+                .to_string()
+                .contains("requires a config path")
+        );
+        let extra = parse_command_args(
+            [
+                OsString::from("retranscribe"),
+                OsString::from("recordings/session-123"),
+                OsString::from("echoscribe.toml"),
+                OsString::from("extra"),
+            ]
+            .into_iter(),
+        )
+        .unwrap_err();
+        assert!(extra.to_string().contains("unexpected argument"));
+    }
+
+    #[test]
+    fn set_transcription_policy_parses_strict_boolean() {
+        let command = parse_command_args(
+            [
+                OsString::from("set-transcription-policy"),
+                OsString::from("recordings/session-123"),
+                OsString::from("854446496798736405"),
+                OsString::from("false"),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        let Command::SetTranscriptionPolicy {
+            discord_user_id,
+            transcribe,
+            ..
+        } = command
+        else {
+            panic!("expected set-transcription-policy command");
+        };
+        assert_eq!(discord_user_id, 854446496798736405);
+        assert!(!transcribe);
+
+        let invalid = parse_command_args(
+            [
+                OsString::from("set-transcription-policy"),
+                OsString::from("recordings/session-123"),
+                OsString::from("854446496798736405"),
+                OsString::from("no"),
+            ]
+            .into_iter(),
+        )
+        .unwrap_err();
+        assert!(invalid.to_string().contains("true or false"));
     }
 
     #[test]

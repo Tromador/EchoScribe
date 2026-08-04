@@ -735,6 +735,61 @@ Normal operation requires one invocation, and all failure paths remain explicitl
 
 ---
 
+## Accepted correction — atomic completed-session retranscription
+
+### Intended result
+
+Replace a healthy completed transcript using current segmentation,
+participant-admission and Whisper settings without risking the existing
+complete authority.
+
+### Route
+
+- add `retranscribe <session> <config>` with strict two-path parsing and no
+  Discord connection;
+- acquire the shared session-operation lease before loading session authority;
+- require and validate a healthy complete format-5 or format-6 session;
+- rebuild work items from authoritative playout evidence using current
+  `merge_gap_ms` and the immutable session-local participant snapshot;
+- add participant `transcribe`, defaulting and materialising to `true`;
+- exclude false participants before work-item sequencing and ID allocation
+  without changing recording evidence or routine tracks;
+- run the normal production worker from sequence 1 against staged generation
+  paths using current transcription settings;
+- require one exact staged result per staged work item and render the readable
+  transcript from those validated results;
+- introduce complete-only session format 6, whose work-item, result and
+  readable-transcript references share one retranscription generation;
+- publish the replacement set through one atomic `session.json` switch only
+  after the complete generation is synchronised and validated;
+- retain the old complete authority and `complete` state on every failure;
+- add explicit leased `set-transcription-policy` migration for changing only
+  one historical snapshot Boolean without rereading mutable role, character or
+  identity data.
+
+### Required checks
+
+- CLI exact-argument parsing;
+- complete-state refusal without mutation;
+- participant default, explicit false and older-snapshot compatibility;
+- exclusion before contiguous sequencing with retained included provenance;
+- fresh sequence-1 worker invocation and staged output paths;
+- exact successful format-6 generation publication;
+- worker, staged-integrity and session-publication failures preserving prior
+  complete authority;
+- operation-lease exclusion;
+- repeated safe deterministic regeneration.
+
+### Non-goals
+
+- no recording, merge, VAD, lexical qualification or prompted-decode changes;
+- no continuation or recovery semantics;
+- no mutable participant-source reread during work generation;
+- no result, work-item or participant snapshot format bump;
+- no deletion of prior complete transcription generations.
+
+---
+
 ## Accepted correction — post-recording speech-presence gate
 
 ### Intended result
