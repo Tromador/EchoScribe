@@ -14,3 +14,6 @@ serenity = { version = "0.12.5", default-features = false, features = ["gateway"
 songbird = { version = "0.6.0", default-features = false, features = ["driver", "gateway", "receive", "rustls", "serenity", "tungstenite"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "1.1.3"
+
+[profile.release]
+strip = true
