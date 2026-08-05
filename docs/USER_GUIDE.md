@@ -94,7 +94,16 @@ py -m venv .venv
 python -m pip install -r requirements.txt
 ```
 
-The installed runtime includes faster-whisper, CTranslate2, and SoundFile.
+The installed runtime includes faster-whisper, CTranslate2, SoundFile, and the
+Hugging Face Hub client. The Hub client supplies the `hf` command; it is an
+indirect faster-whisper dependency rather than a separate EchoScribe
+requirement. Confirm that it is available after activating the virtual
+environment with:
+
+```sh
+hf version
+```
+
 SoundFile extracts each bounded FLAC range supplied to Whisper; it is not an
 alternative recorder. The same environment runs the optional diagnostic replay
 helper described in section 10.15.
@@ -107,7 +116,15 @@ runtime.
 
 The public model is downloaded into the normal Hugging Face cache when
 faster-whisper first needs it, unless it is already cached. A Hugging Face login
-is not normally required for the public model used by the example.
+is not normally required for the public model used by the example. To fetch the
+example's `large-v3` model before the first transcription, use:
+
+```sh
+hf download Systran/faster-whisper-large-v3
+```
+
+This populates the same cache used by faster-whisper. See Appendix A for model
+selection, download-size checks, and alternative model names.
 
 ### 3.4 Choosing the Python interpreter
 
@@ -973,3 +990,78 @@ invoked by the current Rust application.
 See the legacy directory's own README and detailed pipeline document for its
 operation. Do not install or invoke legacy requirements as part of the current
 workflow.
+
+## Appendix A. Faster Whisper models
+
+### Choosing a model
+
+The example configuration uses `large-v3`. It is a sound starting point when
+the available GPU and acceptable processing time can accommodate it. Smaller
+models require fewer resources and generally run faster, but transcription
+accuracy may fall. The practical result depends on the language, recording,
+hardware, and CTranslate2 compute type, so test alternatives against
+representative EchoScribe recordings before adopting one.
+
+Common faster-whisper model names include:
+
+| `transcription.model` | Intended use |
+|---|---|
+| `large-v3` | Full multilingual model and the EchoScribe example setting. |
+| `medium`, `small`, `base`, `tiny` | Progressively smaller multilingual models. |
+| `medium.en`, `small.en`, `base.en`, `tiny.en` | English-only variants; the benefit is greatest for the smallest models. |
+| `turbo` | Faster large-v3-derived model with a possible accuracy trade-off. |
+| `distil-large-v3` | Faster distilled English model; evaluate it as a different model rather than assuming identical output. |
+
+The [Faster Whisper project](https://github.com/SYSTRAN/faster-whisper#usage)
+documents the model names it supports and its own performance measurements.
+The [OpenAI Whisper model table](https://github.com/openai/whisper#available-models-and-languages)
+gives the underlying model families, approximate scale, language coverage, and
+relative speed. Its memory figures describe OpenAI Whisper rather than
+CTranslate2, so use them as model-selection guidance rather than an exact
+EchoScribe hardware requirement.
+
+`transcription.model` may also name a Hugging Face repository containing a
+CTranslate2-converted Whisper model, or a local converted-model directory.
+An arbitrary original Transformers checkpoint is not necessarily directly
+loadable by faster-whisper; see its
+[model-conversion guidance](https://github.com/SYSTRAN/faster-whisper#model-conversion).
+
+### Downloading the example model
+
+Activate EchoScribe's virtual environment first. Installing the pinned Python
+requirements installs `huggingface-hub`, which provides `hf`:
+
+```sh
+hf version
+```
+
+Faster-whisper downloads a recognised model name automatically on first use.
+For the example configuration, it maps `large-v3` to the public
+`Systran/faster-whisper-large-v3` repository. Pre-download it with:
+
+```sh
+hf download Systran/faster-whisper-large-v3
+```
+
+The command downloads the repository into the normal Hugging Face cache and
+prints the cached snapshot path. Repeating it reuses files already present.
+Authentication is not normally required for this public repository.
+
+To inspect the transfer without downloading anything, including the amount not
+already cached, use:
+
+```sh
+hf download Systran/faster-whisper-large-v3 --dry-run
+```
+
+To inspect or verify the cache later, use:
+
+```sh
+hf cache ls
+hf cache verify Systran/faster-whisper-large-v3
+```
+
+The [Hugging Face CLI guide](https://huggingface.co/docs/huggingface_hub/en/guides/cli)
+documents download, authentication, cache-location, and cache-management
+options. Avoid copying cached snapshot files by hand: the cache is
+version-aware and should be managed through faster-whisper or `hf`.
