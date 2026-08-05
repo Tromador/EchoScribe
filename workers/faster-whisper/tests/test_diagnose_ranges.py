@@ -190,7 +190,7 @@ vocabulary_file = "vocabulary.txt"
         self.assertEqual([entry[1] for entry in observed], [400, 0])
         self.assertTrue(all(entry[0] is audio for entry in observed))
 
-    def test_empty_unpadded_vad_result_does_not_invoke_fourth_decode(self):
+    def test_empty_unpadded_vad_result_skips_only_explicit_trim_decode(self):
         model = FakeModel()
 
         results = diagnose.run_decode_configurations(
@@ -208,7 +208,33 @@ vocabulary_file = "vocabulary.txt"
             clock=FakeClock(),
         )
 
-        self.assertEqual(len(model.calls), 3)
+        self.assertEqual(len(model.calls), 4)
+        self.assertEqual(
+            model.calls[3][0],
+            self.root / "range.wav",
+        )
+        self.assertEqual(
+            list(results),
+            [
+                diagnose.CURRENT_DECODE,
+                diagnose.NO_HOTWORD_DECODE,
+                diagnose.CRAIG_LIKE_DECODE,
+                diagnose.INTERNAL_VAD_NO_HOTWORD_DECODE,
+                diagnose.EXPLICIT_TRIM_DECODE,
+            ],
+        )
+        internal_vad_no_hotwords = results[
+            diagnose.INTERNAL_VAD_NO_HOTWORD_DECODE
+        ]
+        self.assertTrue(internal_vad_no_hotwords["whisper_invoked"])
+        self.assertEqual(
+            internal_vad_no_hotwords["configured_hotwords"],
+            {"enabled": False, "phrases": []},
+        )
+        self.assertTrue(internal_vad_no_hotwords["internal_vad_enabled"])
+        self.assertTrue(
+            internal_vad_no_hotwords["word_timestamps_enabled"]
+        )
         trimmed = results[diagnose.EXPLICIT_TRIM_DECODE]
         self.assertFalse(trimmed["whisper_invoked"])
         self.assertEqual(trimmed["text"], "")
@@ -271,14 +297,43 @@ vocabulary_file = "vocabulary.txt"
             model.calls[3][1],
             {
                 **expected_base,
+                "hotwords": None,
+                "vad_filter": True,
+                "word_timestamps": True,
+            },
+        )
+        self.assertEqual(
+            model.calls[4][1],
+            {
+                **expected_base,
                 "hotwords": "Emperor Coaltongue, Agent #7",
                 "vad_filter": False,
             },
         )
+        self.assertEqual(len(model.calls), 5)
+        self.assertTrue(
+            all(
+                call[0] == self.root / "range.wav"
+                for call in model.calls[:4]
+            )
+        )
+        self.assertEqual(model.calls[4][0], self.root / "trimmed.wav")
         self.assertEqual(len(materialised), 1)
         self.assertTrue(
             results[diagnose.CRAIG_LIKE_DECODE]["word_timestamps_enabled"]
         )
+        internal_vad_no_hotwords = results[
+            diagnose.INTERNAL_VAD_NO_HOTWORD_DECODE
+        ]
+        self.assertEqual(
+            internal_vad_no_hotwords["configured_hotwords"],
+            {"enabled": False, "phrases": []},
+        )
+        self.assertTrue(internal_vad_no_hotwords["internal_vad_enabled"])
+        self.assertTrue(
+            internal_vad_no_hotwords["word_timestamps_enabled"]
+        )
+        self.assertTrue(internal_vad_no_hotwords["whisper_invoked"])
         self.assertEqual(
             results[diagnose.EXPLICIT_TRIM_DECODE]["retained_source_spans"][0][
                 "source_start_ms"
@@ -370,7 +425,7 @@ vocabulary_file = "vocabulary.txt"
             [entry["work_item"]["sequence"] for entry in evidence],
             [2, 1],
         )
-        self.assertEqual(len(model.calls), 7)
+        self.assertEqual(len(model.calls), 9)
         self.assertEqual(len(context_paths), 3)
         self.assertTrue(all(not path.exists() for path in cleaned_paths))
         records = [
@@ -381,6 +436,15 @@ vocabulary_file = "vocabulary.txt"
             [record["work_item"]["sequence"] for record in records],
             [2, 1],
         )
+        expected_decodes = [
+            diagnose.CURRENT_DECODE,
+            diagnose.NO_HOTWORD_DECODE,
+            diagnose.CRAIG_LIKE_DECODE,
+            diagnose.INTERNAL_VAD_NO_HOTWORD_DECODE,
+            diagnose.EXPLICIT_TRIM_DECODE,
+        ]
+        for record in records:
+            self.assertEqual(list(record["decode_results"]), expected_decodes)
 
     def test_jsonl_contains_one_object_per_work_item(self):
         output = self.root / "evidence.jsonl"

@@ -23,6 +23,7 @@ FRAME_RMS_MILLISECONDS = 20
 CURRENT_DECODE = "current_echoscribe"
 NO_HOTWORD_DECODE = "no_hotword_control"
 CRAIG_LIKE_DECODE = "craig_like_internal_vad"
+INTERNAL_VAD_NO_HOTWORD_DECODE = "internal_vad_no_hotwords"
 EXPLICIT_TRIM_DECODE = "explicit_silero_trimmed"
 
 
@@ -584,6 +585,12 @@ def run_decode_configurations(
         internal_vad=True,
         word_timestamps=True,
     )
+    internal_vad_no_hotword_options = transcribe_options(
+        settings,
+        None,
+        internal_vad=True,
+        word_timestamps=True,
+    )
     results = {
         CURRENT_DECODE: decode_result(
             model,
@@ -611,6 +618,16 @@ def run_decode_configurations(
             craig_like_options,
             settings,
             True,
+            full_duration_seconds,
+            [],
+            clock,
+        ),
+        INTERNAL_VAD_NO_HOTWORD_DECODE: decode_result(
+            model,
+            ranged_audio,
+            internal_vad_no_hotword_options,
+            settings,
+            False,
             full_duration_seconds,
             [],
             clock,
