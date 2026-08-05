@@ -687,6 +687,24 @@ class TranscriptionWorkerTests(unittest.TestCase):
         self.assertEqual(result["role"], "chair")
         self.assertNotIn("character", result)
 
+    def test_current_speaker_must_match_retained_name_provenance(self):
+        item = make_current_item(
+            1,
+            11,
+            "Tromador",
+            "Stefan",
+            "Entirely Different Person",
+            "chair",
+            0,
+            500,
+        )
+        write_manifest(self.manifest, [item])
+
+        with self.assertRaisesRegex(
+            ValueError, "invalid work item sequence 1"
+        ):
+            worker.load_manifest(self.manifest)
+
 
 def make_item(sequence, user_id, speaker, start_ms, end_ms, character):
     return {

@@ -258,6 +258,7 @@ Current independent versions are:
 - routine track manifest: 2, with format 1 still readable;
 - work-item records: 2, with format 1 still readable;
 - transcription result records: 2, with format 1 still readable;
+- readable transcript: 2, with format 1 still readable;
 - event journal: 2, with event format 1 still readable;
 - packet and playout versions declared by their owning modules.
 
@@ -753,12 +754,19 @@ new progress permits one new calculation.
 After zero worker exit, Rust requires one exact completed result for every work
 item, deterministically rebuilds partial text from JSONL, atomically renames it
 to `transcription/transcript.txt`, synchronises the directory, and transitions
-to `complete` while retaining the lease. Readable text always begins with a
-participant roster derived from unique work-manifest participants in order of
-first appearance. Each entry shows observed Discord name, configured/effective
-name, and role before the timestamped transcript body. A historical format-1
-`character` is presented as the roster name while its transcript-line
+to `complete` while retaining the lease. Current transcript format 2 begins
+with a participant roster derived from unique work-manifest participants in
+order of first appearance. Each entry shows observed Discord name,
+configured/effective name, and role before the timestamped transcript body. A
+historical format-1 `character` is presented as the roster name when a
+replacement format-2 transcript is produced, while its transcript-line
 attribution remains Discord-based.
+
+Transcript format 1 remains the historical timestamped-line grammar. Format 2
+is the roster-bearing grammar. Format-6 sessions declare either explicitly;
+format-5 sessions infer it from the matching work/result metadata generation.
+Validation and `rebuild-transcript` render only the declared grammar. The
+line-only compatibility path is therefore confined to transcript format 1.
 
 `rebuild-transcript` validates only complete work and result authority. It
 deliberately does not return to recording journals, participant snapshots,

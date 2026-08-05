@@ -398,6 +398,10 @@ mod tests {
         assert_eq!(items[0].discord_user_id, "11");
         assert_eq!(items[0].sequence, 1);
         assert_eq!(
+            session.record().files.transcript.as_ref().unwrap().format,
+            crate::artifacts::TRANSCRIPT_FORMAT_VERSION
+        );
+        assert_eq!(
             fs::read_to_string(directory.join(transcript_path)).unwrap(),
             "Participants:\n- Discord: Alice | Name: Included | Role: gm\n\n\
              Transcript:\n[00:00:00] Alice: replacement 1\n"
@@ -575,6 +579,52 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[test]
+    fn current_transcript_descriptor_rejects_legacy_line_only_text() {
+        let (directory, config_path) = complete_fixture("current-rejects-legacy-text");
+        run_with_transcriber(&directory, &config_path, &FakeTranscriber::succeeding()).unwrap();
+        let session = SessionStore::load(&directory).unwrap();
+        let transcript_path =
+            directory.join(&session.record().files.transcript.as_ref().unwrap().path);
+        fs::write(&transcript_path, b"[00:00:00] Alice: replacement 1\n").unwrap();
+
+        let error =
+            validate_complete_transcription_authority(&directory, session.record()).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not match structured result authority")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn legacy_transcript_descriptor_validates_and_rebuilds_line_only_text() {
+        let (directory, config_path) = complete_fixture("legacy-transcript-description");
+        run_with_transcriber(&directory, &config_path, &FakeTranscriber::succeeding()).unwrap();
+        let mut record = SessionStore::load(&directory).unwrap().record().clone();
+        record.files.transcript.as_mut().unwrap().format =
+            crate::artifacts::LEGACY_TRANSCRIPT_FORMAT_VERSION;
+        fs::write(
+            directory.join("session.json"),
+            serde_json::to_vec_pretty(&record).unwrap(),
+        )
+        .unwrap();
+        let transcript_path = directory.join(&record.files.transcript.as_ref().unwrap().path);
+        fs::write(&transcript_path, b"[00:00:00] Alice: replacement 1\n").unwrap();
+        let session = SessionStore::load(&directory).unwrap();
+        validate_complete_transcription_authority(&directory, session.record()).unwrap();
+
+        crate::transcription::rebuild_transcript(&directory).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(transcript_path).unwrap(),
+            "[00:00:00] Alice: replacement 1\n"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     fn complete_fixture(label: &str) -> (PathBuf, PathBuf) {
         let directory = test_directory(label);
         let participant_source = directory.join("source-participants.toml");
@@ -687,10 +737,9 @@ mod tests {
         }
         results_file.sync_all().unwrap();
         session.publish_transcription_start(3_100).unwrap();
-        write_replacement_transcript(
-            &directory.join(FINAL_TRANSCRIPT_PATH),
-            &old_items,
-            &old_results,
+        fs::write(
+            directory.join(FINAL_TRANSCRIPT_PATH),
+            b"[00:00:00] Alice: old transcript\n",
         )
         .unwrap();
         session.publish_transcription_complete(3_200).unwrap();

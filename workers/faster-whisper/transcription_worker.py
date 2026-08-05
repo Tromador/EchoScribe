@@ -165,6 +165,10 @@ def validate_work_item(item, expected_sequence):
             and bool(item["role"].strip())
             and "\n" not in item["role"]
             and "\r" not in item["role"]
+            and (
+                item["speaker"] == item["discord_name"]
+                or item["speaker"] == item["name"]
+            )
         )
     if (
         not metadata_valid

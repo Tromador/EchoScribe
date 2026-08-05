@@ -444,8 +444,8 @@ want to retain recording-recovery capability.
 
 ## 8. Transcript output
 
-The readable transcript begins with a participant roster, followed by one
-completed work item per line:
+The current format-2 readable transcript begins with a participant roster,
+followed by one completed work item per line:
 
 ```text
 Participants:
@@ -455,14 +455,17 @@ Transcript:
 [00:09:26] Tromador: What were you saying? I completely missed it.
 ```
 
-The roster lists transcribed participants in order of first appearance. It is
-always present and shows the observed Discord name, the configured name (or the
-Discord name as fallback), and the role. Participants excluded from
-transcription have no work items and therefore do not appear in the roster.
-Older completed transcripts remain valid without a roster; rebuilding or
-retranscribing them writes the current roster form. For historical version-1
-work items, the old `character` value is shown in the roster's `Name` column
-without changing Discord-based line attribution.
+The roster lists transcribed participants in order of first appearance and
+shows the observed Discord name, the configured name (or the Discord name as
+fallback), and the role. Participants excluded from transcription have no work
+items and therefore do not appear in the roster.
+
+Historical format-1 transcripts remain valid as timestamped lines without a
+roster. `rebuild-transcript` preserves the grammar declared by session
+authority, so rebuilding format 1 remains line-only. A successful replacement
+retranscription publishes format 2 with the roster. When that replacement uses
+historical format-1 work items, the old `character` value appears in the
+roster's `Name` column without changing Discord-based line attribution.
 
 Lines are ordered by session-relative start time. Overlapping speakers remain
 separate lines. The text view omits SSRCs, confidence scores, word-level timing,

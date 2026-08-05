@@ -484,6 +484,28 @@ vocabulary_file = "vocabulary.txt"
         with self.assertRaisesRegex(ValueError, "unexpected schema"):
             diagnose.load_session_manifest(self.session)
 
+    def test_format_two_session_and_work_item_are_supported(self):
+        item = make_current_item(
+            1,
+            11,
+            "Tromador",
+            "Stefan",
+            "Stefan",
+            "speaker",
+            0,
+            1_000,
+        )
+        write_manifest(self.manifest, [item])
+        write_session(self.session, manifest_format=2)
+
+        items = diagnose.load_session_manifest(self.session)
+
+        self.assertEqual(items, [item])
+
+        write_manifest(self.manifest, [self.items[0]])
+        with self.assertRaisesRegex(ValueError, "session-declared format"):
+            diagnose.load_session_manifest(self.session)
+
     def test_vocabulary_matches_production_missing_and_empty_behaviour(self):
         missing_hotwords, missing_warning = diagnose.load_vocabulary(
             self.root / "missing.txt"
@@ -528,6 +550,27 @@ def make_item(sequence, user_id, speaker, start_ms, end_ms):
     }
 
 
+def make_current_item(
+    sequence, user_id, discord_name, name, speaker, role, start_ms, end_ms
+):
+    return {
+        "format": 2,
+        "id": f"session-test:{sequence:06d}",
+        "session_id": "session-test",
+        "sequence": sequence,
+        "discord_user_id": str(user_id),
+        "discord_name": discord_name,
+        "name": name,
+        "speaker": speaker,
+        "role": role,
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        "source": f"tracks/user-{user_id}.flac",
+        "source_start_ms": start_ms,
+        "source_end_ms": end_ms,
+    }
+
+
 def write_manifest(path, items):
     path.write_text(
         "".join(json.dumps(item) + "\n" for item in items),
@@ -535,14 +578,14 @@ def write_manifest(path, items):
     )
 
 
-def write_session(path):
+def write_session(path, manifest_format=1):
     (path / "session.json").write_text(
         json.dumps(
             {
                 "files": {
                     "work_items": {
                         "path": "transcription/work-items.jsonl",
-                        "format": 1,
+                        "format": manifest_format,
                     }
                 }
             }

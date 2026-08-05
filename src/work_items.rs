@@ -730,6 +730,8 @@ fn validate_work_item(item: &WorkItem) -> Result<()> {
                 && !item.role.trim().is_empty()
                 && !item.role.contains(['\n', '\r'])
                 && item.character.is_none()
+                && (item.speaker == item.discord_name
+                    || item.name.as_deref() == Some(item.speaker.as_str()))
         }
         _ => false,
     };
@@ -1128,6 +1130,10 @@ mod tests {
         assert_eq!(value["discord_name"], "Tromador");
         assert_eq!(value["name"], "Stefan");
         assert!(value.get("character").is_none());
+
+        let mut inconsistent = item.clone();
+        inconsistent.speaker = "Entirely Different Person".to_owned();
+        assert!(validate_work_item(&inconsistent).is_err());
     }
 
     #[test]

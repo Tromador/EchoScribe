@@ -16,7 +16,10 @@ import transcription_worker as production_worker
 
 SESSION_FILE_NAME = "session.json"
 SUPPORTED_CONFIG_VERSION = 1
-SUPPORTED_WORK_MANIFEST_FORMAT = 1
+SUPPORTED_WORK_MANIFEST_FORMATS = {
+    production_worker.LEGACY_WORK_ITEM_FORMAT,
+    production_worker.WORK_ITEM_FORMAT,
+}
 VAD_SAMPLE_RATE = 16_000
 FRAME_RMS_MILLISECONDS = 20
 
@@ -152,7 +155,7 @@ def load_session_manifest(session_directory):
     if (
         not isinstance(manifest_value, str)
         or not manifest_value
-        or manifest_format != SUPPORTED_WORK_MANIFEST_FORMAT
+        or manifest_format not in SUPPORTED_WORK_MANIFEST_FORMATS
     ):
         raise ValueError("session work-manifest description is malformed")
 
@@ -171,6 +174,10 @@ def load_session_manifest(session_directory):
         raise ValueError(
             f"failed to read work manifest {manifest_path}: {error}"
         ) from error
+    if any(item["format"] != manifest_format for item in items):
+        raise ValueError(
+            "work manifest records do not match the session-declared format"
+        )
     return items
 
 

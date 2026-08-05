@@ -21,10 +21,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     artifacts::{
-        FINAL_TRANSCRIPT_PATH, LEGACY_TRANSCRIPTION_RESULT_FORMAT_VERSION,
-        LEGACY_WORK_ITEM_MANIFEST_FORMAT_VERSION, PARTIAL_TRANSCRIPT_FILE_NAME,
-        TRANSCRIPTION_DIRECTORY_NAME, TRANSCRIPTION_RESULTS_FILE_NAME,
-        WORK_ITEM_MANIFEST_FORMAT_VERSION,
+        FINAL_TRANSCRIPT_PATH, LEGACY_TRANSCRIPT_FORMAT_VERSION,
+        LEGACY_TRANSCRIPTION_RESULT_FORMAT_VERSION, LEGACY_WORK_ITEM_MANIFEST_FORMAT_VERSION,
+        PARTIAL_TRANSCRIPT_FILE_NAME, TRANSCRIPT_FORMAT_VERSION, TRANSCRIPTION_DIRECTORY_NAME,
+        TRANSCRIPTION_RESULTS_FILE_NAME, WORK_ITEM_MANIFEST_FORMAT_VERSION,
     },
     config::OfflineTranscriptionConfig,
     operation_lease::SessionOperationLease,
@@ -404,9 +404,8 @@ pub(crate) fn validate_complete_transcription_authority(
             transcript_path.display()
         )
     })?;
-    if actual != transcript_bytes(&work_items, &results)
-        && actual != legacy_transcript_bytes(&results)
-    {
+    let transcript_format = declared_transcript_format(record)?;
+    if actual != transcript_bytes(transcript_format, &work_items, &results)? {
         bail!(
             "completed transcript {} does not match structured result authority",
             transcript_path.display()
@@ -448,7 +447,12 @@ fn run_replacement_worker_with_process(
     worker: &dyn WorkerProcess,
 ) -> Result<Vec<TranscriptionResult>> {
     prepare_empty_file(results_path)?;
-    write_transcript_file_atomically(partial_transcript_path, work_items, &[])?;
+    write_transcript_file_atomically(
+        partial_transcript_path,
+        TRANSCRIPT_FORMAT_VERSION,
+        work_items,
+        &[],
+    )?;
     let invocation = WorkerInvocation {
         config_path: &prepared.config_path,
         session_directory,
@@ -487,13 +491,30 @@ pub(crate) fn write_replacement_transcript(
     work_items: &[WorkItem],
     results: &[TranscriptionResult],
 ) -> Result<()> {
-    write_transcript_file_atomically(path, work_items, results)
+    write_transcript_file_atomically(path, TRANSCRIPT_FORMAT_VERSION, work_items, results)
 }
 
 fn completed_transcript_path(session_directory: &Path, record: &SessionRecord) -> PathBuf {
     match record.files.transcript.as_ref() {
         Some(description) => session_directory.join(&description.path),
         None => session_directory.join(FINAL_TRANSCRIPT_PATH),
+    }
+}
+
+fn declared_transcript_format(record: &SessionRecord) -> Result<u16> {
+    if let Some(description) = &record.files.transcript {
+        return Ok(description.format);
+    }
+    let work_format = record
+        .files
+        .work_items
+        .as_ref()
+        .ok_or_else(|| anyhow!("session does not declare a work manifest"))?
+        .format;
+    match work_format {
+        LEGACY_WORK_ITEM_MANIFEST_FORMAT_VERSION => Ok(LEGACY_TRANSCRIPT_FORMAT_VERSION),
+        WORK_ITEM_MANIFEST_FORMAT_VERSION => Ok(TRANSCRIPT_FORMAT_VERSION),
+        _ => bail!("unsupported work manifest format {work_format}"),
     }
 }
 
@@ -568,7 +589,12 @@ fn rebuild_transcript_with_lease(
     }
 
     let final_path = completed_transcript_path(session_directory, session.record());
-    write_transcript_file_atomically(&final_path, &work_items, &committed)?;
+    write_transcript_file_atomically(
+        &final_path,
+        declared_transcript_format(session.record())?,
+        &work_items,
+        &committed,
+    )?;
     println!(
         "Rebuilt final transcript for session {} at {}.",
         session.record().session_id,
@@ -659,7 +685,13 @@ fn run_prepared_with_worker(
         );
         let committed = validate_and_repair_result_prefix(&results_path, &work_items)?;
         let transcript_path = session_directory.join(PARTIAL_TRANSCRIPT_FILE_NAME);
-        rebuild_partial_transcript(session_directory, &transcript_path, &work_items, &committed)?;
+        rebuild_partial_transcript(
+            session_directory,
+            &transcript_path,
+            declared_transcript_format(session.record())?,
+            &work_items,
+            &committed,
+        )?;
         let next_sequence = u64::try_from(committed.len())
             .ok()
             .and_then(|value| value.checked_add(1))
@@ -794,6 +826,7 @@ fn continue_prepared_with_worker(
         rebuild_partial_transcript(
             session_directory,
             &transcript_path,
+            declared_transcript_format(session.record())?,
             &work_items,
             &retained,
         )?;
@@ -902,7 +935,13 @@ fn run_worker_attempt(
         );
     }
 
-    rebuild_partial_transcript(session_directory, transcript_path, work_items, &committed)?;
+    rebuild_partial_transcript(
+        session_directory,
+        transcript_path,
+        declared_transcript_format(session.record())?,
+        work_items,
+        &committed,
+    )?;
     publish_final_transcript(session_directory, transcript_path)?;
     session
         .publish_transcription_complete(unix_millis_now()?)
@@ -1336,6 +1375,8 @@ fn validate_work_item_for_session(
                 && !item.role.trim().is_empty()
                 && !item.role.contains(['\n', '\r'])
                 && item.character.is_none()
+                && (item.speaker == item.discord_name
+                    || item.name.as_deref() == Some(item.speaker.as_str()))
         }
         _ => false,
     };
@@ -1667,6 +1708,7 @@ fn validate_result_matches_work_item(result: &TranscriptionResult, item: &WorkIt
 fn rebuild_partial_transcript(
     session_directory: &Path,
     path: &Path,
+    transcript_format: u16,
     work_items: &[WorkItem],
     results: &[TranscriptionResult],
 ) -> Result<()> {
@@ -1678,7 +1720,7 @@ fn rebuild_partial_transcript(
         .open(&temporary_path)
         .with_context(|| format!("failed to create {}", temporary_path.display()))?;
     let mut writer = BufWriter::new(file);
-    writer.write_all(&transcript_bytes(work_items, results))?;
+    writer.write_all(&transcript_bytes(transcript_format, work_items, results)?)?;
     writer.flush()?;
     writer.get_ref().sync_all()?;
     drop(writer);
@@ -1692,6 +1734,7 @@ fn rebuild_partial_transcript(
 
 fn write_transcript_file_atomically(
     path: &Path,
+    transcript_format: u16,
     work_items: &[WorkItem],
     results: &[TranscriptionResult],
 ) -> Result<()> {
@@ -1712,7 +1755,7 @@ fn write_transcript_file_atomically(
         .open(&temporary_path)
         .with_context(|| format!("failed to create {}", temporary_path.display()))?;
     let mut writer = BufWriter::new(file);
-    writer.write_all(&transcript_bytes(work_items, results))?;
+    writer.write_all(&transcript_bytes(transcript_format, work_items, results)?)?;
     writer.flush()?;
     writer.get_ref().sync_all()?;
     drop(writer);
@@ -1722,7 +1765,19 @@ fn write_transcript_file_atomically(
     Ok(())
 }
 
-fn transcript_bytes(work_items: &[WorkItem], results: &[TranscriptionResult]) -> Vec<u8> {
+fn transcript_bytes(
+    transcript_format: u16,
+    work_items: &[WorkItem],
+    results: &[TranscriptionResult],
+) -> Result<Vec<u8>> {
+    match transcript_format {
+        LEGACY_TRANSCRIPT_FORMAT_VERSION => Ok(legacy_transcript_bytes(results)),
+        TRANSCRIPT_FORMAT_VERSION => Ok(roster_transcript_bytes(work_items, results)),
+        _ => bail!("unsupported transcript format {transcript_format}"),
+    }
+}
+
+fn roster_transcript_bytes(work_items: &[WorkItem], results: &[TranscriptionResult]) -> Vec<u8> {
     let mut transcript = String::from("Participants:\n");
     let mut seen = std::collections::HashSet::new();
     for item in work_items {
@@ -2359,8 +2414,7 @@ mod tests {
 
         assert_eq!(
             fs::read_to_string(&final_path).unwrap(),
-            "Participants:\n- Discord: Alice | Name: Alice | Role: player\n\n\
-             Transcript:\n[00:00:00] Alice: Result 1\n"
+            "[00:00:00] Alice: Result 1\n"
         );
         assert_eq!(fs::read(&results_path).unwrap(), results_before);
         assert_eq!(
@@ -2418,8 +2472,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(directory.join(FINAL_TRANSCRIPT_PATH)).unwrap(),
-            "Participants:\n- Discord: Alice | Name: Alice | Role: player\n\n\
-             Transcript:\n[00:00:00] Alice: All conversation stays here.\n"
+            "[00:00:00] Alice: All conversation stays here.\n"
         );
         let invocations = worker.invocations.lock().unwrap();
         assert_eq!(invocations.len(), 1);
@@ -3110,8 +3163,7 @@ mod tests {
         assert_eq!(worker.invocations.lock().unwrap()[0].next_sequence, 2);
         assert_eq!(
             fs::read_to_string(directory.join(FINAL_TRANSCRIPT_PATH)).unwrap(),
-            "Participants:\n- Discord: Alice | Name: Alice | Role: player\n\n\
-             Transcript:\n[00:00:00] Alice: Result 1\n\
+            "[00:00:00] Alice: Result 1\n\
              [00:00:20] Alice: Result 2\n\
              [00:00:40] Alice: Result 3\n"
         );
@@ -3244,16 +3296,29 @@ mod tests {
         ];
         let items = [test_item(1, 0, 10_000), test_item(2, 65_000, 70_000)];
 
-        rebuild_partial_transcript(&directory, &path, &items, &results).unwrap();
+        rebuild_partial_transcript(
+            &directory,
+            &path,
+            LEGACY_TRANSCRIPT_FORMAT_VERSION,
+            &items,
+            &results,
+        )
+        .unwrap();
         let first = fs::read(&path).unwrap();
         fs::write(&path, b"stale\n").unwrap();
-        rebuild_partial_transcript(&directory, &path, &items, &results).unwrap();
+        rebuild_partial_transcript(
+            &directory,
+            &path,
+            LEGACY_TRANSCRIPT_FORMAT_VERSION,
+            &items,
+            &results,
+        )
+        .unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), first);
         assert_eq!(
             String::from_utf8(first).unwrap(),
-            "Participants:\n- Discord: Alice | Name: Alice | Role: player\n\n\
-             Transcript:\n[00:00:00] Alice: First\n[00:01:05] Alice: Second\n"
+            "[00:00:00] Alice: First\n[00:01:05] Alice: Second\n"
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -3271,12 +3336,23 @@ mod tests {
         ];
         validate_result_matches_work_item(&results[0], &first_item).unwrap();
         let items = [first_item, second_item];
-        rebuild_partial_transcript(&directory, &partial_path, &items, &results).unwrap();
-        write_transcript_file_atomically(&directory.join(FINAL_TRANSCRIPT_PATH), &items, &results)
-            .unwrap();
+        rebuild_partial_transcript(
+            &directory,
+            &partial_path,
+            LEGACY_TRANSCRIPT_FORMAT_VERSION,
+            &items,
+            &results,
+        )
+        .unwrap();
+        write_transcript_file_atomically(
+            &directory.join(FINAL_TRANSCRIPT_PATH),
+            LEGACY_TRANSCRIPT_FORMAT_VERSION,
+            &items,
+            &results,
+        )
+        .unwrap();
 
-        let expected = "Participants:\n- Discord: Alice | Name: Alice | Role: player\n\n\
-                        Transcript:\n[00:00:10] Alice: Spoken text\n";
+        let expected = "[00:00:10] Alice: Spoken text\n";
         assert_eq!(fs::read_to_string(&partial_path).unwrap(), expected);
         assert_eq!(
             fs::read_to_string(directory.join(FINAL_TRANSCRIPT_PATH)).unwrap(),
@@ -3314,7 +3390,10 @@ mod tests {
         assert_eq!(result_value["name"], "Stefan");
         assert!(result_value.get("character").is_none());
 
-        let transcript = String::from_utf8(transcript_bytes(&items, &results)).unwrap();
+        let transcript = String::from_utf8(
+            transcript_bytes(TRANSCRIPT_FORMAT_VERSION, &items, &results).unwrap(),
+        )
+        .unwrap();
 
         assert_eq!(
             transcript,
@@ -3325,6 +3404,36 @@ mod tests {
              [00:00:00] Tromador: Opening\n\
              [00:00:20] Observer: Question\n"
         );
+    }
+
+    #[test]
+    fn current_work_manifest_rejects_speaker_without_retained_provenance() {
+        let (directory, _, _) = ready_session("invalid-current-speaker");
+        let mut record = SessionStore::load(&directory).unwrap().record().clone();
+        assert_eq!(
+            declared_transcript_format(&record).unwrap(),
+            LEGACY_TRANSCRIPT_FORMAT_VERSION
+        );
+        record.files.work_items.as_mut().unwrap().format = WORK_ITEM_MANIFEST_FORMAT_VERSION;
+        assert_eq!(
+            declared_transcript_format(&record).unwrap(),
+            TRANSCRIPT_FORMAT_VERSION
+        );
+        let mut item = test_item(1, 0, 10_000);
+        item.format = WORK_ITEM_MANIFEST_FORMAT_VERSION;
+        item.discord_name = "Tromador".to_owned();
+        item.name = Some("Stefan".to_owned());
+        item.speaker = "Entirely Different Person".to_owned();
+        item.role = "chair".to_owned();
+
+        let error = validate_work_item_for_session(&item, &record, None).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid or out-of-order work item")
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -3477,6 +3586,7 @@ mod tests {
         rebuild_partial_transcript(
             &directory,
             &directory.join(PARTIAL_TRANSCRIPT_FILE_NAME),
+            LEGACY_TRANSCRIPT_FORMAT_VERSION,
             &items,
             &results,
         )
