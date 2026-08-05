@@ -95,7 +95,7 @@ cargo run --release --manifest-path <root>/Cargo.toml -- <arguments>
 |---|---|
 | `main.rs` | CLI parsing, live Discord lifecycle, handler registration, shutdown, and entry into one-stop orchestration. |
 | `config.rs` | Strict TOML schemas, live configuration, offline stage projections, relative path resolution, and vocabulary parsing. |
-| `participants.rs` | Participant TOML validation, case-insensitive roles, defaults, and canonical session snapshots. |
+| `participants.rs` | Versioned participant TOML validation, attribution policy, defaults, and canonical session snapshots. |
 | `artifacts.rs` | Canonical session artefact names and independent format versions. |
 | `session.rs` | Versioned `session.json`, state transition table, event records, validation, and atomic authority replacement. |
 | `telemetry.rs` | Songbird callback adapter, non-blocking capture submission, and RTP continuity telemetry. |
@@ -105,7 +105,7 @@ cargo run --release --manifest-path <root>/Cargo.toml -- <arguments>
 | `identity.rs` | Bounded SSRC-to-user resolution, display-name fallback, disconnect handling, and terminal continuity poisoning. |
 | `diagnostics.rs` | Optional live and recovered SSRC-keyed WAV writers. |
 | `live_flac.rs` | Bounded downstream encoder stage and one live writer per Discord user. |
-| `track_manifest.rs` | Version-1 routine track manifest validation and atomic publication. |
+| `track_manifest.rs` | Versioned routine track manifest validation and atomic publication. |
 | `flac_tracks.rs` | Older explicit SSRC-keyed offline FLAC export and full-decode verification. |
 | `recover.rs` | Authoritative journal replay, Opus decode/PLC, diagnostic WAV recovery, and legacy export. |
 | `routine_recovery.rs` | User-keyed routine FLAC regeneration, mapping replay, publication, and durable recovery evidence. |
@@ -254,10 +254,10 @@ changes as versioned compatibility decisions, not ordinary struct edits.
 
 Current independent versions are:
 
-- participant snapshot: 1;
-- routine track manifest: 1;
-- work-item records: 1;
-- transcription result records: 1;
+- participant snapshot: 2, with format 1 still readable;
+- routine track manifest: 2, with format 1 still readable;
+- work-item records: 2, with format 1 still readable;
+- transcription result records: 2, with format 1 still readable;
 - event journal: 2, with event format 1 still readable;
 - packet and playout versions declared by their owning modules.
 
@@ -269,16 +269,20 @@ eligible for narrowly defined crash repair.
 ### 7.3 Participant context compatibility
 
 The main configuration references a separate Discord-user-ID-keyed participant
-TOML file. `character` is optional, `role` defaults to `player`, and
-`transcribe` defaults to `true`. Missing participant mappings remain normal
-players who are recorded and transcribed; multiple GMs are valid.
+TOML file. Current format 2 supports an optional `name`, an arbitrary non-empty
+single-line `role` defaulting to `participant`, and `transcribe` defaulting to
+`true`. `transcript_name_source` defaults to `discord`; `name` attribution uses
+the configured name with an observed-Discord-name fallback. Missing mappings
+are therefore ordinary recorded and transcribed participants.
 
 Session creation writes a canonical session-local snapshot and materialises
 those defaults. `session.json` references the snapshot rather than embedding
 participant entries. Later stages use this immutable snapshot, not the mutable
-operator source. Older format-1 snapshots without `transcribe` remain
-compatible as `true`; `set-transcription-policy` is the sole supported route
-for changing that Boolean in historical session authority.
+operator source. Format-1 snapshots retain their historical optional
+`character`, `player`/`gm` role validation, Discord attribution, and
+`transcribe = true` compatibility default. `set-transcription-policy` is the
+sole supported route for changing that Boolean in historical session
+authority; it does not otherwise migrate the snapshot format.
 
 ### 7.4 Workflow states
 
@@ -338,7 +342,9 @@ Bots are ignored. No HTTP member lookup is needed. Display-name preference is:
 3. username;
 4. numeric Discord user ID.
 
-The operator participant file does not override this human speaker name.
+Format-2 participant policy may select a configured name for transcript-line
+attribution. The observed Discord name remains separate provenance in work and
+result authority.
 
 ### 9.2 Songbird evidence
 
@@ -494,8 +500,8 @@ The builder then:
 
 1. validates track/session alignment;
 2. passes candidates through the `RangeRefiner` interface;
-3. materialises participant role, character and transcription policy from the
-   session snapshot;
+3. materialises participant name, role, attribution and transcription policy
+   from the session snapshot;
 4. removes `transcribe = false` participants;
 5. sorts globally by start time with stable tie-breakers;
 6. assigns `session-id:000001` style IDs only after exclusion;
@@ -512,8 +518,14 @@ when range adjustment or splitting is explicitly required.
 Repeated work-item generation while still ready replaces rather than appends.
 Stable input and settings produce stable ordering and IDs.
 
-The producer orders exact sample-domain starts before converting format-1
-records to milliseconds. Distinct starts can therefore collapse to the same
+Format-2 work items keep `discord_user_id` and `discord_name` as observed
+identity provenance, carry optional `name` and arbitrary `role` context, and
+store the selected effective line attribution in `speaker`. Result records
+repeat the same fields exactly. Format-1 work and result records retain their
+historical `character` field and remain strictly readable.
+
+The producer orders exact sample-domain starts before converting records to
+milliseconds. Distinct starts can therefore collapse to the same
 published `start_ms`. Sequence retains the producer's deterministic order in
 that case: manifest validation rejects decreasing millisecond starts, but does
 not invent a new tie-break from other lossy published fields.
@@ -741,7 +753,12 @@ new progress permits one new calculation.
 After zero worker exit, Rust requires one exact completed result for every work
 item, deterministically rebuilds partial text from JSONL, atomically renames it
 to `transcription/transcript.txt`, synchronises the directory, and transitions
-to `complete` while retaining the lease.
+to `complete` while retaining the lease. Readable text always begins with a
+participant roster derived from unique work-manifest participants in order of
+first appearance. Each entry shows observed Discord name, configured/effective
+name, and role before the timestamped transcript body. A historical format-1
+`character` is presented as the roster name while its transcript-line
+attribution remains Discord-based.
 
 `rebuild-transcript` validates only complete work and result authority. It
 deliberately does not return to recording journals, participant snapshots,
@@ -764,7 +781,7 @@ generation directories are non-authoritative.
 Historical snapshots are not refreshed from configured participant data.
 `set-transcription-policy` is the narrow exception: under the same lease it
 atomically changes only one materialised `transcribe` Boolean. Missing entries
-are inserted with the normal player defaults. The operator must invoke
+are inserted with the defaults appropriate to that snapshot format. The operator must invoke
 `retranscribe` separately to publish a replacement transcript.
 
 ## 15. Exclusive offline ownership
@@ -968,8 +985,9 @@ resolved user PCM
 ```
 
 It must not replace packet/playout/event authority, routine FLAC, stable user
-identity, or the retained structured transcript contract. GM assistance is a
-later consumer of structured output, not a reason to filter the master record.
+identity, or the retained structured transcript contract. Live facilitation or
+domain-specific assistance is a later consumer of structured output, not a
+reason to filter the master record.
 
 ## 19. Testing and verification
 
@@ -1068,7 +1086,7 @@ The following are extension points, not partially hidden features:
 - one Python worker handles one session;
 - work items do not condition Whisper on previous item text;
 - the master transcript performs no relevance filtering;
-- there is no AAR or GM-assist stage;
+- there is no automated report, minutes, or live-assistance stage;
 - transcription is local; cloud processing, Runpod, and deployment to Mort are
   outside the current application boundary;
 - diagnostic WAV and SSRC-keyed export remain separate from routine user FLAC;

@@ -1,7 +1,7 @@
 # EchoScribe faster-whisper vocabulary
 #
 # Copy this file to vocabulary.txt, then replace these examples with terms
-# specific to your campaign. The vocabulary path is configured by
+# specific to the conversations you record. The vocabulary path is configured by
 # transcription.vocabulary_file in echoscribe.toml.
 #
 # Put one complete word or phrase on each line. Leading and trailing whitespace
@@ -11,18 +11,13 @@
 # are not supported: a # appearing later in a phrase is sent to faster-whisper
 # as part of that phrase.
 
-Baldur's Gate
-Faerûn
-Astarion
-Lae'zel
-Shadowheart
-Karlach
-Gale Dekarios
-Wyll Ravengard
-the Absolute
-mind flayer
-githyanki
-Vlaakith
+Bose-Einstein condensate
+Syzygy
+Schrödinger equation
+James Webb Space Telescope
+PostgreSQL
+Kubernetes
+Aeltharyn
 Ketheric Thorm
 Orin the Red
 Enver Gortash

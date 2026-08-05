@@ -17,12 +17,13 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     artifacts::{
-        FINAL_TRANSCRIPT_PATH, PARTIAL_TRANSCRIPT_FILE_NAME, TRANSCRIPTION_DIRECTORY_NAME,
-        TRANSCRIPTION_RESULT_FORMAT_VERSION, TRANSCRIPTION_RESULTS_FILE_NAME,
+        FINAL_TRANSCRIPT_PATH, LEGACY_TRANSCRIPTION_RESULT_FORMAT_VERSION,
+        LEGACY_WORK_ITEM_MANIFEST_FORMAT_VERSION, PARTIAL_TRANSCRIPT_FILE_NAME,
+        TRANSCRIPTION_DIRECTORY_NAME, TRANSCRIPTION_RESULTS_FILE_NAME,
         WORK_ITEM_MANIFEST_FORMAT_VERSION,
     },
     config::OfflineTranscriptionConfig,
@@ -44,14 +45,15 @@ const FINAL_TRANSCRIPT_TEMP_FILE_NAME: &str = ".transcript.txt.tmp";
 const RESUME_PREPARED_PREFIX: &str = "transcription_resume_prepared_";
 const RESUME_APPLIED_PREFIX: &str = "transcription_resume_applied_";
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TranscriptionResult {
     pub(crate) format: u16,
     pub(crate) work_item_id: String,
     pub(crate) session_id: String,
     pub(crate) sequence: u64,
     pub(crate) discord_user_id: String,
+    pub(crate) discord_name: String,
+    pub(crate) name: Option<String>,
     pub(crate) speaker: String,
     pub(crate) role: String,
     pub(crate) character: Option<String>,
@@ -62,6 +64,153 @@ pub(crate) struct TranscriptionResult {
     pub(crate) source_end_ms: u64,
     pub(crate) text: String,
     pub(crate) status: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyTranscriptionResult {
+    format: u16,
+    work_item_id: String,
+    session_id: String,
+    sequence: u64,
+    discord_user_id: String,
+    speaker: String,
+    role: String,
+    character: Option<String>,
+    start_ms: u64,
+    end_ms: u64,
+    source: String,
+    source_start_ms: u64,
+    source_end_ms: u64,
+    text: String,
+    status: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentTranscriptionResult {
+    format: u16,
+    work_item_id: String,
+    session_id: String,
+    sequence: u64,
+    discord_user_id: String,
+    discord_name: String,
+    name: Option<String>,
+    speaker: String,
+    role: String,
+    start_ms: u64,
+    end_ms: u64,
+    source: String,
+    source_start_ms: u64,
+    source_end_ms: u64,
+    text: String,
+    status: String,
+}
+
+impl Serialize for TranscriptionResult {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if self.format == LEGACY_TRANSCRIPTION_RESULT_FORMAT_VERSION {
+            LegacyTranscriptionResult {
+                format: self.format,
+                work_item_id: self.work_item_id.clone(),
+                session_id: self.session_id.clone(),
+                sequence: self.sequence,
+                discord_user_id: self.discord_user_id.clone(),
+                speaker: self.speaker.clone(),
+                role: self.role.clone(),
+                character: self.character.clone(),
+                start_ms: self.start_ms,
+                end_ms: self.end_ms,
+                source: self.source.clone(),
+                source_start_ms: self.source_start_ms,
+                source_end_ms: self.source_end_ms,
+                text: self.text.clone(),
+                status: self.status.clone(),
+            }
+            .serialize(serializer)
+        } else {
+            CurrentTranscriptionResult {
+                format: self.format,
+                work_item_id: self.work_item_id.clone(),
+                session_id: self.session_id.clone(),
+                sequence: self.sequence,
+                discord_user_id: self.discord_user_id.clone(),
+                discord_name: self.discord_name.clone(),
+                name: self.name.clone(),
+                speaker: self.speaker.clone(),
+                role: self.role.clone(),
+                start_ms: self.start_ms,
+                end_ms: self.end_ms,
+                source: self.source.clone(),
+                source_start_ms: self.source_start_ms,
+                source_end_ms: self.source_end_ms,
+                text: self.text.clone(),
+                status: self.status.clone(),
+            }
+            .serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TranscriptionResult {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let format = value
+            .get("format")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| serde::de::Error::custom("result format must be an integer"))?;
+        if format == u64::from(LEGACY_TRANSCRIPTION_RESULT_FORMAT_VERSION) {
+            let result: LegacyTranscriptionResult =
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+            Ok(Self {
+                format: result.format,
+                work_item_id: result.work_item_id,
+                session_id: result.session_id,
+                sequence: result.sequence,
+                discord_user_id: result.discord_user_id,
+                discord_name: result.speaker.clone(),
+                name: None,
+                speaker: result.speaker,
+                role: result.role,
+                character: result.character,
+                start_ms: result.start_ms,
+                end_ms: result.end_ms,
+                source: result.source,
+                source_start_ms: result.source_start_ms,
+                source_end_ms: result.source_end_ms,
+                text: result.text,
+                status: result.status,
+            })
+        } else {
+            let result: CurrentTranscriptionResult =
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+            Ok(Self {
+                format: result.format,
+                work_item_id: result.work_item_id,
+                session_id: result.session_id,
+                sequence: result.sequence,
+                discord_user_id: result.discord_user_id,
+                discord_name: result.discord_name,
+                name: result.name,
+                speaker: result.speaker,
+                role: result.role,
+                character: None,
+                start_ms: result.start_ms,
+                end_ms: result.end_ms,
+                source: result.source,
+                source_start_ms: result.source_start_ms,
+                source_end_ms: result.source_end_ms,
+                text: result.text,
+                status: result.status,
+            })
+        }
+    }
 }
 
 struct WorkerInvocation<'a> {
@@ -255,7 +404,9 @@ pub(crate) fn validate_complete_transcription_authority(
             transcript_path.display()
         )
     })?;
-    if actual != transcript_bytes(&results) {
+    if actual != transcript_bytes(&work_items, &results)
+        && actual != legacy_transcript_bytes(&results)
+    {
         bail!(
             "completed transcript {} does not match structured result authority",
             transcript_path.display()
@@ -297,7 +448,7 @@ fn run_replacement_worker_with_process(
     worker: &dyn WorkerProcess,
 ) -> Result<Vec<TranscriptionResult>> {
     prepare_empty_file(results_path)?;
-    prepare_empty_file(partial_transcript_path)?;
+    write_transcript_file_atomically(partial_transcript_path, work_items, &[])?;
     let invocation = WorkerInvocation {
         config_path: &prepared.config_path,
         session_directory,
@@ -333,9 +484,10 @@ fn run_replacement_worker_with_process(
 
 pub(crate) fn write_replacement_transcript(
     path: &Path,
+    work_items: &[WorkItem],
     results: &[TranscriptionResult],
 ) -> Result<()> {
-    write_transcript_file_atomically(path, results)
+    write_transcript_file_atomically(path, work_items, results)
 }
 
 fn completed_transcript_path(session_directory: &Path, record: &SessionRecord) -> PathBuf {
@@ -416,7 +568,7 @@ fn rebuild_transcript_with_lease(
     }
 
     let final_path = completed_transcript_path(session_directory, session.record());
-    write_transcript_file_atomically(&final_path, &committed)?;
+    write_transcript_file_atomically(&final_path, &work_items, &committed)?;
     println!(
         "Rebuilt final transcript for session {} at {}.",
         session.record().session_id,
@@ -507,7 +659,7 @@ fn run_prepared_with_worker(
         );
         let committed = validate_and_repair_result_prefix(&results_path, &work_items)?;
         let transcript_path = session_directory.join(PARTIAL_TRANSCRIPT_FILE_NAME);
-        rebuild_partial_transcript(session_directory, &transcript_path, &committed)?;
+        rebuild_partial_transcript(session_directory, &transcript_path, &work_items, &committed)?;
         let next_sequence = u64::try_from(committed.len())
             .ok()
             .and_then(|value| value.checked_add(1))
@@ -639,7 +791,12 @@ fn continue_prepared_with_worker(
         replace_results_prefix(&results_path, &committed[..retained_count])?;
         let retained = committed[..retained_count].to_vec();
         let transcript_path = session_directory.join(PARTIAL_TRANSCRIPT_FILE_NAME);
-        rebuild_partial_transcript(session_directory, &transcript_path, &retained)?;
+        rebuild_partial_transcript(
+            session_directory,
+            &transcript_path,
+            &work_items,
+            &retained,
+        )?;
         session
             .apply_transcription_resume(unix_millis_now()?, plan.sequence)
             .with_context(|| {
@@ -745,7 +902,7 @@ fn run_worker_attempt(
         );
     }
 
-    rebuild_partial_transcript(session_directory, transcript_path, &committed)?;
+    rebuild_partial_transcript(session_directory, transcript_path, work_items, &committed)?;
     publish_final_transcript(session_directory, transcript_path)?;
     session
         .publish_transcription_complete(unix_millis_now()?)
@@ -1048,12 +1205,15 @@ fn validate_session_artifacts(
     }
 
     let participant_path = session_directory.join(&record.files.participants.path);
-    ParticipantContext::load(&participant_path).with_context(|| {
+    let participants = ParticipantContext::load(&participant_path).with_context(|| {
         format!(
             "failed to validate participant snapshot {}",
             participant_path.display()
         )
     })?;
+    if participants.format_version() != record.files.participants.format {
+        bail!("participant snapshot format does not match session.json");
+    }
 
     let track_manifest_path = session_directory.join(&record.files.tracks.path);
     let tracks = TrackManifest::read(&track_manifest_path).with_context(|| {
@@ -1062,6 +1222,9 @@ fn validate_session_artifacts(
             track_manifest_path.display()
         )
     })?;
+    if tracks.format != record.files.tracks.format {
+        bail!("track manifest format does not match session.json");
+    }
     if tracks.session_id != record.session_id {
         bail!(
             "track manifest session ID {:?} does not match session.json ID {:?}",
@@ -1151,14 +1314,40 @@ fn validate_work_item_for_session(
     previous: Option<&WorkItem>,
 ) -> Result<()> {
     let expected_sequence = previous.map_or(1, |value| value.sequence + 1);
-    if item.format != WORK_ITEM_MANIFEST_FORMAT_VERSION
+    let expected_format = record
+        .files
+        .work_items
+        .as_ref()
+        .expect("work manifest validation requires its session description")
+        .format;
+    let metadata_valid = match item.format {
+        LEGACY_WORK_ITEM_MANIFEST_FORMAT_VERSION => {
+            matches!(item.role.as_str(), "player" | "gm")
+                && item.discord_name == item.speaker
+                && item.name.is_none()
+        }
+        WORK_ITEM_MANIFEST_FORMAT_VERSION => {
+            !item.discord_name.trim().is_empty()
+                && !item.discord_name.contains(['\n', '\r'])
+                && item
+                    .name
+                    .as_ref()
+                    .is_none_or(|name| !name.trim().is_empty() && !name.contains(['\n', '\r']))
+                && !item.role.trim().is_empty()
+                && !item.role.contains(['\n', '\r'])
+                && item.character.is_none()
+        }
+        _ => false,
+    };
+    if item.format != expected_format
+        || !metadata_valid
         || item.session_id != record.session_id
         || item.sequence != expected_sequence
         || item.id != format!("{}:{:06}", record.session_id, item.sequence)
         || item.start_ms >= item.end_ms
         || item.source_start_ms >= item.source_end_ms
         || item.speaker.trim().is_empty()
-        || !matches!(item.role.as_str(), "player" | "gm")
+        || item.speaker.contains(['\n', '\r'])
         || item
             .discord_user_id
             .parse::<u64>()
@@ -1448,12 +1637,14 @@ fn validate_and_repair_result_prefix_detailed(
 }
 
 fn validate_result_matches_work_item(result: &TranscriptionResult, item: &WorkItem) -> Result<()> {
-    if result.format != TRANSCRIPTION_RESULT_FORMAT_VERSION
+    if result.format != item.format
         || result.status != "complete"
         || result.work_item_id != item.id
         || result.session_id != item.session_id
         || result.sequence != item.sequence
         || result.discord_user_id != item.discord_user_id
+        || result.discord_name != item.discord_name
+        || result.name != item.name
         || result.speaker != item.speaker
         || result.role != item.role
         || result.character != item.character
@@ -1476,6 +1667,7 @@ fn validate_result_matches_work_item(result: &TranscriptionResult, item: &WorkIt
 fn rebuild_partial_transcript(
     session_directory: &Path,
     path: &Path,
+    work_items: &[WorkItem],
     results: &[TranscriptionResult],
 ) -> Result<()> {
     let temporary_path = session_directory.join(PARTIAL_TRANSCRIPT_TEMP_FILE_NAME);
@@ -1486,11 +1678,7 @@ fn rebuild_partial_transcript(
         .open(&temporary_path)
         .with_context(|| format!("failed to create {}", temporary_path.display()))?;
     let mut writer = BufWriter::new(file);
-    for result in results {
-        if !result.text.trim().is_empty() {
-            writer.write_all(transcript_line(result).as_bytes())?;
-        }
-    }
+    writer.write_all(&transcript_bytes(work_items, results))?;
     writer.flush()?;
     writer.get_ref().sync_all()?;
     drop(writer);
@@ -1502,7 +1690,11 @@ fn rebuild_partial_transcript(
     Ok(())
 }
 
-fn write_transcript_file_atomically(path: &Path, results: &[TranscriptionResult]) -> Result<()> {
+fn write_transcript_file_atomically(
+    path: &Path,
+    work_items: &[WorkItem],
+    results: &[TranscriptionResult],
+) -> Result<()> {
     let directory = path
         .parent()
         .ok_or_else(|| anyhow!("transcript path has no parent"))?;
@@ -1520,7 +1712,7 @@ fn write_transcript_file_atomically(path: &Path, results: &[TranscriptionResult]
         .open(&temporary_path)
         .with_context(|| format!("failed to create {}", temporary_path.display()))?;
     let mut writer = BufWriter::new(file);
-    writer.write_all(&transcript_bytes(results))?;
+    writer.write_all(&transcript_bytes(work_items, results))?;
     writer.flush()?;
     writer.get_ref().sync_all()?;
     drop(writer);
@@ -1530,7 +1722,32 @@ fn write_transcript_file_atomically(path: &Path, results: &[TranscriptionResult]
     Ok(())
 }
 
-fn transcript_bytes(results: &[TranscriptionResult]) -> Vec<u8> {
+fn transcript_bytes(work_items: &[WorkItem], results: &[TranscriptionResult]) -> Vec<u8> {
+    let mut transcript = String::from("Participants:\n");
+    let mut seen = std::collections::HashSet::new();
+    for item in work_items {
+        if seen.insert(item.discord_user_id.as_str()) {
+            let name = item
+                .name
+                .as_deref()
+                .or(item.character.as_deref())
+                .unwrap_or(&item.discord_name);
+            transcript.push_str(&format!(
+                "- Discord: {} | Name: {} | Role: {}\n",
+                item.discord_name, name, item.role
+            ));
+        }
+    }
+    transcript.push_str("\nTranscript:\n");
+    for result in results {
+        if !result.text.trim().is_empty() {
+            transcript.push_str(&transcript_line(result));
+        }
+    }
+    transcript.into_bytes()
+}
+
+fn legacy_transcript_bytes(results: &[TranscriptionResult]) -> Vec<u8> {
     results
         .iter()
         .filter(|result| !result.text.trim().is_empty())
@@ -2142,7 +2359,8 @@ mod tests {
 
         assert_eq!(
             fs::read_to_string(&final_path).unwrap(),
-            "[00:00:00] Alice: Result 1\n"
+            "Participants:\n- Discord: Alice | Name: Alice | Role: player\n\n\
+             Transcript:\n[00:00:00] Alice: Result 1\n"
         );
         assert_eq!(fs::read(&results_path).unwrap(), results_before);
         assert_eq!(
@@ -2200,7 +2418,8 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(directory.join(FINAL_TRANSCRIPT_PATH)).unwrap(),
-            "[00:00:00] Alice: All conversation stays here.\n"
+            "Participants:\n- Discord: Alice | Name: Alice | Role: player\n\n\
+             Transcript:\n[00:00:00] Alice: All conversation stays here.\n"
         );
         let invocations = worker.invocations.lock().unwrap();
         assert_eq!(invocations.len(), 1);
@@ -2891,7 +3110,8 @@ mod tests {
         assert_eq!(worker.invocations.lock().unwrap()[0].next_sequence, 2);
         assert_eq!(
             fs::read_to_string(directory.join(FINAL_TRANSCRIPT_PATH)).unwrap(),
-            "[00:00:00] Alice: Result 1\n\
+            "Participants:\n- Discord: Alice | Name: Alice | Role: player\n\n\
+             Transcript:\n[00:00:00] Alice: Result 1\n\
              [00:00:20] Alice: Result 2\n\
              [00:00:40] Alice: Result 3\n"
         );
@@ -3022,16 +3242,18 @@ mod tests {
             complete_result(&test_item(1, 0, 10_000), "First"),
             complete_result(&test_item(2, 65_000, 70_000), "Second"),
         ];
+        let items = [test_item(1, 0, 10_000), test_item(2, 65_000, 70_000)];
 
-        rebuild_partial_transcript(&directory, &path, &results).unwrap();
+        rebuild_partial_transcript(&directory, &path, &items, &results).unwrap();
         let first = fs::read(&path).unwrap();
         fs::write(&path, b"stale\n").unwrap();
-        rebuild_partial_transcript(&directory, &path, &results).unwrap();
+        rebuild_partial_transcript(&directory, &path, &items, &results).unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), first);
         assert_eq!(
             String::from_utf8(first).unwrap(),
-            "[00:00:00] Alice: First\n[00:01:05] Alice: Second\n"
+            "Participants:\n- Discord: Alice | Name: Alice | Role: player\n\n\
+             Transcript:\n[00:00:00] Alice: First\n[00:01:05] Alice: Second\n"
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -3047,18 +3269,62 @@ mod tests {
             complete_result(&first_item, ""),
             complete_result(&second_item, "Spoken text"),
         ];
-
         validate_result_matches_work_item(&results[0], &first_item).unwrap();
-        rebuild_partial_transcript(&directory, &partial_path, &results).unwrap();
-        write_transcript_file_atomically(&directory.join(FINAL_TRANSCRIPT_PATH), &results).unwrap();
+        let items = [first_item, second_item];
+        rebuild_partial_transcript(&directory, &partial_path, &items, &results).unwrap();
+        write_transcript_file_atomically(&directory.join(FINAL_TRANSCRIPT_PATH), &items, &results)
+            .unwrap();
 
-        let expected = "[00:00:10] Alice: Spoken text\n";
+        let expected = "Participants:\n- Discord: Alice | Name: Alice | Role: player\n\n\
+                        Transcript:\n[00:00:10] Alice: Spoken text\n";
         assert_eq!(fs::read_to_string(&partial_path).unwrap(), expected);
         assert_eq!(
             fs::read_to_string(directory.join(FINAL_TRANSCRIPT_PATH)).unwrap(),
             expected
         );
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn transcript_header_lists_unique_participants_and_preserves_attribution_policy() {
+        let mut named = test_item(1, 0, 10_000);
+        named.format = WORK_ITEM_MANIFEST_FORMAT_VERSION;
+        named.discord_name = "Tromador".to_owned();
+        named.name = Some("Stefan".to_owned());
+        named.speaker = "Tromador".to_owned();
+        named.role = "chair".to_owned();
+        let mut repeated = named.clone();
+        repeated.sequence = 2;
+        repeated.id = "session-transcription:000002".to_owned();
+        let mut unnamed = test_item(3, 20_000, 30_000);
+        unnamed.format = WORK_ITEM_MANIFEST_FORMAT_VERSION;
+        unnamed.discord_user_id = "22".to_owned();
+        unnamed.discord_name = "Observer".to_owned();
+        unnamed.name = None;
+        unnamed.speaker = "Observer".to_owned();
+        unnamed.role = "attendee".to_owned();
+        let items = [named.clone(), repeated, unnamed.clone()];
+        let results = [
+            complete_result(&named, "Opening"),
+            complete_result(&unnamed, "Question"),
+        ];
+
+        let result_value = serde_json::to_value(&results[0]).unwrap();
+        assert_eq!(result_value["discord_name"], "Tromador");
+        assert_eq!(result_value["name"], "Stefan");
+        assert!(result_value.get("character").is_none());
+
+        let transcript = String::from_utf8(transcript_bytes(&items, &results)).unwrap();
+
+        assert_eq!(
+            transcript,
+            "Participants:\n\
+             - Discord: Tromador | Name: Stefan | Role: chair\n\
+             - Discord: Observer | Name: Observer | Role: attendee\n\n\
+             Transcript:\n\
+             [00:00:00] Tromador: Opening\n\
+             [00:00:20] Observer: Question\n"
+        );
     }
 
     #[test]
@@ -3211,6 +3477,7 @@ mod tests {
         rebuild_partial_transcript(
             &directory,
             &directory.join(PARTIAL_TRANSCRIPT_FILE_NAME),
+            &items,
             &results,
         )
         .unwrap();
@@ -3337,11 +3604,13 @@ mod tests {
         session.publish_work_manifest(2_200).unwrap();
 
         let item = WorkItem {
-            format: WORK_ITEM_MANIFEST_FORMAT_VERSION,
+            format: LEGACY_WORK_ITEM_MANIFEST_FORMAT_VERSION,
             id: "session-transcription:000001".to_owned(),
             session_id: "session-transcription".to_owned(),
             sequence: 1,
             discord_user_id: "11".to_owned(),
+            discord_name: "Alice".to_owned(),
+            name: None,
             speaker: "Alice".to_owned(),
             role: "player".to_owned(),
             character: None,
@@ -3394,11 +3663,13 @@ merge_gap_ms = 750
 
     fn complete_result(item: &WorkItem, text: &str) -> TranscriptionResult {
         TranscriptionResult {
-            format: TRANSCRIPTION_RESULT_FORMAT_VERSION,
+            format: item.format,
             work_item_id: item.id.clone(),
             session_id: item.session_id.clone(),
             sequence: item.sequence,
             discord_user_id: item.discord_user_id.clone(),
+            discord_name: item.discord_name.clone(),
+            name: item.name.clone(),
             speaker: item.speaker.clone(),
             role: item.role.clone(),
             character: item.character.clone(),
@@ -3414,11 +3685,13 @@ merge_gap_ms = 750
 
     fn test_item(sequence: u64, start_ms: u64, end_ms: u64) -> WorkItem {
         WorkItem {
-            format: WORK_ITEM_MANIFEST_FORMAT_VERSION,
+            format: LEGACY_WORK_ITEM_MANIFEST_FORMAT_VERSION,
             id: format!("session-transcription:{sequence:06}"),
             session_id: "session-transcription".to_owned(),
             sequence,
             discord_user_id: "11".to_owned(),
+            discord_name: "Alice".to_owned(),
+            name: None,
             speaker: "Alice".to_owned(),
             role: "player".to_owned(),
             character: None,

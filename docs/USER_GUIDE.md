@@ -1,8 +1,9 @@
 # EchoScribe User Guide
 
-EchoScribe records tabletop role-playing sessions from a Discord voice channel
-and produces per-participant audio, a structured transcript, and a readable
-plain-text transcript.
+EchoScribe records conversations from a Discord voice channel and produces
+per-participant audio, a structured transcript, and a readable plain-text
+transcript. It works for tabletop role-playing, meetings, lectures, symposia,
+interviews, and other spoken sessions.
 
 This guide describes the current application as an operator uses it. It is
 standalone documentation: it does not depend on the project specification,
@@ -45,8 +46,8 @@ The current application provides:
 - JSONL structured results and a readable text transcript.
 
 It does not currently provide live transcription, relevance filtering,
-after-action report generation, GM assistance, a graphical interface, or cloud
-transcription.
+automated report or minutes generation, live facilitation assistance, a
+graphical interface, or cloud transcription.
 
 ## 3. Requirements
 
@@ -232,7 +233,7 @@ Unknown or misspelt fields are rejected instead of being silently ignored.
 | `transcription.device` | CTranslate2 device, normally `cuda` or `cpu`. |
 | `transcription.compute_type` | CTranslate2 compute type, such as `float16` for the configured GPU. |
 | `transcription.beam_size` | Whisper beam size; must be greater than zero. |
-| `transcription.vocabulary_file` | Campaign-specific hotword phrase file. |
+| `transcription.vocabulary_file` | Session-specific hotword phrase file. |
 | `transcription.resume_rewind_seconds` | Amount of committed transcription reconsidered after a known worker failure. `0` disables rewind. |
 | `transcription.lexical_no_speech_threshold` | Threshold for the unprompted lexical-speech qualification pass. Defaults to `0.60`. |
 | `segmentation.vad_enabled` | When true, admit complete work-item ranges through bundled Silero VAD before lexical qualification. When false, send every work item directly to lexical qualification. |
@@ -248,7 +249,7 @@ architectural promise.
 `lexical_no_speech_threshold` controls whether an unprompted Whisper segment
 is accepted as lexical speech before configured hotwords are used. Higher
 values are more permissive; lower values are more restrictive. The `0.60`
-default is tuned for EchoScribe's after-action-report use case: it retains
+default is tuned for EchoScribe's source-transcript use case: it retains
 useful short responses such as “okay” while deliberately allowing low-value
 acknowledgements, abandoned utterances, and speech-like non-verbal sounds to
 be rejected.
@@ -260,46 +261,58 @@ inside the session rather than rereading the mutable participant source.
 
 ### 5.2 Participant context
 
-The participant file adds campaign context keyed by Discord user ID:
+The participant file adds descriptive context keyed by Discord user ID:
 
 ```toml
-version = 1
+version = 2
+transcript_name_source = "discord"
 
 [participants."881203221593464864"]
-character = "Example Character"
-role = "player"
+name = "Stefan"
+role = "speaker"
 
 [participants."123456789012345678"]
-role = "gm"
+role = "chair"
 transcribe = false
 ```
 
-The Discord handle is not configured here. EchoScribe obtains the server
-display name, global display name, and username from Discord and uses that
-evidence for transcript attribution. The participant file supplies only:
+EchoScribe obtains the server display name, global display name, and username
+from Discord. This observed identity is retained as provenance. The participant
+file supplies:
 
-- optional `character` context;
-- optional `role`, defaulting to `player`;
+- optional `name`, which may be a real name, character name, professional name,
+  or any other useful alternative to the Discord handle;
+- optional `role`, accepting any non-empty single-line text and defaulting to
+  `participant`;
 - optional `transcribe`, defaulting to `true`.
 
-Roles are `player` or `gm`, accepted without regard to letter case and written
-canonically in lowercase. Multiple GMs are allowed. Empty character names and
-invalid or zero Discord IDs are rejected.
+The top-level `transcript_name_source` selects line attribution. `"discord"`
+is the default and uses the observed Discord name. `"name"` uses the configured
+`name`, falling back to the Discord name when a participant has no configured
+name. The choice does not alter Discord identity evidence.
+
+Empty names or roles, multiline values, and invalid or zero Discord IDs are
+rejected.
 
 A participant with `transcribe = false` remains fully recorded in journals,
 identity evidence and the routine FLAC track, but is omitted from transcription
 work-item generation. This is an operator policy, not a role. A participant who
-is absent from the file is recorded and transcribed with default player context.
+is absent from the file is recorded and transcribed with default `participant`
+context and Discord-name attribution.
 
 At session creation, EchoScribe writes a canonical `participants.toml` snapshot
 inside the session directory. Later edits to the configured participant file do
 not rewrite old sessions. Canonical snapshots always write the resolved Boolean;
-older snapshots without it load as `transcribe = true`.
+older snapshots without it load as `transcribe = true`. Historical version-1
+snapshots retain their original `character`, `player`/`gm`, and Discord-name
+semantics; they do not need migration for reading, rebuilding, or
+retranscription.
 
-### 5.3 Campaign vocabulary
+### 5.3 Transcription vocabulary
 
-The vocabulary file gives faster-whisper campaign names and specialist terms
-which ordinary language modelling may miss.
+The vocabulary file gives faster-whisper names, places, jargon, scientific
+terms, and other specialist phrases which ordinary language modelling may
+miss.
 
 - Use UTF-8 text.
 - Put one complete word or phrase on each line.
@@ -326,7 +339,7 @@ echoscribe
 Or name a different configuration explicitly:
 
 ```sh
-echoscribe path/to/campaign.toml
+echoscribe path/to/session.toml
 ```
 
 EchoScribe creates a session directory, connects to Discord, and joins the
@@ -353,7 +366,7 @@ To record and finalise without immediately transcribing:
 
 ```sh
 echoscribe record
-echoscribe record path/to/campaign.toml
+echoscribe record path/to/session.toml
 ```
 
 A healthy recording-only session ends in `ready_for_transcription`. Advance it
@@ -431,11 +444,25 @@ want to retain recording-recovery capability.
 
 ## 8. Transcript output
 
-The readable transcript uses one completed work item per line:
+The readable transcript begins with a participant roster, followed by one
+completed work item per line:
 
 ```text
+Participants:
+- Discord: Tromador | Name: Stefan | Role: attendee
+
+Transcript:
 [00:09:26] Tromador: What were you saying? I completely missed it.
 ```
+
+The roster lists transcribed participants in order of first appearance. It is
+always present and shows the observed Discord name, the configured name (or the
+Discord name as fallback), and the role. Participants excluded from
+transcription have no work items and therefore do not appear in the roster.
+Older completed transcripts remain valid without a roster; rebuilding or
+retranscribing them writes the current roster form. For historical version-1
+work items, the old `character` value is shown in the roster's `Name` column
+without changing Discord-based line attribution.
 
 Lines are ordered by session-relative start time. Overlapping speakers remain
 separate lines. The text view omits SSRCs, confidence scores, word-level timing,
@@ -447,7 +474,7 @@ retains work-item identity, sequence, Discord user, speaker metadata, timing,
 source range, text, and completion status. If text and JSONL disagree after a
 crash, EchoScribe rebuilds the text from the validated JSONL prefix.
 
-The master transcript includes in-character speech, rules discussion, jokes,
+The master transcript includes formal contributions, side discussions, jokes,
 social chatter, and anything else captured. Relevance filtering belongs to a
 later downstream process.
 
@@ -457,7 +484,7 @@ Faster Whisper is a probabilistic speech-recognition model. Marginal,
 ambiguous, noisy, or very short audio can occasionally produce plausible but
 incorrect text.
 
-EchoScribe supplies the configured campaign vocabulary to Faster Whisper as
+EchoScribe supplies the configured vocabulary to Faster Whisper as
 hotword context. This materially improves names, places, jargon, and specialist
 terminology. On an uncertain range, however, the same context can sometimes
 turn a short uncertain transcription into a fluent stock phrase learned by the
@@ -476,13 +503,14 @@ hypothesis from uncertain audio.
 EchoScribe deliberately does not blacklist stock phrases. A phrase may
 occasionally be genuine speech, and removing visible text would not establish
 what the audio actually contained. Disabling vocabulary assistance would also
-materially reduce accuracy for campaign names and specialist terminology.
+materially reduce accuracy for proper names and specialist terminology.
 
 Participant recordings are retained so the source audio can be reviewed by a
-person, considered by later language-model processing while producing an AAR,
-or retranscribed in future with an improved Faster Whisper model or a different
-transcription backend. This is a known limitation of the current transcription
-backend, not a session-recovery procedure or a data-integrity fault.
+person, considered by later language-model processing while producing minutes
+or another report, or retranscribed in future with an improved Faster Whisper
+model or a different transcription backend. This is a known limitation of the
+current transcription backend, not a session-recovery procedure or a
+data-integrity fault.
 
 ## 9. Workflow states
 
@@ -629,15 +657,15 @@ validation or publication failure leaves the old complete set authoritative and
 the workflow state remains `complete`; retranscription is not continuation or
 failure recovery.
 
-For the existing representative session, Astra can be excluded through the
-explicit historical-policy migration and then retranscribed:
+To exclude someone from an existing completed session, apply the explicit
+historical-policy migration and then retranscribe:
 
 ```sh
 echoscribe set-transcription-policy \
-  recordings/session-1785683509050 \
-  854446496798736405 false
+  recordings/session-... \
+  123456789012345678 false
 echoscribe retranscribe \
-  recordings/session-1785683509050 \
+  recordings/session-... \
   echoscribe.toml
 ```
 
@@ -651,7 +679,7 @@ future sessions only.
 Explicitly migrates only a completed session snapshot's transcription policy.
 It does not rebuild work items or start transcription; run `retranscribe`
 afterwards. If the user has no snapshot entry, EchoScribe adds one with normal
-player defaults and the requested policy. This exceptional command is the
+format-appropriate defaults and the requested policy. This exceptional command is the
 supported route for historical snapshots, which otherwise remain immutable.
 
 ### 10.12 `echoscribe rebuild-transcript <session>`
@@ -863,8 +891,9 @@ operator configuration.
 
 ### Participant parse failure
 
-Check the top-level `version`, quoted Discord-ID table keys, non-empty
-characters, and `player`/`gm` roles. Role case is accepted; other words are not.
+Check the top-level `version`, `transcript_name_source`, quoted Discord-ID table
+keys, and non-empty single-line names and roles. Version 2 accepts arbitrary
+roles; version-1 historical files retain their `player`/`gm` validation.
 
 ### Missing vocabulary warning
 

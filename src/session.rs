@@ -20,10 +20,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     artifacts::{
-        EVENT_JOURNAL_FILE_NAME, PACKET_JOURNAL_FILE_NAME, PARTICIPANT_SNAPSHOT_FILE_NAME,
-        PARTICIPANT_SNAPSHOT_FORMAT_VERSION, PLAYOUT_JOURNAL_FILE_NAME, TRACK_MANIFEST_FILE_NAME,
-        TRACK_MANIFEST_FORMAT_VERSION, TRANSCRIPT_FORMAT_VERSION,
-        TRANSCRIPTION_RESULT_FORMAT_VERSION, TRANSCRIPTION_RESULTS_PATH,
+        EVENT_JOURNAL_FILE_NAME, LEGACY_PARTICIPANT_SNAPSHOT_FORMAT_VERSION,
+        LEGACY_TRACK_MANIFEST_FORMAT_VERSION, LEGACY_TRANSCRIPTION_RESULT_FORMAT_VERSION,
+        LEGACY_WORK_ITEM_MANIFEST_FORMAT_VERSION, PACKET_JOURNAL_FILE_NAME,
+        PARTICIPANT_SNAPSHOT_FILE_NAME, PARTICIPANT_SNAPSHOT_FORMAT_VERSION,
+        PLAYOUT_JOURNAL_FILE_NAME, TRACK_MANIFEST_FILE_NAME, TRACK_MANIFEST_FORMAT_VERSION,
+        TRANSCRIPT_FORMAT_VERSION, TRANSCRIPTION_RESULT_FORMAT_VERSION, TRANSCRIPTION_RESULTS_PATH,
         WORK_ITEM_MANIFEST_FORMAT_VERSION, WORK_ITEM_MANIFEST_PATH,
     },
     participants::ParticipantContext,
@@ -182,11 +184,11 @@ impl SessionRecord {
                 },
                 participants: FileDescription {
                     path: PARTICIPANT_SNAPSHOT_FILE_NAME.to_owned(),
-                    format: PARTICIPANT_SNAPSHOT_FORMAT_VERSION,
+                    format: input.participants.format_version(),
                 },
                 tracks: FileDescription {
                     path: TRACK_MANIFEST_FILE_NAME.to_owned(),
-                    format: TRACK_MANIFEST_FORMAT_VERSION,
+                    format: input.participants.format_version(),
                 },
                 work_items: None,
                 results: None,
@@ -270,18 +272,6 @@ impl SessionRecord {
                 PLAYOUT_JOURNAL_FILE_NAME,
                 crate::playout::FORMAT_VERSION,
             ),
-            (
-                "participants",
-                &self.files.participants,
-                PARTICIPANT_SNAPSHOT_FILE_NAME,
-                PARTICIPANT_SNAPSHOT_FORMAT_VERSION,
-            ),
-            (
-                "tracks",
-                &self.files.tracks,
-                TRACK_MANIFEST_FILE_NAME,
-                TRACK_MANIFEST_FORMAT_VERSION,
-            ),
         ] {
             validate_relative_artifact_path(name, &description.path)?;
             if description.path != expected_path || description.format != expected_format {
@@ -289,6 +279,29 @@ impl SessionRecord {
                     "session file {name} must be {expected_path:?} format {expected_format}"
                 )));
             }
+        }
+        validate_relative_artifact_path("participants", &self.files.participants.path)?;
+        if self.files.participants.path != PARTICIPANT_SNAPSHOT_FILE_NAME
+            || !matches!(
+                self.files.participants.format,
+                LEGACY_PARTICIPANT_SNAPSHOT_FORMAT_VERSION | PARTICIPANT_SNAPSHOT_FORMAT_VERSION
+            )
+        {
+            return Err(invalid_data(
+                "session contains an unsupported participant snapshot",
+            ));
+        }
+        validate_relative_artifact_path("tracks", &self.files.tracks.path)?;
+        if self.files.tracks.path != TRACK_MANIFEST_FILE_NAME
+            || !matches!(
+                self.files.tracks.format,
+                LEGACY_TRACK_MANIFEST_FORMAT_VERSION | TRACK_MANIFEST_FORMAT_VERSION
+            )
+            || self.files.tracks.format != self.files.participants.format
+        {
+            return Err(invalid_data(
+                "session track and participant artefacts must use one supported matching format",
+            ));
         }
         validate_relative_artifact_path("events", &self.files.events.path)?;
         if self.files.events.path != EVENT_JOURNAL_FILE_NAME
@@ -311,11 +324,14 @@ impl SessionRecord {
             validate_relative_artifact_path("work_items", &description.path)?;
             if (self.format < RETRANSCRIPTION_SESSION_FORMAT_VERSION
                 && description.path != WORK_ITEM_MANIFEST_PATH)
-                || description.format != WORK_ITEM_MANIFEST_FORMAT_VERSION
+                || !matches!(
+                    description.format,
+                    LEGACY_WORK_ITEM_MANIFEST_FORMAT_VERSION | WORK_ITEM_MANIFEST_FORMAT_VERSION
+                )
+                || description.format != self.files.participants.format
             {
                 return Err(invalid_data(format!(
-                    "session file work_items must be {WORK_ITEM_MANIFEST_PATH:?} format \
-                     {WORK_ITEM_MANIFEST_FORMAT_VERSION}"
+                    "session file work_items must use the supported participant metadata format"
                 )));
             }
         }
@@ -337,11 +353,21 @@ impl SessionRecord {
                 .expect("format-5 results presence checked above");
             validate_relative_artifact_path("results", &description.path)?;
             if description.path != TRANSCRIPTION_RESULTS_PATH
-                || description.format != TRANSCRIPTION_RESULT_FORMAT_VERSION
+                || !matches!(
+                    description.format,
+                    LEGACY_TRANSCRIPTION_RESULT_FORMAT_VERSION
+                        | TRANSCRIPTION_RESULT_FORMAT_VERSION
+                )
+                || description.format
+                    != self
+                        .files
+                        .work_items
+                        .as_ref()
+                        .expect("format-5 work-items presence checked above")
+                        .format
             {
                 return Err(invalid_data(format!(
-                    "session file results must be {TRANSCRIPTION_RESULTS_PATH:?} format \
-                     {TRANSCRIPTION_RESULT_FORMAT_VERSION}"
+                    "session file results must use the work manifest metadata format"
                 )));
             }
         }
@@ -360,9 +386,15 @@ impl SessionRecord {
                     "session format 6 requires work_items, results, and transcript descriptions",
                 ));
             };
-            if work_items.format != WORK_ITEM_MANIFEST_FORMAT_VERSION
-                || results.format != TRANSCRIPTION_RESULT_FORMAT_VERSION
-                || transcript.format != TRANSCRIPT_FORMAT_VERSION
+            if !matches!(
+                work_items.format,
+                LEGACY_WORK_ITEM_MANIFEST_FORMAT_VERSION | WORK_ITEM_MANIFEST_FORMAT_VERSION
+            ) || !matches!(
+                results.format,
+                LEGACY_TRANSCRIPTION_RESULT_FORMAT_VERSION | TRANSCRIPTION_RESULT_FORMAT_VERSION
+            ) || transcript.format != TRANSCRIPT_FORMAT_VERSION
+                || work_items.format != results.format
+                || work_items.format != self.files.participants.format
             {
                 return Err(invalid_data(
                     "session format 6 contains an unsupported transcription artefact format",
@@ -560,7 +592,7 @@ impl SessionStore {
         updated.format = RECORDING_SESSION_FORMAT_VERSION;
         updated.files.work_items = Some(FileDescription {
             path: WORK_ITEM_MANIFEST_PATH.to_owned(),
-            format: WORK_ITEM_MANIFEST_FORMAT_VERSION,
+            format: self.record.files.participants.format,
         });
         updated.checkpoints.push(CheckpointRecord {
             completed_at_unix_millis,
@@ -621,11 +653,18 @@ impl SessionStore {
         }
 
         let mut updated = self.record.clone();
+        let results_format = self
+            .record
+            .files
+            .work_items
+            .as_ref()
+            .expect("transcription start requires work items")
+            .format;
         updated.format = SESSION_FORMAT_VERSION;
         updated.state = WorkflowState::Transcribing;
         updated.files.results = Some(FileDescription {
             path: TRANSCRIPTION_RESULTS_PATH.to_owned(),
-            format: TRANSCRIPTION_RESULT_FORMAT_VERSION,
+            format: results_format,
         });
         updated.checkpoints.push(CheckpointRecord {
             completed_at_unix_millis: started_at_unix_millis,
@@ -752,6 +791,9 @@ impl SessionStore {
         work_items_path: String,
         results_path: String,
         transcript_path: String,
+        work_items_format: u16,
+        results_format: u16,
+        transcript_format: u16,
     ) -> io::Result<()> {
         if !matches!(
             self.record.format,
@@ -769,15 +811,15 @@ impl SessionStore {
         updated.format = RETRANSCRIPTION_SESSION_FORMAT_VERSION;
         updated.files.work_items = Some(FileDescription {
             path: work_items_path,
-            format: WORK_ITEM_MANIFEST_FORMAT_VERSION,
+            format: work_items_format,
         });
         updated.files.results = Some(FileDescription {
             path: results_path,
-            format: TRANSCRIPTION_RESULT_FORMAT_VERSION,
+            format: results_format,
         });
         updated.files.transcript = Some(FileDescription {
             path: transcript_path,
-            format: TRANSCRIPT_FORMAT_VERSION,
+            format: transcript_format,
         });
         updated.checkpoints.push(CheckpointRecord {
             completed_at_unix_millis,
@@ -1220,6 +1262,27 @@ mod tests {
     }
 
     #[test]
+    fn new_session_uses_current_participant_metadata_format() {
+        let directory = test_directory("current-participants");
+        let participants = ParticipantContext::from_toml(
+            "version = 2\ntranscript_name_source = \"name\"\n",
+            Path::new("participants.toml"),
+        )
+        .unwrap();
+        let store = create_store(&directory, &participants);
+
+        assert_eq!(
+            store.record().files.participants.format,
+            PARTICIPANT_SNAPSHOT_FORMAT_VERSION
+        );
+        assert_eq!(
+            store.record().files.tracks.format,
+            TRACK_MANIFEST_FORMAT_VERSION
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn format_three_session_remains_readable() {
         let directory = test_directory("format-three-event-one");
         let participants = ParticipantContext::empty_for_test();
@@ -1293,7 +1356,7 @@ mod tests {
             reloaded.record().files.work_items,
             Some(FileDescription {
                 path: WORK_ITEM_MANIFEST_PATH.to_owned(),
-                format: WORK_ITEM_MANIFEST_FORMAT_VERSION,
+                format: LEGACY_WORK_ITEM_MANIFEST_FORMAT_VERSION,
             })
         );
         assert_eq!(
@@ -1349,7 +1412,7 @@ mod tests {
             reloaded.record().files.results,
             Some(FileDescription {
                 path: TRANSCRIPTION_RESULTS_PATH.to_owned(),
-                format: TRANSCRIPTION_RESULT_FORMAT_VERSION,
+                format: LEGACY_TRANSCRIPTION_RESULT_FORMAT_VERSION,
             })
         );
         assert_eq!(
@@ -1367,7 +1430,7 @@ mod tests {
         let mut record = store.record().clone();
         record.files.work_items = Some(FileDescription {
             path: WORK_ITEM_MANIFEST_PATH.to_owned(),
-            format: WORK_ITEM_MANIFEST_FORMAT_VERSION,
+            format: LEGACY_WORK_ITEM_MANIFEST_FORMAT_VERSION,
         });
 
         let error = record.validate().unwrap_err();

@@ -13,7 +13,10 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    artifacts::{TRACK_MANIFEST_FILE_NAME, TRACK_MANIFEST_FORMAT_VERSION},
+    artifacts::{
+        LEGACY_TRACK_MANIFEST_FORMAT_VERSION, TRACK_MANIFEST_FILE_NAME,
+        TRACK_MANIFEST_FORMAT_VERSION,
+    },
     diagnostics::{CHANNELS, SAMPLE_RATE},
 };
 
@@ -33,6 +36,7 @@ pub(crate) struct TrackDescription {
     pub(crate) discord_user_id: String,
     pub(crate) display_name: String,
     pub(crate) role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) character: Option<String>,
     pub(crate) path: String,
     pub(crate) state: TrackState,
@@ -88,7 +92,16 @@ pub(crate) struct TrackManifest {
 }
 
 impl TrackManifest {
-    pub(crate) fn new(session_id: String, mut tracks: Vec<TrackDescription>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(session_id: String, tracks: Vec<TrackDescription>) -> Self {
+        Self::new_with_format(LEGACY_TRACK_MANIFEST_FORMAT_VERSION, session_id, tracks)
+    }
+
+    pub(crate) fn new_with_format(
+        format: u16,
+        session_id: String,
+        mut tracks: Vec<TrackDescription>,
+    ) -> Self {
         tracks.sort_unstable_by_key(|track| {
             track
                 .discord_user_id
@@ -96,17 +109,20 @@ impl TrackManifest {
                 .expect("track descriptions are constructed from numeric Discord IDs")
         });
         Self {
-            format: TRACK_MANIFEST_FORMAT_VERSION,
+            format,
             session_id,
             tracks,
         }
     }
 
     pub(crate) fn validate(&self) -> io::Result<()> {
-        if self.format != TRACK_MANIFEST_FORMAT_VERSION {
+        if !matches!(
+            self.format,
+            LEGACY_TRACK_MANIFEST_FORMAT_VERSION | TRACK_MANIFEST_FORMAT_VERSION
+        ) {
             return Err(invalid_data(format!(
-                "unsupported track manifest format {}; expected {}",
-                self.format, TRACK_MANIFEST_FORMAT_VERSION
+                "unsupported track manifest format {}; expected {} or {}",
+                self.format, LEGACY_TRACK_MANIFEST_FORMAT_VERSION, TRACK_MANIFEST_FORMAT_VERSION
             )));
         }
         if self.session_id.trim().is_empty() {
@@ -146,8 +162,15 @@ impl TrackManifest {
             if track.display_name.trim().is_empty() {
                 return Err(invalid_data("track display_name must not be empty"));
             }
-            if !matches!(track.role.as_str(), "player" | "gm") {
-                return Err(invalid_data("track role must be player or gm"));
+            if self.format == LEGACY_TRACK_MANIFEST_FORMAT_VERSION
+                && !matches!(track.role.as_str(), "player" | "gm")
+            {
+                return Err(invalid_data("format-1 track role must be player or gm"));
+            }
+            if track.role.trim().is_empty() || track.role.contains(['\n', '\r']) {
+                return Err(invalid_data(
+                    "track role must be non-empty single-line text",
+                ));
             }
             if track
                 .character
@@ -155,6 +178,11 @@ impl TrackManifest {
                 .is_some_and(|value| value.trim().is_empty())
             {
                 return Err(invalid_data("track character must not be empty"));
+            }
+            if self.format == TRACK_MANIFEST_FORMAT_VERSION && track.character.is_some() {
+                return Err(invalid_data(
+                    "format-2 track manifest must not contain character metadata",
+                ));
             }
             if track.sample_rate != SAMPLE_RATE
                 || track.channels != CHANNELS

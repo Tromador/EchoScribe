@@ -31,7 +31,7 @@ use crate::{
     identity::{IdentityRouter, RoutingAction, UnresolvedSsrcAbandonment, UserIdentity},
     journal::{self, PacketRecord},
     live_flac::{LiveFlacStage, LiveTrackSummary, StageReport as LiveFlacReport, TrackAbandonment},
-    participants::{ParticipantContext, ParticipantRole},
+    participants::ParticipantContext,
     playout::{self, OpusPayloadBounds, PlayoutDecision, PlayoutRecord},
     session::{self, NewSession, SessionEvent, WorkflowState},
     track_manifest::{TrackDescription, TrackManifest, TrackState},
@@ -974,7 +974,7 @@ fn apply_routing_actions(
                 summary.missing_participant_warnings += 1;
                 eprintln!(
                     "Discord user {discord_user_id} is missing from participant context; \
-                     recording continues with role player and no character."
+                     recording continues with default participant metadata."
                 );
             }
         }
@@ -1160,6 +1160,12 @@ fn finalize_recording(
     let participants =
         ParticipantContext::load(&session_directory.join(PARTICIPANT_SNAPSHOT_FILE_NAME))
             .map_err(io::Error::other)?;
+    if participants.format_version() != session_store.record().files.participants.format {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "participant snapshot format does not match session.json",
+        ));
+    }
     let live_report = summary
         .live_flac
         .as_ref()
@@ -1278,10 +1284,8 @@ fn finalize_recording(
 
         let participant = participants.get(user_id);
         let role = participant
-            .map(|participant| participant.role)
-            .unwrap_or(ParticipantRole::Player)
-            .as_str()
-            .to_owned();
+            .map(|participant| participant.role.clone())
+            .unwrap_or_else(|| participants.default_role().to_owned());
         let character = participant.and_then(|participant| participant.character.clone());
         let display_name = summary
             .display_names
@@ -1318,7 +1322,11 @@ fn finalize_recording(
         ));
     }
 
-    let manifest = TrackManifest::new(session_store.record().session_id.clone(), descriptions);
+    let manifest = TrackManifest::new_with_format(
+        participants.format_version(),
+        session_store.record().session_id.clone(),
+        descriptions,
+    );
     if let Err(error) = manifest.write(session_directory) {
         let message = format!("failed to publish track manifest: {error}");
         session_store.record_failure(stopped_at, "track_manifest", &message)?;
@@ -1597,11 +1605,12 @@ mod tests {
         fs::write(
             &participant_source,
             r#"
-version = 1
+version = 2
+transcript_name_source = "name"
 
 [participants."789"]
-character = "Example Character"
-role = "GM"
+name = "Dr Example"
+role = "chair"
 "#,
         )
         .unwrap();
@@ -1695,9 +1704,22 @@ role = "GM"
             session["files"]["participants"]["path"],
             "participants.toml"
         );
+        assert_eq!(
+            session["files"]["participants"]["format"],
+            crate::artifacts::PARTICIPANT_SNAPSHOT_FORMAT_VERSION
+        );
         assert_eq!(session["files"]["tracks"]["path"], "tracks.json");
+        assert_eq!(
+            session["files"]["tracks"]["format"],
+            crate::artifacts::TRACK_MANIFEST_FORMAT_VERSION
+        );
         assert!(session["files"].get("work_items").is_none());
         assert!(session_path.join("participants.toml").is_file());
+        let participant_snapshot =
+            fs::read_to_string(session_path.join("participants.toml")).unwrap();
+        assert!(participant_snapshot.contains("transcript_name_source = \"name\""));
+        assert!(participant_snapshot.contains("name = \"Dr Example\""));
+        assert!(participant_snapshot.contains("role = \"chair\""));
 
         let events = fs::read_to_string(session_path.join("events.ndjson")).unwrap();
         let events = events
@@ -1754,11 +1776,12 @@ role = "GM"
         assert_eq!(manifest.tracks.len(), 1);
         assert_eq!(manifest.tracks[0].discord_user_id, "789");
         assert_eq!(manifest.tracks[0].display_name, "Server name");
-        assert_eq!(manifest.tracks[0].role, "gm");
         assert_eq!(
-            manifest.tracks[0].character.as_deref(),
-            Some("Example Character")
+            manifest.format,
+            crate::artifacts::TRACK_MANIFEST_FORMAT_VERSION
         );
+        assert_eq!(manifest.tracks[0].role, "chair");
+        assert_eq!(manifest.tracks[0].character, None);
         assert_eq!(manifest.tracks[0].state, TrackState::Complete);
         assert_eq!(manifest.tracks[0].path, "tracks/user-789.flac");
         assert_eq!(

@@ -1,13 +1,14 @@
 # EchoScribe
 
-EchoScribe was created to record Discord tabletop role-playing sessions and
-produce reliable, speaker-attributed source transcripts for later after-action
-reports (AARs). It retains durable journals, aligned per-participant FLAC tracks,
-and chronological structured and human-readable transcripts.
+EchoScribe records Discord voice conversations and produces reliable,
+speaker-attributed source transcripts. It retains durable journals, aligned
+per-participant FLAC tracks, and chronological structured and human-readable
+transcripts.
 
-Although designed around TTRPG sessions, the recording and transcription
-pipeline can be used for any Discord voice conversation where recoverability,
-speaker identity, and a shared timeline matter.
+It was created for tabletop role-playing after-action reports, but the same
+pipeline suits meetings, lectures, symposia, interviews, and other Discord
+conversations where recoverability, speaker identity, and a shared timeline
+matter.
 
 The operator-facing application is Rust. It owns recording, recovery, workflow
 state and Python process orchestration. Faster-whisper runs as a subordinate

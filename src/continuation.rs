@@ -63,16 +63,22 @@ pub(crate) fn run_with_lease(
     }
 
     let participants_path = session_directory.join(&session.record().files.participants.path);
-    ParticipantContext::load(&participants_path).with_context(|| {
+    let participants = ParticipantContext::load(&participants_path).with_context(|| {
         format!(
             "failed to validate participant snapshot {}",
             participants_path.display()
         )
     })?;
+    if participants.format_version() != session.record().files.participants.format {
+        bail!("participant snapshot format does not match session.json");
+    }
 
     let manifest_path = session_directory.join(&session.record().files.tracks.path);
     let manifest = TrackManifest::read(&manifest_path)
         .with_context(|| format!("failed to read track manifest {}", manifest_path.display()))?;
+    if manifest.format != session.record().files.tracks.format {
+        bail!("track manifest format does not match session.json");
+    }
     if manifest.session_id != session.record().session_id {
         bail!(
             "track manifest session ID {:?} does not match session.json ID {:?}",

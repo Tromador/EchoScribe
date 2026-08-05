@@ -22,7 +22,7 @@ pub(crate) struct UserIdentity {
 }
 
 impl UserIdentity {
-    /// Apply the approved player-name fallback without campaign character data.
+    /// Apply the observed Discord-name fallback without participant metadata.
     pub(crate) fn display_name(&self) -> Option<&str> {
         self.server_display_name
             .as_deref()

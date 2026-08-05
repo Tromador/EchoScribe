@@ -1,10 +1,14 @@
-version = 1
+version = 2
+# Use "name" to attribute transcript lines to configured names instead.
+# A missing name always falls back to the observed Discord name.
+transcript_name_source = "discord"
 
 [participants."881203221593464864"]
-character = "Example Character"
-role = "player"
+name = "Example Person"
+role = "speaker"
+# role accepts any non-empty single-line description.
 # transcribe defaults to true when omitted.
 
 [participants."123456789012345678"]
-role = "gm"
+role = "chair"
 transcribe = false

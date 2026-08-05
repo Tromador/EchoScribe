@@ -17,8 +17,12 @@ pub(crate) const TRANSCRIPTION_RESULTS_PATH: &str = "transcription/results.jsonl
 pub(crate) const PARTIAL_TRANSCRIPT_FILE_NAME: &str = "transcript.partial.txt";
 pub(crate) const FINAL_TRANSCRIPT_PATH: &str = "transcription/transcript.txt";
 
-pub(crate) const PARTICIPANT_SNAPSHOT_FORMAT_VERSION: u16 = 1;
-pub(crate) const TRACK_MANIFEST_FORMAT_VERSION: u16 = 1;
-pub(crate) const WORK_ITEM_MANIFEST_FORMAT_VERSION: u16 = 1;
-pub(crate) const TRANSCRIPTION_RESULT_FORMAT_VERSION: u16 = 1;
+pub(crate) const LEGACY_PARTICIPANT_SNAPSHOT_FORMAT_VERSION: u16 = 1;
+pub(crate) const PARTICIPANT_SNAPSHOT_FORMAT_VERSION: u16 = 2;
+pub(crate) const LEGACY_TRACK_MANIFEST_FORMAT_VERSION: u16 = 1;
+pub(crate) const TRACK_MANIFEST_FORMAT_VERSION: u16 = 2;
+pub(crate) const LEGACY_WORK_ITEM_MANIFEST_FORMAT_VERSION: u16 = 1;
+pub(crate) const WORK_ITEM_MANIFEST_FORMAT_VERSION: u16 = 2;
+pub(crate) const LEGACY_TRANSCRIPTION_RESULT_FORMAT_VERSION: u16 = 1;
+pub(crate) const TRANSCRIPTION_RESULT_FORMAT_VERSION: u16 = 2;
 pub(crate) const TRANSCRIPT_FORMAT_VERSION: u16 = 1;

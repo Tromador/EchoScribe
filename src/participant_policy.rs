@@ -112,11 +112,11 @@ mod tests {
         record.state = WorkflowState::Complete;
         record.files.work_items = Some(crate::session::FileDescription {
             path: crate::artifacts::WORK_ITEM_MANIFEST_PATH.to_owned(),
-            format: crate::artifacts::WORK_ITEM_MANIFEST_FORMAT_VERSION,
+            format: crate::artifacts::LEGACY_WORK_ITEM_MANIFEST_FORMAT_VERSION,
         });
         record.files.results = Some(crate::session::FileDescription {
             path: crate::artifacts::TRANSCRIPTION_RESULTS_PATH.to_owned(),
-            format: crate::artifacts::TRANSCRIPTION_RESULT_FORMAT_VERSION,
+            format: crate::artifacts::LEGACY_TRANSCRIPTION_RESULT_FORMAT_VERSION,
         });
         record.checkpoints.push(crate::session::CheckpointRecord {
             completed_at_unix_millis: 3,
@@ -134,10 +134,10 @@ mod tests {
         let snapshot = ParticipantContext::load(&directory.join("participants.toml")).unwrap();
         let existing = snapshot.get(11).unwrap();
         assert_eq!(existing.character.as_deref(), Some("A Character"));
-        assert_eq!(existing.role, crate::participants::ParticipantRole::Gm);
+        assert_eq!(existing.role, "gm");
         assert!(!existing.transcribe);
         let added = snapshot.get(22).unwrap();
-        assert_eq!(added.role, crate::participants::ParticipantRole::Player);
+        assert_eq!(added.role, "player");
         assert_eq!(added.character, None);
         assert!(!added.transcribe);
 

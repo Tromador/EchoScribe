@@ -11,8 +11,8 @@ from contextlib import contextmanager
 from pathlib import Path
 
 
-WORK_ITEM_FORMAT = 1
-RESULT_FORMAT = 1
+LEGACY_WORK_ITEM_FORMAT = 1
+WORK_ITEM_FORMAT = 2
 SOURCE_SAMPLE_RATE = 48_000
 MAX_END_ROUNDING_FRAMES = 47
 VAD_SAMPLE_RATE = 16_000
@@ -22,7 +22,7 @@ NON_SPEECH_REJECTED = "non_speech_rejected"
 LEXICAL_ACCEPTED = "lexical_accepted"
 LEXICAL_REJECTED_EMPTY = "lexical_rejected_empty"
 LEXICAL_REJECTED_HIGH_NO_SPEECH = "lexical_rejected_high_no_speech"
-WORK_ITEM_FIELDS = {
+LEGACY_WORK_ITEM_FIELDS = {
     "format",
     "id",
     "session_id",
@@ -31,6 +31,22 @@ WORK_ITEM_FIELDS = {
     "speaker",
     "role",
     "character",
+    "start_ms",
+    "end_ms",
+    "source",
+    "source_start_ms",
+    "source_end_ms",
+}
+WORK_ITEM_FIELDS = {
+    "format",
+    "id",
+    "session_id",
+    "sequence",
+    "discord_user_id",
+    "discord_name",
+    "name",
+    "speaker",
+    "role",
     "start_ms",
     "end_ms",
     "source",
@@ -107,12 +123,51 @@ def load_manifest(path):
 
 
 def validate_work_item(item, expected_sequence):
-    if not isinstance(item, dict) or set(item) != WORK_ITEM_FIELDS:
+    if not isinstance(item, dict):
         raise ValueError(
             f"work item sequence {expected_sequence} has an unexpected schema"
         )
+    item_format = item.get("format")
+    expected_fields = (
+        LEGACY_WORK_ITEM_FIELDS
+        if item_format == LEGACY_WORK_ITEM_FORMAT
+        else WORK_ITEM_FIELDS
+    )
+    if set(item) != expected_fields:
+        raise ValueError(
+            f"work item sequence {expected_sequence} has an unexpected schema"
+        )
+    if item_format == LEGACY_WORK_ITEM_FORMAT:
+        metadata_valid = (
+            item["role"] in ("player", "gm")
+            and (
+                item["character"] is None
+                or isinstance(item["character"], str)
+            )
+        )
+    else:
+        metadata_valid = (
+            item_format == WORK_ITEM_FORMAT
+            and isinstance(item["discord_name"], str)
+            and bool(item["discord_name"].strip())
+            and "\n" not in item["discord_name"]
+            and "\r" not in item["discord_name"]
+            and (
+                item["name"] is None
+                or (
+                    isinstance(item["name"], str)
+                    and bool(item["name"].strip())
+                    and "\n" not in item["name"]
+                    and "\r" not in item["name"]
+                )
+            )
+            and isinstance(item["role"], str)
+            and bool(item["role"].strip())
+            and "\n" not in item["role"]
+            and "\r" not in item["role"]
+        )
     if (
-        item["format"] != WORK_ITEM_FORMAT
+        not metadata_valid
         or item["sequence"] != expected_sequence
         or not isinstance(item["id"], str)
         or not item["id"]
@@ -122,11 +177,6 @@ def validate_work_item(item, expected_sequence):
         or not item["discord_user_id"].isdigit()
         or not isinstance(item["speaker"], str)
         or not item["speaker"].strip()
-        or item["role"] not in ("player", "gm")
-        or (
-            item["character"] is not None
-            and not isinstance(item["character"], str)
-        )
         or not isinstance(item["start_ms"], int)
         or not isinstance(item["end_ms"], int)
         or item["start_ms"] >= item["end_ms"]
@@ -281,15 +331,14 @@ def qualify_lexical_speech(segments, threshold):
 
 
 def result_from_item(item, text):
-    return {
-        "format": RESULT_FORMAT,
+    result = {
+        "format": item["format"],
         "work_item_id": item["id"],
         "session_id": item["session_id"],
         "sequence": item["sequence"],
         "discord_user_id": item["discord_user_id"],
         "speaker": item["speaker"],
         "role": item["role"],
-        "character": item["character"],
         "start_ms": item["start_ms"],
         "end_ms": item["end_ms"],
         "source": item["source"],
@@ -298,6 +347,12 @@ def result_from_item(item, text):
         "text": text,
         "status": "complete",
     }
+    if item["format"] == LEGACY_WORK_ITEM_FORMAT:
+        result["character"] = item["character"]
+    else:
+        result["discord_name"] = item["discord_name"]
+        result["name"] = item["name"]
+    return result
 
 
 def transcript_line(result):

@@ -2,8 +2,8 @@
 //!
 //! Authoritative replay supplies activity and mapping evidence, while
 //! `tracks.json` supplies the observed speaker name and aligned source file.
-//! Participant role and character context always comes from the immutable
-//! session-local TOML snapshot.
+//! Participant naming, role, and transcription policy always come from the
+//! immutable session-local TOML snapshot.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -14,17 +14,17 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     artifacts::{
-        TRANSCRIPTION_DIRECTORY_NAME, WORK_ITEM_MANIFEST_FILE_NAME,
-        WORK_ITEM_MANIFEST_FORMAT_VERSION,
+        LEGACY_WORK_ITEM_MANIFEST_FORMAT_VERSION, TRANSCRIPTION_DIRECTORY_NAME,
+        WORK_ITEM_MANIFEST_FILE_NAME, WORK_ITEM_MANIFEST_FORMAT_VERSION,
     },
     config::SegmentationConfig,
     diagnostics::{SAMPLE_RATE, SAMPLES_PER_TICK},
     operation_lease::SessionOperationLease,
-    participants::{ParticipantContext, ParticipantRole},
+    participants::{ParticipantContext, TranscriptNameSource},
     recover,
     routine_recovery::MappingTimeline,
     session::{SessionRecord, SessionStore, WorkflowState},
@@ -35,14 +35,15 @@ use crate::{
 const WORK_ITEM_TEMP_FILE_NAME: &str = ".work-items.jsonl.tmp";
 const SAMPLES_PER_MILLISECOND: u64 = SAMPLE_RATE as u64 / 1_000;
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WorkItem {
     pub(crate) format: u16,
     pub(crate) id: String,
     pub(crate) session_id: String,
     pub(crate) sequence: u64,
     pub(crate) discord_user_id: String,
+    pub(crate) discord_name: String,
+    pub(crate) name: Option<String>,
     pub(crate) speaker: String,
     pub(crate) role: String,
     pub(crate) character: Option<String>,
@@ -51,6 +52,141 @@ pub(crate) struct WorkItem {
     pub(crate) source: String,
     pub(crate) source_start_ms: u64,
     pub(crate) source_end_ms: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyWorkItem {
+    format: u16,
+    id: String,
+    session_id: String,
+    sequence: u64,
+    discord_user_id: String,
+    speaker: String,
+    role: String,
+    character: Option<String>,
+    start_ms: u64,
+    end_ms: u64,
+    source: String,
+    source_start_ms: u64,
+    source_end_ms: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentWorkItem {
+    format: u16,
+    id: String,
+    session_id: String,
+    sequence: u64,
+    discord_user_id: String,
+    discord_name: String,
+    name: Option<String>,
+    speaker: String,
+    role: String,
+    start_ms: u64,
+    end_ms: u64,
+    source: String,
+    source_start_ms: u64,
+    source_end_ms: u64,
+}
+
+impl Serialize for WorkItem {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if self.format == LEGACY_WORK_ITEM_MANIFEST_FORMAT_VERSION {
+            LegacyWorkItem {
+                format: self.format,
+                id: self.id.clone(),
+                session_id: self.session_id.clone(),
+                sequence: self.sequence,
+                discord_user_id: self.discord_user_id.clone(),
+                speaker: self.speaker.clone(),
+                role: self.role.clone(),
+                character: self.character.clone(),
+                start_ms: self.start_ms,
+                end_ms: self.end_ms,
+                source: self.source.clone(),
+                source_start_ms: self.source_start_ms,
+                source_end_ms: self.source_end_ms,
+            }
+            .serialize(serializer)
+        } else {
+            CurrentWorkItem {
+                format: self.format,
+                id: self.id.clone(),
+                session_id: self.session_id.clone(),
+                sequence: self.sequence,
+                discord_user_id: self.discord_user_id.clone(),
+                discord_name: self.discord_name.clone(),
+                name: self.name.clone(),
+                speaker: self.speaker.clone(),
+                role: self.role.clone(),
+                start_ms: self.start_ms,
+                end_ms: self.end_ms,
+                source: self.source.clone(),
+                source_start_ms: self.source_start_ms,
+                source_end_ms: self.source_end_ms,
+            }
+            .serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkItem {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let format = value
+            .get("format")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| serde::de::Error::custom("work item format must be an integer"))?;
+        if format == u64::from(LEGACY_WORK_ITEM_MANIFEST_FORMAT_VERSION) {
+            let item: LegacyWorkItem =
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+            Ok(Self {
+                format: item.format,
+                id: item.id,
+                session_id: item.session_id,
+                sequence: item.sequence,
+                discord_user_id: item.discord_user_id,
+                discord_name: item.speaker.clone(),
+                name: None,
+                speaker: item.speaker,
+                role: item.role,
+                character: item.character,
+                start_ms: item.start_ms,
+                end_ms: item.end_ms,
+                source: item.source,
+                source_start_ms: item.source_start_ms,
+                source_end_ms: item.source_end_ms,
+            })
+        } else {
+            let item: CurrentWorkItem =
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+            Ok(Self {
+                format: item.format,
+                id: item.id,
+                session_id: item.session_id,
+                sequence: item.sequence,
+                discord_user_id: item.discord_user_id,
+                discord_name: item.discord_name,
+                name: item.name,
+                speaker: item.speaker,
+                role: item.role,
+                character: None,
+                start_ms: item.start_ms,
+                end_ms: item.end_ms,
+                source: item.source,
+                source_start_ms: item.source_start_ms,
+                source_end_ms: item.source_end_ms,
+            })
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -210,6 +346,9 @@ fn build_items_from_authority(
             participants_path.display()
         )
     })?;
+    if participants.format_version() != record.files.participants.format {
+        bail!("participant snapshot format does not match session.json");
+    }
 
     let track_manifest_path = session_directory.join(&record.files.tracks.path);
     let tracks = TrackManifest::read(&track_manifest_path).with_context(|| {
@@ -218,6 +357,9 @@ fn build_items_from_authority(
             track_manifest_path.display()
         )
     })?;
+    if tracks.format != record.files.tracks.format {
+        bail!("track manifest format does not match session.json");
+    }
     validate_tracks(session_directory, record.session_id.as_str(), &tracks)?;
 
     let timeline = MappingTimeline::read(&session_directory.join(&record.files.events.path))?;
@@ -519,18 +661,24 @@ fn materialise_work_items(
                 .ok_or_else(|| anyhow!("work item sequence overflow"))?;
             let participant = participants.get(range.discord_user_id);
             let role = participant
-                .map(|value| value.role)
-                .unwrap_or(ParticipantRole::Player)
-                .as_str()
-                .to_owned();
+                .map(|value| value.role.clone())
+                .unwrap_or_else(|| participants.default_role().to_owned());
+            let name = participant.and_then(|value| value.name.clone());
             let character = participant.and_then(|value| value.character.clone());
+            let discord_name = track.display_name.clone();
+            let speaker = match participants.transcript_name_source() {
+                TranscriptNameSource::Name => name.clone().unwrap_or_else(|| discord_name.clone()),
+                TranscriptNameSource::Discord => discord_name.clone(),
+            };
             let item = WorkItem {
-                format: WORK_ITEM_MANIFEST_FORMAT_VERSION,
+                format: participants.format_version(),
                 id: format!("{session_id}:{sequence:06}"),
                 session_id: session_id.to_owned(),
                 sequence,
                 discord_user_id: range.discord_user_id.to_string(),
-                speaker: track.display_name.clone(),
+                discord_name,
+                name,
+                speaker,
                 role,
                 character,
                 start_ms: samples_to_millis_floor(range.start_sample),
@@ -566,7 +714,26 @@ fn validate_range(range: &CandidateRange, track: &TrackDescription) -> Result<()
 }
 
 fn validate_work_item(item: &WorkItem) -> Result<()> {
-    if item.format != WORK_ITEM_MANIFEST_FORMAT_VERSION
+    let metadata_valid = match item.format {
+        LEGACY_WORK_ITEM_MANIFEST_FORMAT_VERSION => {
+            matches!(item.role.as_str(), "player" | "gm")
+                && item.discord_name == item.speaker
+                && item.name.is_none()
+        }
+        WORK_ITEM_MANIFEST_FORMAT_VERSION => {
+            !item.discord_name.trim().is_empty()
+                && !item.discord_name.contains(['\n', '\r'])
+                && item
+                    .name
+                    .as_ref()
+                    .is_none_or(|name| !name.trim().is_empty() && !name.contains(['\n', '\r']))
+                && !item.role.trim().is_empty()
+                && !item.role.contains(['\n', '\r'])
+                && item.character.is_none()
+        }
+        _ => false,
+    };
+    if !metadata_valid
         || item.sequence == 0
         || item.id.trim().is_empty()
         || item.session_id.trim().is_empty()
@@ -577,7 +744,7 @@ fn validate_work_item(item: &WorkItem) -> Result<()> {
             .filter(|id| *id != 0)
             .is_none()
         || item.speaker.trim().is_empty()
-        || !matches!(item.role.as_str(), "player" | "gm")
+        || item.speaker.contains(['\n', '\r'])
         || item.start_ms >= item.end_ms
         || item.source_start_ms >= item.source_end_ms
     {
@@ -909,6 +1076,58 @@ mod tests {
         assert_eq!(items[0].role, "gm");
         assert_eq!(items[0].character.as_deref(), Some("Included"));
         assert_eq!(items[0].source, "tracks/user-11.flac");
+    }
+
+    #[test]
+    fn current_participant_metadata_controls_attribution_and_manifest_schema() {
+        let participants = ParticipantContext::from_toml(
+            concat!(
+                "version = 2\n",
+                "transcript_name_source = \"name\"\n",
+                "[participants.\"11\"]\n",
+                "name = \"Stefan\"\n",
+                "role = \"speaker\"\n",
+            ),
+            Path::new("session/participants.toml"),
+        )
+        .unwrap();
+        let tracks = TrackManifest::new_with_format(
+            WORK_ITEM_MANIFEST_FORMAT_VERSION,
+            "session-generic".to_owned(),
+            vec![TrackDescription::new(
+                11,
+                "Tromador".to_owned(),
+                "speaker".to_owned(),
+                None,
+                "tracks/user-11.flac".to_owned(),
+                TrackState::Complete,
+                2 * SAMPLES_PER_TICK,
+                vec![100],
+                None,
+            )],
+        );
+        let ranges = vec![CandidateRange {
+            discord_user_id: 11,
+            start_sample: SAMPLES_PER_TICK,
+            end_sample: 2 * SAMPLES_PER_TICK,
+            source_start_sample: SAMPLES_PER_TICK,
+            source_end_sample: 2 * SAMPLES_PER_TICK,
+        }];
+
+        let items =
+            materialise_work_items("session-generic", ranges, &tracks, &participants).unwrap();
+        let item = &items[0];
+        assert_eq!(item.format, WORK_ITEM_MANIFEST_FORMAT_VERSION);
+        assert_eq!(item.discord_name, "Tromador");
+        assert_eq!(item.name.as_deref(), Some("Stefan"));
+        assert_eq!(item.speaker, "Stefan");
+        assert_eq!(item.role, "speaker");
+        assert_eq!(item.character, None);
+
+        let value = serde_json::to_value(item).unwrap();
+        assert_eq!(value["discord_name"], "Tromador");
+        assert_eq!(value["name"], "Stefan");
+        assert!(value.get("character").is_none());
     }
 
     #[test]

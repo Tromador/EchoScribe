@@ -674,14 +674,16 @@ def warm_up_model(model, ranged_audio, settings):
 
 
 def work_item_metadata(item):
-    return {
+    metadata = {
         "sequence": item["sequence"],
         "work_item_id": item["id"],
         "session_id": item["session_id"],
         "discord_user_id": item["discord_user_id"],
         "speaker": item["speaker"],
         "role": item["role"],
-        "character": item["character"],
+        "discord_name": item.get("discord_name", item["speaker"]),
+        "name": item.get("name"),
+        "character": item.get("character"),
         "work_item_start_ms": item["start_ms"],
         "work_item_end_ms": item["end_ms"],
         "work_item_duration_ms": item["end_ms"] - item["start_ms"],
@@ -692,6 +694,7 @@ def work_item_metadata(item):
             item["source_end_ms"] - item["source_start_ms"]
         ),
     }
+    return metadata
 
 
 def model_configuration(settings):

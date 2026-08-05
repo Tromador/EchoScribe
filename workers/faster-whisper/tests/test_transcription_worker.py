@@ -660,6 +660,33 @@ class TranscriptionWorkerTests(unittest.TestCase):
         ):
             self.assertEqual(worker.main(command_line(self)), 1)
 
+    def test_current_participant_metadata_is_preserved_in_results(self):
+        item = make_current_item(
+            1, 11, "Tromador", "Stefan", "Tromador", "chair", 0, 500
+        )
+        write_manifest(self.manifest, [item])
+
+        @contextmanager
+        def range_extractor(path, start_ms, end_ms):
+            yield self.directory / "range.wav"
+
+        worker.process(
+            make_args(self),
+            model_factory=lambda args: FakeModel([["Welcome"]]),
+            range_extractor=range_extractor,
+            vad_analyser=lambda unused: self.fail(
+                "disabled VAD must not analyse a range"
+            ),
+        )
+
+        result = json.loads(self.results.read_text(encoding="utf-8"))
+        self.assertEqual(result["format"], 2)
+        self.assertEqual(result["discord_name"], "Tromador")
+        self.assertEqual(result["name"], "Stefan")
+        self.assertEqual(result["speaker"], "Tromador")
+        self.assertEqual(result["role"], "chair")
+        self.assertNotIn("character", result)
+
 
 def make_item(sequence, user_id, speaker, start_ms, end_ms, character):
     return {
@@ -671,6 +698,27 @@ def make_item(sequence, user_id, speaker, start_ms, end_ms, character):
         "speaker": speaker,
         "role": "player",
         "character": character,
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        "source": f"tracks/user-{user_id}.flac",
+        "source_start_ms": start_ms,
+        "source_end_ms": end_ms,
+    }
+
+
+def make_current_item(
+    sequence, user_id, discord_name, name, speaker, role, start_ms, end_ms
+):
+    return {
+        "format": 2,
+        "id": f"session-test:{sequence:06d}",
+        "session_id": "session-test",
+        "sequence": sequence,
+        "discord_user_id": str(user_id),
+        "discord_name": discord_name,
+        "name": name,
+        "speaker": speaker,
+        "role": role,
         "start_ms": start_ms,
         "end_ms": end_ms,
         "source": f"tracks/user-{user_id}.flac",

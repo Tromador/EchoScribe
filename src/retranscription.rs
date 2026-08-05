@@ -145,7 +145,7 @@ fn run_owned(
         &work_items,
         lease,
     )?;
-    write_replacement_transcript(&transcript_path, &results)?;
+    write_replacement_transcript(&transcript_path, &work_items, &results)?;
     if partial_path.exists() {
         fs::remove_file(&partial_path).with_context(|| {
             format!(
@@ -165,6 +165,9 @@ fn run_owned(
             work_items_relative,
             results_relative,
             transcript_relative,
+            session.record().files.participants.format,
+            session.record().files.participants.format,
+            crate::artifacts::TRANSCRIPT_FORMAT_VERSION,
         )
         .context("staged retranscription was complete but session authority was not replaced")?;
 
@@ -396,7 +399,8 @@ mod tests {
         assert_eq!(items[0].sequence, 1);
         assert_eq!(
             fs::read_to_string(directory.join(transcript_path)).unwrap(),
-            "[00:00:00] Alice: replacement 1\n"
+            "Participants:\n- Discord: Alice | Name: Included | Role: gm\n\n\
+             Transcript:\n[00:00:00] Alice: replacement 1\n"
         );
         assert!(
             !directory
@@ -551,6 +555,26 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[test]
+    fn historical_headerless_transcript_remains_valid_for_retranscription() {
+        let (directory, config_path) = complete_fixture("headerless-history");
+        fs::write(
+            directory.join(FINAL_TRANSCRIPT_PATH),
+            b"[00:00:00] Alice: old transcript\n",
+        )
+        .unwrap();
+
+        run_with_transcriber(&directory, &config_path, &FakeTranscriber::succeeding()).unwrap();
+
+        let session = SessionStore::load(&directory).unwrap();
+        assert_eq!(session.record().state, WorkflowState::Complete);
+        assert_eq!(
+            session.record().format,
+            RETRANSCRIPTION_SESSION_FORMAT_VERSION
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     fn complete_fixture(label: &str) -> (PathBuf, PathBuf) {
         let directory = test_directory(label);
         let participant_source = directory.join("source-participants.toml");
@@ -663,7 +687,12 @@ mod tests {
         }
         results_file.sync_all().unwrap();
         session.publish_transcription_start(3_100).unwrap();
-        write_replacement_transcript(&directory.join(FINAL_TRANSCRIPT_PATH), &old_results).unwrap();
+        write_replacement_transcript(
+            &directory.join(FINAL_TRANSCRIPT_PATH),
+            &old_items,
+            &old_results,
+        )
+        .unwrap();
         session.publish_transcription_complete(3_200).unwrap();
 
         let config_path = directory.join("echoscribe.toml");
@@ -704,6 +733,8 @@ mod tests {
             session_id: item.session_id.clone(),
             sequence: item.sequence,
             discord_user_id: item.discord_user_id.clone(),
+            discord_name: item.discord_name.clone(),
+            name: item.name.clone(),
             speaker: item.speaker.clone(),
             role: item.role.clone(),
             character: item.character.clone(),
