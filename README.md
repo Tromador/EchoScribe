@@ -18,7 +18,7 @@ worker and never modifies `session.json`.
 ```text
 Cargo.toml, src/                  Rust application
 workers/faster-whisper/          Python transcription worker and dependencies
-docs/                            User, developer, and retained design documents
+docs/                            User and developer guides
 archive/legacy-pipeline/         Historical pre-rewrite implementation
 echoscribe.ps1, echoscribe.sh    Convenience launchers
 ```

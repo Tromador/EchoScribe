@@ -40,7 +40,8 @@ The repository root is one Cargo application named `echoscribe`.
   recovery, workflow state, offline orchestration, and process lifetime.
 - Serenity supplies Discord gateway events and member identity evidence.
 - Songbird supplies voice connectivity, decrypted RTP, playout decisions, and
-  decoded mono PCM.
+  decoded mono PCM, including the current Discord voice encryption and DAVE
+  handling supported by Songbird.
 - Rust writes routine FLAC through `flac-codec`.
 - A repository-owned Python worker uses faster-whisper/CTranslate2 for local
   transcription.
@@ -265,7 +266,21 @@ also JSONL. A newline-terminated malformed record is durable bad evidence and
 must not be silently skipped. Only a non-newline-terminated final byte tail is
 eligible for narrowly defined crash repair.
 
-### 7.3 Workflow states
+### 7.3 Participant context compatibility
+
+The main configuration references a separate Discord-user-ID-keyed participant
+TOML file. `character` is optional, `role` defaults to `player`, and
+`transcribe` defaults to `true`. Missing participant mappings remain normal
+players who are recorded and transcribed; multiple GMs are valid.
+
+Session creation writes a canonical session-local snapshot and materialises
+those defaults. `session.json` references the snapshot rather than embedding
+participant entries. Later stages use this immutable snapshot, not the mutable
+operator source. Older format-1 snapshots without `transcribe` remain
+compatible as `true`; `set-transcription-policy` is the sole supported route
+for changing that Boolean in historical session authority.
+
+### 7.4 Workflow states
 
 The transition table is explicit rather than ordinal:
 
@@ -392,6 +407,10 @@ One managed encoder loop owns writers keyed by Discord user. Each writer:
 - accepts successive SSRCs belonging to the same user;
 - retains SSRC provenance;
 - is never restarted after terminal continuity or encoder failure.
+
+Routine tracks are aligned mono 48 kHz FLAC sourced from 16-bit PCM and are
+written incrementally during recording. Normal creation does not require a
+whole-session post-recording export.
 
 Queue-full rejection abandons only the user whose frame was rejected. A
 decoded-audio rejection at the earlier shared ingress cannot safely attribute
@@ -522,6 +541,13 @@ model settings, the validated `vad_enabled` Boolean, the validated lexical
 no-speech threshold, and repeated hotword arguments. Python does not parse the
 main TOML.
 
+`ECHOSCRIBE_PYTHON` selects the interpreter when it is non-empty. Otherwise
+Rust prefers the repository-root virtual environment and then the platform
+Python command. Offline transcription loading does not require Discord
+credentials or the mutable participant source. Vocabulary is resolved relative
+to the named configuration; missing, empty, and comment-only files are
+warning-only, while other read failures and invalid UTF-8 are fatal.
+
 The worker loads the model once and processes work items sequentially. For each
 item it:
 
@@ -557,7 +583,53 @@ The requested end is rounded from milliseconds to frames. Clamping to physical
 EOF is allowed only for the maximum 47-frame 48 kHz rounding discrepancy. A
 larger source shortfall fails before either output is committed.
 
-### 13.3 Result authority
+### 13.3 Known prompted-decode artefacts and accepted boundary
+
+The production admission and decode sequence is deliberately explicit:
+
+1. extract the exact complete work-item range;
+2. when configured, reject a bundled-Silero-negative range before Whisper;
+3. decode a Silero-admitted range without hotwords;
+4. accept lexical speech when at least one non-empty segment has
+   `no_speech_prob` strictly below the configured lexical threshold;
+5. if accepted, either reuse that unprompted text when no hotwords are
+   configured or decode the same complete range again with hotwords and
+   publish the prompted result.
+
+A marginal range can produce a short, plausible unprompted hypothesis and
+narrowly pass lexical qualification. The prompted pass can then replace it
+with a fluent stock phrase which is poorly related, or unrelated, to the
+apparent acoustic content.
+
+Faster Whisper hotwords are decoder context or bias. They are not a hard
+vocabulary mapping, a protected list of allowed substitutions, a
+natural-language instruction, or a guarantee that the result contains one of
+the supplied terms. Their influence can change the probability distribution
+of the complete decode rather than merely correcting a proper noun's spelling.
+That can make an ordinary low-confidence ASR mistake much more conspicuous; it
+does not prove that the range was originally classified as non-speech.
+
+Diagnostic evidence from the investigated session showed that affected ranges
+already produced non-empty unprompted hypotheses and passed the configured
+lexical threshold before the prompted pass. This is evidence for the observed
+mechanism, not a claim that every stock phrase has the same cause.
+
+The current engineering decision is:
+
+- do not blacklist recognised stock phrases;
+- do not automatically reconcile prompted and unprompted text semantically;
+- retain vocabulary assistance because it materially improves proper names and
+  specialist terminology;
+- retain recordings and atomic retranscription so improved models or other
+  backends can be used later.
+
+Filtering could merely replace a conspicuous error with less obvious incorrect
+text without recovering the true speech. The behaviour is therefore accepted
+as a known limitation of the current transcription backend at the current
+reasonable engineering boundary. Threshold tuning, phrase suppression, and
+internal VAD have not been established as solutions.
+
+### 13.4 Result authority
 
 Rust requires a contiguous global prefix beginning at sequence 1. Each result
 must exactly match its work item's provenance and have completed status.
@@ -579,7 +651,7 @@ The validator rejects:
 Only an incomplete final byte tail may be truncated to the last validated
 newline.
 
-### 13.4 Diagnostic replay harness
+### 13.5 Diagnostic replay harness
 
 `diagnose_ranges.py` reads the work-manifest path declared by `session.json`
 and selects exactly the repeatable `--sequence` arguments supplied by the
@@ -592,18 +664,25 @@ model.
 
 The helper loads the configured model once and performs an untimed warm-up. It
 records range acoustics, bundled Silero timestamps with production-default and
-zero-padding options, and four decode paths:
+zero-padding options, and five decode paths in stable output order:
 
-1. the hotword-assisted production decode settings;
-2. the same decode without hotwords;
-3. selected Craig-like internal-VAD behaviour with word timestamps;
-4. an explicit decode of concatenated unpadded Silero spans.
+1. `current_echoscribe`: current hotword-assisted decode settings over the
+   original complete range;
+2. `no_hotword_control`: the same original range without hotwords;
+3. `craig_like_internal_vad`: selected Craig-like internal VAD with hotwords
+   and word timestamps;
+4. `internal_vad_no_hotwords`: the original complete range with internal VAD
+   and word timestamps, but without hotwords;
+5. `explicit_silero_trimmed`: explicit decoding of concatenated unpadded Silero
+   speech spans, separate from Faster Whisper's internal VAD path.
 
 The third path samples behaviour from
 [CraigChat/runpod-worker-faster_whisper](https://github.com/CraigChat/runpod-worker-faster_whisper)
-and is not an exact reproduction of that worker. The `current_echoscribe` label
+and is only a selected behavioural comparison, not an exact reproduction of
+Craig's private production configuration. The `current_echoscribe` label
 denotes the prompted production decode settings, not the complete current
-two-stage admission path. The harness deliberately retains richer segment
+two-stage admission path. No diagnostic path is a recommended production
+replacement. The harness deliberately retains richer segment
 evidence than durable results, including timing, temperature, average log
 probability, compression ratio, no-speech probability, optional word timing,
 input duration, and timestamp overrun.
@@ -990,6 +1069,8 @@ The following are extension points, not partially hidden features:
 - work items do not condition Whisper on previous item text;
 - the master transcript performs no relevance filtering;
 - there is no AAR or GM-assist stage;
+- transcription is local; cloud processing, Runpod, and deployment to Mort are
+  outside the current application boundary;
 - diagnostic WAV and SSRC-keyed export remain separate from routine user FLAC;
 - automatic recording recovery and automatic transcription retry are forbidden.
 

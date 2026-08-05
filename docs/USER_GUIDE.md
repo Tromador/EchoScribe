@@ -451,6 +451,39 @@ The master transcript includes in-character speech, rules discussion, jokes,
 social chatter, and anything else captured. Relevance filtering belongs to a
 later downstream process.
 
+### 8.1 Known model-generated transcription artefacts
+
+Faster Whisper is a probabilistic speech-recognition model. Marginal,
+ambiguous, noisy, or very short audio can occasionally produce plausible but
+incorrect text.
+
+EchoScribe supplies the configured campaign vocabulary to Faster Whisper as
+hotword context. This materially improves names, places, jargon, and specialist
+terminology. On an uncertain range, however, the same context can sometimes
+turn a short uncertain transcription into a fluent stock phrase learned by the
+model, such as:
+
+- `Thank you for watching.`
+- `Thank you for your support.`
+- generic video-outro or customer-support language.
+
+EchoScribe does not insert these phrases. Their presence alone does not mean
+that the recording is damaged, session authority is broken, or transcription
+files are corrupt. Nor should the audio be assumed to contain only silence:
+the initial decode may itself have produced a plausible but incorrect short
+hypothesis from uncertain audio.
+
+EchoScribe deliberately does not blacklist stock phrases. A phrase may
+occasionally be genuine speech, and removing visible text would not establish
+what the audio actually contained. Disabling vocabulary assistance would also
+materially reduce accuracy for campaign names and specialist terminology.
+
+Participant recordings are retained so the source audio can be reviewed by a
+person, considered by later language-model processing while producing an AAR,
+or retranscribed in future with an improved Faster Whisper model or a different
+transcription backend. This is a known limitation of the current transcription
+backend, not a session-recovery procedure or a data-integrity fault.
+
 ## 9. Workflow states
 
 `session.json` records one of these states:
@@ -677,14 +710,25 @@ PowerShell:
 ```
 
 For each range, the helper prints acoustic measurements, padded and unpadded
-Silero results, and four decode comparisons: the current prompted decode
-settings, a no-hotword control, a Craig-like internal-VAD comparison, and a
-decode of concatenated unpadded Silero speech spans. The Craig-like comparison
-tests selected behaviour from
+Silero results, and five decode comparisons in this output order:
+
+1. `current_echoscribe` uses the current hotword-assisted decode settings on
+   the original complete range.
+2. `no_hotword_control` uses the same original range without hotwords.
+3. `craig_like_internal_vad` enables selected Craig-like internal-VAD
+   behaviour and word timestamps while retaining hotwords.
+4. `internal_vad_no_hotwords` uses the original complete range with internal
+   VAD and word timestamps enabled, but hotwords disabled.
+5. `explicit_silero_trimmed` explicitly decodes the concatenated unpadded
+   Silero speech spans and remains distinct from Faster Whisper's internal VAD.
+
+The Craig-like comparison tests selected behaviour from
 [CraigChat/runpod-worker-faster_whisper](https://github.com/CraigChat/runpod-worker-faster_whisper)
-only; it does not reproduce that worker exactly. Likewise, the result labelled
-`current_echoscribe` is the current prompted decode stage, not a replay of the
-complete Silero and lexical admission pipeline.
+only; it is not an exact reproduction of Craig's private production
+configuration. Likewise, the result labelled `current_echoscribe` is the
+current prompted decode stage, not a replay of the complete Silero and lexical
+admission pipeline. These comparisons gather evidence; none is presented as a
+recommended production replacement.
 
 `--output` is optional. When supplied, it is overwritten with one JSON object
 per requested work item. The repository-root `diagnostics/` directory is

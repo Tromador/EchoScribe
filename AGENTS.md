@@ -4,15 +4,17 @@
 
 The global Tromador Codex Working Agreement applies in full.
 
-The following repository documents are normative and must be read before planning or changing EchoScribe:
+`docs/DEVELOPER_GUIDE.md` is the primary repository guide for current
+architecture, ownership, authority, formats, failure semantics, and extension
+guidance.
 
-1. `docs/SPECIFICATION.md` — required product behaviour and scope.
-2. `docs/ARCHITECTURE.md` — approved technical architecture and failure semantics.
-3. `docs/IMPLEMENTATION_PLAN.md` — authorised implementation sequence and slice boundaries.
+`docs/USER_GUIDE.md` describes current user-visible installation,
+configuration, operation, recovery, and troubleshooting behaviour.
 
-Where source code differs from those documents, the source code describes current implementation state; it does not override the approved design.
-
-Do not use historical notes, old pipeline documentation, comments, tests, existing dependencies, or currently implemented workflows as authority to change the approved design.
+Inspect the relevant source code and tests before changing behaviour.
+Historical notes and archived material are not authority for current
+behaviour. If maintained documentation and implementation conflict, report the
+conflict and resolve it explicitly rather than silently choosing one.
 
 ## Project baseline
 
@@ -26,22 +28,22 @@ Do not use historical notes, old pipeline documentation, comments, tests, existi
 - The master transcript records everything captured. Relevance filtering belongs to later AAR processing.
 - Mort is outside EchoScribe's deployment and processing scope.
 
-## Control of implementation
+## Control of changes
 
-Implement only one approved slice from `docs/IMPLEMENTATION_PLAN.md` at a time.
+Work only within the explicitly authorised scope.
 
 Before editing, state:
 
-1. the slice being implemented;
-2. the intended externally observable result;
-3. the implementation route;
-4. the files expected to change;
-5. the tests or checks expected to run;
-6. the explicit non-goals.
+1. the intended externally observable result;
+2. the implementation route;
+3. the files expected to change;
+4. the tests or checks expected to run;
+5. the explicit non-goals.
 
-Stop when the slice acceptance criteria have been addressed. Do not begin the next slice.
+Stop when the scoped change is complete. Do not begin adjacent work.
 
-If implementation reveals a conflict with the specification or architecture, stop and report it. Do not silently select a replacement design.
+If implementation reveals a conflict with maintained documentation or current
+behaviour, stop and report it. Do not silently select a replacement design.
 
 ## Live and external operations
 
@@ -53,7 +55,7 @@ If implementation reveals a conflict with the specification or architecture, sto
 
 ## Commit workflow
 
-When an authorised implementation slice or correction is complete and locally
+When an authorised scoped change or correction is complete and locally
 verified, commit the scoped changes without waiting for separate permission.
 Tromador normally pushes the commit. Do not push unless he explicitly asks.
 
@@ -63,7 +65,8 @@ Safe, understood, narrowly targeted local checks may be run during an authorised
 
 Live acceptance evidence is supplied by Tromador.
 
-Passing tests do not prove that the architecture is correct. Verification must cover the requirements and failure semantics of the active slice.
+Passing tests do not prove that the architecture is correct. Verification must
+cover the requirements and failure semantics of the scoped change.
 
 ## Code comments
 
